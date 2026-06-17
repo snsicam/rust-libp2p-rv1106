@@ -1,0 +1,9 @@
+[package]
+name = "proto"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+libp2p-stream = { workspace = true }
+bytes = { workspace = true }

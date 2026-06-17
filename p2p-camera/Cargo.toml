@@ -1,0 +1,2 @@
+# p2p-camera 已并入父 workspace (rust-libp2p/Cargo.toml)
+# 此文件仅为占位，不再声明独立的 [workspace]

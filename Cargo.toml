@@ -67,6 +67,10 @@ members = [
     "transports/websocket",
     "transports/webtransport-websys",
     "wasm-tests/webtransport-tests",
+    "p2p-camera/proto",
+    "p2p-camera/relay-server",
+    "p2p-camera/gateway",
+    "p2p-camera/mobile-core",
 ]
 resolver = "2"
 
