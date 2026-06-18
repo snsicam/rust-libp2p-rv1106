@@ -20,7 +20,7 @@ use clap::Parser;
 use futures::StreamExt;
 use libp2p::{
     core::multiaddr::{Multiaddr, Protocol},
-    identity, noise,
+    identify, identity, noise,
     swarm::SwarmEvent,
     tcp, yamux,
 };

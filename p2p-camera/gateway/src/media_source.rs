@@ -3,7 +3,6 @@
 //! 当前阶段: 从文件模拟读取 (H.265 raw + PCM raw)
 //! 后续替换: RV1106 SDK FFI 回调 → crossbeam_channel
 
-use anyhow::Result;
 use bytes::Bytes;
 use crossbeam_channel::Sender;
 use proto::media_packet::MediaPacket;
@@ -43,15 +42,16 @@ impl FileVideoSource {
     }
 
     /// 在独立线程中运行，通过 Sender 发送视频帧
-    pub fn spawn(mut self, sender: Sender<MediaPacket>) -> thread::JoinHandle<()> {
+    pub fn spawn(self, sender: Sender<MediaPacket>) -> thread::JoinHandle<()> {
         thread::spawn(move || {
+            let mut this = self;
             let start = Instant::now();
             let mut frame_count: u64 = 0;
 
             loop {
-                let data = self.next_frame();
+                let data = this.next_frame();
                 if data.is_empty() {
-                    thread::sleep(self.frame_interval);
+                    thread::sleep(this.frame_interval);
                     continue;
                 }
 
@@ -65,7 +65,7 @@ impl FileVideoSource {
                 }
 
                 frame_count += 1;
-                thread::sleep(self.frame_interval);
+                thread::sleep(this.frame_interval);
             }
         })
     }
@@ -96,11 +96,12 @@ impl SilenceAudioSource {
         vec![0u8; total_bytes]
     }
 
-    pub fn spawn(mut self, sender: Sender<MediaPacket>) -> thread::JoinHandle<()> {
+    pub fn spawn(self, sender: Sender<MediaPacket>) -> thread::JoinHandle<()> {
         thread::spawn(move || {
+            let this = self;
             let start = Instant::now();
             loop {
-                let data = self.next_frame();
+                let data = this.next_frame();
                 let timestamp_ms = start.elapsed().as_millis() as u64;
                 let packet = MediaPacket::audio_pcm(timestamp_ms, Bytes::from(data));
 
@@ -108,7 +109,7 @@ impl SilenceAudioSource {
                     break;
                 }
 
-                thread::sleep(self.frame_interval);
+                thread::sleep(this.frame_interval);
             }
         })
     }

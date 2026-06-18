@@ -5,5 +5,5 @@ edition = "2021"
 publish = false
 
 [dependencies]
-libp2p-stream = { workspace = true }
+libp2p-swarm = { workspace = true }
 bytes = { workspace = true }

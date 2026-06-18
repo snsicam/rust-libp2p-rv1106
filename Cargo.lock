@@ -4070,6 +4070,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "clap",
  "crossbeam-channel",
  "futures",
  "libp2p",
@@ -4077,6 +4078,7 @@ dependencies = [
  "proto",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -4972,7 +4974,7 @@ name = "proto"
 version = "0.1.0"
 dependencies = [
  "bytes",
- "libp2p-stream",
+ "libp2p-swarm",
 ]
 
 [[package]]

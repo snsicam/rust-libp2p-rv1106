@@ -14,8 +14,8 @@ use futures::{AsyncReadExt, StreamExt};
 use libp2p::{
     core::multiaddr::{Multiaddr, Protocol},
     dcutr, identify, noise, ping, relay,
-    swarm::NetworkBehaviour,
-    tcp, yamux, Swarm, SwarmEvent, PeerId,
+    swarm::{NetworkBehaviour, SwarmEvent},
+    tcp, yamux, Swarm, PeerId,
 };
 use libp2p_stream::{self, Control};
 use proto::{

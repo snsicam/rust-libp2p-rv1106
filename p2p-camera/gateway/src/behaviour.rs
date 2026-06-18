@@ -3,13 +3,10 @@
 //! 组合 relay client + DCUtR + identify + stream 四个行为。
 
 use libp2p::{
-    dcutr, identify, relay, ping,
+    dcutr, identify, ping, relay,
     swarm::NetworkBehaviour,
-    PeerId,
 };
 use libp2p_stream;
-
-use proto::stream_protocols;
 
 #[derive(NetworkBehaviour)]
 pub struct Behaviour {

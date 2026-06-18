@@ -16,21 +16,18 @@ mod behaviour;
 mod media_source;
 
 use std::{
-    collections::HashMap,
-    error::Error,
     path::PathBuf,
     time::Duration,
 };
 
 use anyhow::{Context, Result};
 use behaviour::Behaviour;
-use bytes::Bytes;
 use clap::Parser;
 use crossbeam_channel::Sender;
-use futures::StreamExt;
+use futures::{AsyncWriteExt, StreamExt};
 use libp2p::{
     core::multiaddr::{Multiaddr, Protocol},
-    identity, noise,
+    dcutr, identity, noise, relay,
     swarm::SwarmEvent,
     tcp, yamux,
     PeerId,
@@ -46,7 +43,7 @@ use tracing_subscriber::EnvFilter;
 const BROADCAST_CAPACITY: usize = 100;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .init();
@@ -97,7 +94,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!("[Gateway] External address: /p2p-circuit/p2p/{peer_id}");
 
     // ---- 初始化媒体源 (文件 or SDK) ----
-    let (video_tx, mut video_rx) = broadcast::channel::<MediaPacket>(BROADCAST_CAPACITY);
+    let (video_tx, _video_rx) = broadcast::channel::<MediaPacket>(BROADCAST_CAPACITY);
     let (audio_tx, _audio_rx) = broadcast::channel::<MediaPacket>(BROADCAST_CAPACITY);
 
     if let Some(video_path) = &opt.video_file {
@@ -118,7 +115,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 
     // ---- Stream 控制 ----
-    let stream_control = swarm.behaviour().new_stream_control();
+    let mut stream_control = swarm.behaviour().new_stream_control();
 
     // 注册入站协议
     let mut incoming_video = stream_control
@@ -130,8 +127,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .context("Failed to accept audio protocol")?;
 
     // ---- 事件循环 ----
-    let mut viewer_listeners: HashMap<PeerId, tokio::sync::oneshot::Sender<()>> = HashMap::new();
-
+    // 注: 原型阶段不主动断开 viewer，stream 任务在出错/EOF 时自然结束。
     loop {
         tokio::select! {
             // Swarm 事件
@@ -146,7 +142,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     SwarmEvent::Behaviour(behaviour::BehaviourEvent::Dcutr(
                         dcutr::Event { remote_peer_id, result, .. },
                     )) => match result {
-                        Ok(conn_id) => {
+                        Ok(_conn_id) => {
                             println!("[Gateway] DCUtR direct connection established with {remote_peer_id}");
                         }
                         Err(err) => {
@@ -173,25 +169,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
 
             // 新的视频 stream 请求
-            video = incoming_video.select_next_some() => {
-                let (peer_id, stream) = video;
-                let mut rx = video_rx.subscribe();
-                let (kill_tx, kill_rx) = tokio::sync::oneshot::channel::<()>();
-                viewer_listeners.insert(peer_id, kill_tx);
-
-                println!("[Gateway] New video viewer: {peer_id}");
-                tokio::spawn(stream_video_to_viewer(peer_id, stream, rx, kill_rx));
+            video = incoming_video.next() => {
+                if let Some((peer_id, stream)) = video {
+                    let rx = video_tx.subscribe();
+                    println!("[Gateway] New video viewer: {peer_id}");
+                    tokio::spawn(stream_video_to_viewer(peer_id, stream, rx));
+                } else { break Ok(()); }
             }
 
             // 新的音频 stream 请求
-            audio = incoming_audio.select_next_some() => {
-                let (peer_id, stream) = audio;
-                let mut rx = audio_tx.subscribe();
-                let (kill_tx, kill_rx) = tokio::sync::oneshot::channel::<()>();
-                viewer_listeners.insert(peer_id, kill_tx);
-
-                println!("[Gateway] New audio viewer: {peer_id}");
-                tokio::spawn(stream_audio_to_viewer(peer_id, stream, rx, kill_rx));
+            audio = incoming_audio.next() => {
+                if let Some((peer_id, stream)) = audio {
+                    let rx = audio_tx.subscribe();
+                    println!("[Gateway] New audio viewer: {peer_id}");
+                    tokio::spawn(stream_audio_to_viewer(peer_id, stream, rx));
+                } else { break Ok(()); }
             }
         }
     }
@@ -245,38 +237,28 @@ async fn stream_video_to_viewer(
     peer_id: PeerId,
     mut stream: libp2p::swarm::Stream,
     mut source: broadcast::Receiver<MediaPacket>,
-    kill_rx: tokio::sync::oneshot::Receiver<()>,
 ) {
-    tokio::pin!(kill_rx);
     loop {
-        tokio::select! {
-            _ = &mut kill_rx => {
-                let _ = stream.close().await;
-                break;
-            }
-            packet = source.recv() => {
-                match packet {
-                    Ok(packet) => {
-                        let encoded = packet.encode();
-                        use futures::AsyncWriteExt;
-                        if let Err(e) = stream.write_all(&encoded).await {
-                            tracing::warn!("Write to {peer_id} failed: {e}");
-                            break;
-                        }
-                        if let Err(e) = stream.flush().await {
-                            tracing::warn!("Flush to {peer_id} failed: {e}");
-                            break;
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::warn!("Video stream to {peer_id} lagged by {n} frames");
-                        // 继续, 跳过丢失的帧
-                    }
-                    Err(broadcast::error::RecvError::Closed) => break,
+        match source.recv().await {
+            Ok(packet) => {
+                let encoded = packet.encode();
+                if let Err(e) = stream.write_all(&encoded).await {
+                    tracing::warn!("Write to {peer_id} failed: {e}");
+                    break;
+                }
+                if let Err(e) = stream.flush().await {
+                    tracing::warn!("Flush to {peer_id} failed: {e}");
+                    break;
                 }
             }
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                tracing::warn!("Video stream to {peer_id} lagged by {n} frames");
+                // 继续, 跳过丢失的帧
+            }
+            Err(broadcast::error::RecvError::Closed) => break,
         }
     }
+    let _ = stream.close().await;
     tracing::info!("Video stream to {peer_id} ended");
 }
 
@@ -285,34 +267,24 @@ async fn stream_audio_to_viewer(
     peer_id: PeerId,
     mut stream: libp2p::swarm::Stream,
     mut source: broadcast::Receiver<MediaPacket>,
-    kill_rx: tokio::sync::oneshot::Receiver<()>,
 ) {
-    // 同视频逻辑, 但容忍更大的滞后 (音频帧小)
-    tokio::pin!(kill_rx);
     loop {
-        tokio::select! {
-            _ = &mut kill_rx => {
-                let _ = stream.close().await;
-                break;
-            }
-            packet = source.recv() => {
-                match packet {
-                    Ok(packet) => {
-                        let data = packet.encode();
-                        use futures::AsyncWriteExt;
-                        if let Err(e) = stream.write_all(&data).await {
-                            tracing::warn!("Audio write to {peer_id} failed: {e}");
-                            break;
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Lagged(_)) => {
-                        // 音频丢帧可接受
-                    }
-                    Err(broadcast::error::RecvError::Closed) => break,
+        match source.recv().await {
+            Ok(packet) => {
+                let data = packet.encode();
+                if let Err(e) = stream.write_all(&data).await {
+                    tracing::warn!("Audio write to {peer_id} failed: {e}");
+                    break;
                 }
             }
+            Err(broadcast::error::RecvError::Lagged(_)) => {
+                // 音频丢帧可接受
+            }
+            Err(broadcast::error::RecvError::Closed) => break,
         }
     }
+    let _ = stream.close().await;
+    tracing::info!("Audio stream to {peer_id} ended");
 }
 
 /// 将 broadcast sender 包装为 crossbeam Sender

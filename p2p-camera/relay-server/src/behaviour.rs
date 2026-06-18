@@ -1,7 +1,6 @@
 use libp2p::{
-    identify, noise, ping, relay,
-    swarm::{NetworkBehaviour, SwarmEvent},
-    tcp, yamux,
+    identify, ping, relay,
+    swarm::NetworkBehaviour,
 };
 use std::time::Duration;
 
