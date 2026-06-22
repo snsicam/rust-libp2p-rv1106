@@ -100,6 +100,8 @@ async fn main() -> Result<()> {
 
     // 参数集缓存 (VPS/SPS/PPS) — 新 viewer 连接时先发送这些，避免 "PPS id out of range"
     let mut param_sets: Option<std::sync::Arc<std::sync::Mutex<Option<Vec<Vec<u8>>>>>> = None;
+    // 视频源启动触发器 — 第一个 viewer 连接时才开始播放 (从文件头)
+    let mut video_start_trigger: Option<crossbeam_channel::Sender<()>> = None;
 
     if let Some(video_path) = &opt.video_file {
         let data = std::fs::read(video_path)
@@ -107,11 +109,11 @@ async fn main() -> Result<()> {
         println!("[Gateway] Video file: {:?} ({} bytes)", video_path, data.len());
         let source = media_source::FileVideoSource::from_file(data);
         param_sets = Some(source.param_sets_handle());
-        source.spawn(broadcast_sender_to_crossbeam(video_tx.clone()));
-        println!("[Gateway] Video source: file ({:?})", video_path);
+        let (_, start_tx) = source.spawn(broadcast_sender_to_crossbeam(video_tx.clone()));
+        video_start_trigger = Some(start_tx);
+        println!("[Gateway] Video source: file ({:?}) — waiting for first viewer to start", video_path);
     } else {
         println!("[Gateway] Video source: NONE (waiting for stream requests)");
-        param_sets = None;
     }
 
     // 音频源: 模拟静音 (for 原型)
@@ -180,6 +182,10 @@ async fn main() -> Result<()> {
                 if let Some((peer_id, stream)) = video {
                     let rx = video_tx.subscribe();
                     println!("[Gateway] New video viewer: {peer_id}");
+                    // 第一个 viewer 连接时触发视频源开始播放 (从文件头)
+                    if let Some(tx) = video_start_trigger.take() {
+                        let _ = tx.send(());
+                    }
                     // 先发送缓存的 VPS/SPS/PPS，让 viewer 立即能解码
                     let init_nals = param_sets.as_ref().and_then(|ps| {
                         ps.lock().ok()?.as_ref().map(|v| v.clone())

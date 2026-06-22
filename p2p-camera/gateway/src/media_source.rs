@@ -70,10 +70,17 @@ impl FileVideoSource {
     }
 
     /// 在独立线程中运行，通过 Sender 发送视频帧
-    pub fn spawn(self, sender: Sender<MediaPacket>) -> thread::JoinHandle<()> {
-        thread::spawn(move || {
+    /// 返回 (JoinHandle, start_trigger) — 调用 start_trigger.send(()) 开始播放
+    /// 这样可以让 gateway 在第一个 viewer 连接时才开始播放，从文件头发送
+    pub fn spawn(self, sender: Sender<MediaPacket>) -> (thread::JoinHandle<()>, Sender<()>) {
+        let (start_tx, start_rx) = crossbeam_channel::bounded::<()>(1);
+        let handle = thread::spawn(move || {
             let mut this = self;
+            // 等待开始信号 (第一个 viewer 连接时触发)
+            let _ = start_rx.recv();
+
             let start = Instant::now();
+            println!("[Gateway] Video source started (from beginning of file)");
 
             loop {
                 let data = this.next_frame();
@@ -104,7 +111,8 @@ impl FileVideoSource {
 
                 thread::sleep(this.frame_interval);
             }
-        })
+        });
+        (handle, start_tx)
     }
 }
 
