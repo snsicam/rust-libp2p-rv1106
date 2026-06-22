@@ -22,6 +22,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use behaviour::Behaviour;
+use bytes::Bytes;
 use clap::Parser;
 use crossbeam_channel::Sender;
 use futures::{AsyncWriteExt, StreamExt};
@@ -97,14 +98,20 @@ async fn main() -> Result<()> {
     let (video_tx, _video_rx) = broadcast::channel::<MediaPacket>(BROADCAST_CAPACITY);
     let (audio_tx, _audio_rx) = broadcast::channel::<MediaPacket>(BROADCAST_CAPACITY);
 
+    // 参数集缓存 (VPS/SPS/PPS) — 新 viewer 连接时先发送这些，避免 "PPS id out of range"
+    let mut param_sets: Option<std::sync::Arc<std::sync::Mutex<Option<Vec<Vec<u8>>>>>> = None;
+
     if let Some(video_path) = &opt.video_file {
         let data = std::fs::read(video_path)
             .context("Failed to read video file")?;
+        println!("[Gateway] Video file: {:?} ({} bytes)", video_path, data.len());
         let source = media_source::FileVideoSource::from_file(data);
+        param_sets = Some(source.param_sets_handle());
         source.spawn(broadcast_sender_to_crossbeam(video_tx.clone()));
         println!("[Gateway] Video source: file ({:?})", video_path);
     } else {
         println!("[Gateway] Video source: NONE (waiting for stream requests)");
+        param_sets = None;
     }
 
     // 音频源: 模拟静音 (for 原型)
@@ -173,7 +180,11 @@ async fn main() -> Result<()> {
                 if let Some((peer_id, stream)) = video {
                     let rx = video_tx.subscribe();
                     println!("[Gateway] New video viewer: {peer_id}");
-                    tokio::spawn(stream_video_to_viewer(peer_id, stream, rx));
+                    // 先发送缓存的 VPS/SPS/PPS，让 viewer 立即能解码
+                    let init_nals = param_sets.as_ref().and_then(|ps| {
+                        ps.lock().ok()?.as_ref().map(|v| v.clone())
+                    }).unwrap_or_default();
+                    tokio::spawn(stream_video_to_viewer(peer_id, stream, rx, init_nals));
                 } else { break Ok(()); }
             }
 
@@ -237,7 +248,31 @@ async fn stream_video_to_viewer(
     peer_id: PeerId,
     mut stream: libp2p::swarm::Stream,
     mut source: broadcast::Receiver<MediaPacket>,
+    init_nals: Vec<Vec<u8>>,
 ) {
+    let mut frame_count: u64 = 0;
+
+    // 先发送 VPS/SPS/PPS (让 viewer 立即能解码，不必等下一个 IDR)
+    for nal in &init_nals {
+        // init_nals 是原始 NAL data (不含 start code)，需要加 start code
+        let mut au_with_sc = Vec::with_capacity(4 + nal.len());
+        au_with_sc.extend_from_slice(&[0, 0, 0, 1]);
+        au_with_sc.extend_from_slice(nal);
+        let packet = MediaPacket::video(0, true, Bytes::from(au_with_sc));
+        let encoded = packet.encode();
+        if let Err(e) = stream.write_all(&encoded).await {
+            tracing::warn!("Init NAL write to {peer_id} failed: {e}");
+            return;
+        }
+    }
+    if !init_nals.is_empty() {
+        if let Err(e) = stream.flush().await {
+            tracing::warn!("Init flush to {peer_id} failed: {e}");
+            return;
+        }
+        println!("[Gateway] Sent {} init NALs to {peer_id}", init_nals.len());
+    }
+
     loop {
         match source.recv().await {
             Ok(packet) => {
@@ -250,16 +285,24 @@ async fn stream_video_to_viewer(
                     tracing::warn!("Flush to {peer_id} failed: {e}");
                     break;
                 }
+                frame_count += 1;
+                if frame_count == 1 {
+                    println!("[Gateway] First frame sent to {peer_id} ({} bytes, keyframe={})",
+                        encoded.len(), packet.is_keyframe());
+                }
             }
             Err(broadcast::error::RecvError::Lagged(n)) => {
                 tracing::warn!("Video stream to {peer_id} lagged by {n} frames");
                 // 继续, 跳过丢失的帧
             }
-            Err(broadcast::error::RecvError::Closed) => break,
+            Err(broadcast::error::RecvError::Closed) => {
+                println!("[Gateway] Broadcast closed for {peer_id} after {frame_count} frames");
+                break;
+            }
         }
     }
     let _ = stream.close().await;
-    tracing::info!("Video stream to {peer_id} ended");
+    println!("[Gateway] Video stream to {peer_id} ended ({frame_count} frames sent)");
 }
 
 /// 发送音频帧到指定 viewer
@@ -292,8 +335,9 @@ async fn stream_audio_to_viewer(
 fn broadcast_sender_to_crossbeam(tx: broadcast::Sender<MediaPacket>) -> Sender<MediaPacket> {
     let (c_tx, c_rx) = crossbeam_channel::bounded::<MediaPacket>(BROADCAST_CAPACITY);
 
-    // 后台任务: crossbeam → broadcast
-    tokio::spawn(async move {
+    // 用 spawn_blocking 而非 tokio::spawn — c_rx.recv() 是阻塞调用，
+    // 在 tokio::spawn 里会永久占用一个 async worker 线程。
+    tokio::task::spawn_blocking(move || {
         while let Ok(packet) = c_rx.recv() {
             if tx.send(packet).is_err() {
                 break;

@@ -146,8 +146,8 @@ async fn main() -> Result<()> {
                 // 写入文件 (H.265 裸流, 可用 ffplay 播放)
                 if let Some(file) = &mut output_file {
                     use std::io::Write;
-                    // 写入 NAL start code + data
-                    file.write_all(&[0, 0, 0, 1])?;
+                    // packet.data 是完整的 access unit (已含 start code)
+                    // 直接写入，不加额外 start code
                     file.write_all(&packet.data)?;
                     file.flush()?;
                 }

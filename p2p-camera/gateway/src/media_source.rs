@@ -15,20 +15,48 @@ pub struct FileVideoSource {
     frame_interval: Duration,
     nal_units: Vec<Vec<u8>>,
     current: usize,
+    /// 缓存最新的 VPS/SPS/PPS (用于新 viewer 快速恢复)
+    /// 通过 Arc<Mutex> 共享给 gateway，在新 viewer 连接时读取
+    latest_param_sets: std::sync::Arc<std::sync::Mutex<Option<Vec<Vec<u8>>>>>,
 }
 
 impl FileVideoSource {
-    /// 从 H.265 裸流文件加载所有 NAL units
-    /// 简化: 按 start code (0x00000001) 分帧
+    /// 从 H.265 裸流文件加载所有 access units (每帧画面)
     pub fn from_file(data: Vec<u8>) -> Self {
-        let nal_units = split_h265_nal_units(&data);
-        tracing::info!("Loaded {} H.265 NAL units from file", nal_units.len());
+        let access_units = split_h265_access_units(&data);
+
+        // 统计 NAL 类型分布 (从每个 AU 的第一个 NAL 判断)
+        let mut vps = 0; let mut sps = 0; let mut pps = 0;
+        let mut idr = 0; let mut other = 0;
+        for au in &access_units {
+            // AU 格式: [00 00 00 01] [NAL...] [00 00 00 01] [NAL...]
+            // 找第一个 NAL 的 type
+            if let Some(first_nal) = first_nal_in_au(au) {
+                match nal_type(first_nal) {
+                    32 => vps += 1,
+                    33 => sps += 1,
+                    34 => pps += 1,
+                    19 | 20 => idr += 1,
+                    _ => other += 1,
+                }
+            }
+        }
+        println!(
+            "[Gateway] FileVideoSource: {} bytes → {} access units (VPS={}, SPS={}, PPS={}, IDR={}, other={})",
+            data.len(), access_units.len(), vps, sps, pps, idr, other
+        );
 
         Self {
             frame_interval: Duration::from_millis(40),
-            nal_units,
+            nal_units: access_units,
             current: 0,
+            latest_param_sets: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    /// 获取参数集缓存的 Arc clone (用于新 viewer 快速恢复)
+    pub fn param_sets_handle(&self) -> std::sync::Arc<std::sync::Mutex<Option<Vec<Vec<u8>>>>> {
+        self.latest_param_sets.clone()
     }
 
     /// 循环读取下一帧 (到头就循环)
@@ -46,7 +74,6 @@ impl FileVideoSource {
         thread::spawn(move || {
             let mut this = self;
             let start = Instant::now();
-            let mut frame_count: u64 = 0;
 
             loop {
                 let data = this.next_frame();
@@ -56,15 +83,25 @@ impl FileVideoSource {
                 }
 
                 let timestamp_ms = start.elapsed().as_millis() as u64;
-                // 简化: 每隔 50 帧认为是一个关键帧
-                let is_keyframe = frame_count % 50 == 0;
+                // 从 AU 的第一个 NAL 判断类型
+                let first_nal = first_nal_in_au(&data).unwrap_or(&[]);
+                let nal_t = nal_type(first_nal);
+                let is_keyframe = nal_t == 19 || nal_t == 20;
+
+                // 缓存 VPS/SPS/PPS (新 viewer 连接时需要)
+                if nal_t == 32 || nal_t == 33 || nal_t == 34 {
+                    if let Ok(mut ps) = this.latest_param_sets.lock() {
+                        let ps_vec = ps.get_or_insert_with(Vec::new);
+                        ps_vec.retain(|n| nal_type(n) != nal_t);
+                        ps_vec.push(first_nal.to_vec());
+                    }
+                }
 
                 let packet = MediaPacket::video(timestamp_ms, is_keyframe, Bytes::from(data));
                 if sender.send(packet).is_err() {
                     break; // 接收端已关闭
                 }
 
-                frame_count += 1;
                 thread::sleep(this.frame_interval);
             }
         })
@@ -115,23 +152,93 @@ impl SilenceAudioSource {
     }
 }
 
-/// 简单按 start code 分帧 (仅用于原型)
-fn split_h265_nal_units(data: &[u8]) -> Vec<Vec<u8>> {
-    let start_code: &[u8] = &[0, 0, 0, 1];
-    let mut units = Vec::new();
-    let mut start = None;
-
-    for i in 0..data.len().saturating_sub(3) {
-        if &data[i..i + 4] == start_code {
-            if let Some(s) = start {
-                if i > s {
-                    units.push(data[s..i].to_vec());
-                }
-            }
-            start = Some(i + 4);
-        }
+/// 按 access unit 分组 H.265 NAL units (Annex B 格式)
+/// 
+/// 一个 access unit = 一帧画面，可能包含多个 NAL:
+///   - VPS+SPS+PPS+IDR (关键帧)
+///   - 一组 slice NAL (P/B 帧)
+/// 
+/// Access unit 边界判断:
+///   1. VPS(32)/SPS(33)/PPS(34) 总是新 access unit 的开始
+///   2. IDR(19/20) 总是新 access unit 的开始  
+///   3. slice NAL (type < 32) 的 first_slice_segment_in_pic_flag=1 表示新 access unit
+///      H.265 NAL header: 2 bytes, slice_segment_header 第一字节 bit 7 = first_slice
+fn split_h265_access_units(data: &[u8]) -> Vec<Vec<u8>> {
+    let nal_units = split_h265_nal_units(data);
+    if nal_units.is_empty() {
+        return Vec::new();
     }
 
+    let mut access_units: Vec<Vec<u8>> = Vec::new();
+    let mut current_au: Vec<u8> = Vec::new();
+
+    for nal in &nal_units {
+        let nal_t = nal_type(nal);
+        // 判断是否是新 access unit 的开始
+        let is_new_au_start = if nal_t == 32 || nal_t == 33 || nal_t == 34 {
+            // VPS/SPS/PPS — 如果当前 AU 非空，先保存
+            true
+        } else if nal_t == 19 || nal_t == 20 {
+            // IDR — 总是新 AU
+            true
+        } else if nal_t < 32 {
+            // slice NAL — 检查 first_slice_segment_in_pic_flag
+            // NAL header = 2 bytes, 第3字节 bit 7 = first_slice_segment_in_pic_flag
+            nal.len() >= 3 && (nal[2] & 0x80) != 0
+        } else {
+            // SEI 等其他类型 — 归入当前 AU
+            false
+        };
+
+        if is_new_au_start && !current_au.is_empty() {
+            access_units.push(std::mem::take(&mut current_au));
+        }
+
+        // 将 NAL + start code 加入当前 AU (用 4 字节 start code)
+        current_au.extend_from_slice(&[0, 0, 0, 1]);
+        current_au.extend_from_slice(nal);
+    }
+
+    if !current_au.is_empty() {
+        access_units.push(current_au);
+    }
+
+    access_units
+}
+
+/// 按 start code 分割 H.265 NAL units (Annex B 格式)
+/// 同时支持 4 字节 (0x00000001) 和 3 字节 (0x000001) start code
+fn split_h265_nal_units(data: &[u8]) -> Vec<Vec<u8>> {
+    let mut units = Vec::new();
+    let mut start = None;
+    let mut i = 0;
+
+    while i + 3 <= data.len() {
+        // 快速跳过: 只有前两字节都为 0 才可能是 start code
+        if data[i] == 0 && data[i + 1] == 0 {
+            // 4 字节 start code: 0x00000001
+            if i + 4 <= data.len() && data[i + 2] == 0 && data[i + 3] == 1 {
+                if let Some(s) = start {
+                    units.push(data[s..i].to_vec());
+                }
+                start = Some(i + 4);
+                i += 4;
+                continue;
+            }
+            // 3 字节 start code: 0x000001
+            if data[i + 2] == 1 {
+                if let Some(s) = start {
+                    units.push(data[s..i].to_vec());
+                }
+                start = Some(i + 3);
+                i += 3;
+                continue;
+            }
+        }
+        i += 1;
+    }
+
+    // 最后一个 NAL unit
     if let Some(s) = start {
         if data.len() > s {
             units.push(data[s..].to_vec());
@@ -144,4 +251,40 @@ fn split_h265_nal_units(data: &[u8]) -> Vec<Vec<u8>> {
     }
 
     units
+}
+
+/// 提取 H.265 NAL unit type
+/// H.265 NAL header: 2 bytes
+///   byte0: forbidden_zero_bit(1) | nal_unit_type(6) | nuh_layer_id_high(1)
+///   nal_unit_type = (byte0 >> 1) & 0x3F
+/// 常见类型: 32=VPS, 33=SPS, 34=PPS, 19=IDR_W_RADL, 20=IDR_N_LP, 1=TRAIL_R
+fn nal_type(data: &[u8]) -> u8 {
+    if data.is_empty() {
+        return 0;
+    }
+    (data[0] >> 1) & 0x3F
+}
+
+/// 从 access unit (含 start code 的字节流) 中提取第一个 NAL unit 的内容
+/// AU 格式: [00 00 00 01] [NAL data...] [00 00 00 01] [NAL data...]
+/// 返回第一个 NAL data (不含 start code)
+fn first_nal_in_au(au: &[u8]) -> Option<&[u8]> {
+    // 跳过 start code (3 或 4 字节)
+    let start = if au.len() >= 4 && au[0..4] == [0, 0, 0, 1] {
+        4
+    } else if au.len() >= 3 && au[0..3] == [0, 0, 1] {
+        3
+    } else {
+        return None;
+    };
+
+    // 找下一个 start code
+    let nal_end = (start..au.len().saturating_sub(3))
+        .find(|&i| {
+            (au[i] == 0 && au[i + 1] == 0 && au[i + 2] == 1)
+                || (i + 3 < au.len() && au[i] == 0 && au[i + 1] == 0 && au[i + 2] == 0 && au[i + 3] == 1)
+        })
+        .unwrap_or(au.len());
+
+    Some(&au[start..nal_end])
 }

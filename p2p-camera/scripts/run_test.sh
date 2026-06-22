@@ -8,16 +8,19 @@
 # 用法:
 #   ./run_test.sh              # 完整端到端测试
 #   ./run_test.sh --no-video   # 跳过视频文件 (仅验证连接)
+#   ./run_test.sh --regen      # 强制重新生成测试视频
 
 set -e
 
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."  # 回到 rust-libp2p 根目录
 
 BIN_DIR="target/debug"
-VIDEO_FILE="/tmp/test.h265"
-OUTPUT_FILE="/tmp/output.h265"
+INPUT_FILE="p2p-camera/test-data/input.mp4"
+VIDEO_FILE="p2p-camera/test-data/p2p-camera-test.h265"
+OUTPUT_FILE="p2p-camera/test-data/p2p-camera-output.h265"
 PORT=4001
 SEED=42
+export RUST_LOG="${RUST_LOG:-info}"
 
 echo "=========================================="
 echo "  P2P-Camera End-to-End Test"
@@ -29,24 +32,46 @@ if [ ! -f "$BIN_DIR/relay-server" ] || [ ! -f "$BIN_DIR/gateway" ]; then
     exit 1
 fi
 
+# --regen: 强制删除旧视频，重新生成
+if [ "$1" == "--regen" ]; then
+    rm -f "$VIDEO_FILE"
+fi
+
 # ---- 1. 生成测试视频 ----
+# repeat-headers=1: 每个 IDR 关键帧前重复 VPS/SPS/PPS
+# 这样 viewer 从任意关键帧都能开始解码 (无需从头接收)
 if [ "$1" != "--no-video" ] && [ ! -f "$VIDEO_FILE" ]; then
-    echo "[1/5] Generating test H.265 video..."
+    echo "[1/5] Generating test H.265 video (50s, keyint=50, repeat-headers)..."
     if ! command -v ffmpeg &> /dev/null; then
         echo "[ERROR] ffmpeg not installed. Install with: sudo apt install ffmpeg"
         exit 1
     fi
-    ffmpeg -y -f lavfi -i "testsrc=duration=30:size=640x480:rate=25" \
-        -c:v libx265 -x265-params "keyint=50:min-keyint=50" \
-        -f hevc "$VIDEO_FILE" 2>/dev/null
+    # ffmpeg -y -f lavfi -i "testsrc=duration=50:size=640x480:rate=25" \
+    #     -c:v libx265 -x265-params "keyint=50:min-keyint=50:repeat-headers=1" \
+    #     -f hevc "$VIDEO_FILE" 2>/dev/null
+    ffmpeg -i "$INPUT_FILE" -c:v libx265 -x265-params "repeat-headers=1" -an "$VIDEO_FILE"
     echo "      Generated: $VIDEO_FILE"
 else
     echo "[1/5] Skipping video generation"
 fi
 
+# 检查视频文件大小 (空文件会导致 gateway 无帧可发)
+if [ -f "$VIDEO_FILE" ]; then
+    VSIZE=$(stat -c%s "$VIDEO_FILE" 2>/dev/null || stat -f%z "$VIDEO_FILE" 2>/dev/null)
+    echo "      Video file: $VIDEO_FILE ($VSIZE bytes)"
+    if [ "$VSIZE" -eq 0 ] 2>/dev/null; then
+        echo "[ERROR] Video file is empty! Removing and regenerating..."
+        rm -f "$VIDEO_FILE"
+        ffmpeg -y -f lavfi -i "testsrc=duration=50:size=640x480:rate=25" \
+            -c:v libx265 -x265-params "keyint=50:min-keyint=50:repeat-headers=1" \
+            -f hevc "$VIDEO_FILE" 2>/dev/null
+    fi
+fi
+
 # ---- 2. 启动 Relay Server ----
 echo "[2/5] Starting Relay Server..."
 RELAY_LOG=$(mktemp)
+export RUST_LOG=info
 $BIN_DIR/relay-server --port $PORT --secret-key-seed $SEED > "$RELAY_LOG" 2>&1 &
 RELAY_PID=$!
 sleep 2
@@ -113,6 +138,15 @@ if [ -f "$BIN_DIR/examples/viewer_cli" ]; then
             echo "=========================================="
             echo "  ❌ TEST FAILED - Empty output"
             echo "=========================================="
+            echo ""
+            echo "-------- Gateway log --------"
+            cat "$GATEWAY_LOG" | tail -30
+            echo ""
+            echo "-------- Relay log --------"
+            cat "$RELAY_LOG" | tail -10
+            echo ""
+            echo "-------- Viewer log --------"
+            cat "$VIEWER_LOG" | tail -10
         fi
     else
         echo "      No output file generated"
