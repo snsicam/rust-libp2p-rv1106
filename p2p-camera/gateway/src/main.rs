@@ -132,11 +132,23 @@ async fn main() -> Result<()> {
         }
     }
 
-    // 音频源: 模拟静音 (for 原型)
-    if opt.enable_audio {
-        let source = media_source::SilenceAudioSource::new(16000, 1);
-        source.spawn(broadcast_sender_to_crossbeam(audio_tx.clone()));
-        println!("[Gateway] Audio source: silence (16kHz mono)");
+    // 音频源
+    #[cfg(feature = "rv1106")]
+    {
+        if opt.enable_audio {
+            let source = rk_video_source::RkAudioSource::new(16000);
+            source.spawn(broadcast_sender_to_crossbeam(audio_tx.clone()));
+            println!("[Gateway] Audio source: RV1106 AI (16kHz mono)");
+        }
+    }
+
+    #[cfg(not(feature = "rv1106"))]
+    {
+        if opt.enable_audio {
+            let source = media_source::SilenceAudioSource::new(16000, 1);
+            source.spawn(broadcast_sender_to_crossbeam(audio_tx.clone()));
+            println!("[Gateway] Audio source: silence (16kHz mono)");
+        }
     }
 
     // ---- Stream 控制 ----

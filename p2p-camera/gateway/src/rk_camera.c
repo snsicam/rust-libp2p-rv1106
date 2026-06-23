@@ -19,10 +19,12 @@
 #include "rk_mpi_vi.h"
 #include "rk_mpi_venc.h"
 #include "rk_mpi_mb.h"
+#include "rk_mpi_ai.h"
 #include "rk_common.h"
 #include "rk_comm_video.h"
 #include "rk_comm_venc.h"
 #include "rk_comm_vi.h"
+#include "rk_comm_aio.h"
 
 // ISP (rkaiq) 头文件
 #include "rk_aiq_user_api2_sysctl.h"
@@ -37,6 +39,33 @@ static pthread_t g_get_stream_thread;
 static volatile int g_quit = 0;
 static volatile int g_initialized = 0;
 static rk_aiq_sys_ctx_t *g_aiq_ctx = NULL;  // ISP AIQ 上下文
+
+// RK_MPI_SYS_Init/Exit 引用计数 — camera 和 audio 各自 init 时 +1, deinit 时 -1
+// 当计数归零时才真正调用 RK_MPI_SYS_Exit
+// 解决: 当 audio 先于 camera 初始化时 (例如 gateway 启动后还没有 viewer 连接,
+//       视频 spawn 等待 start_trigger, 但音频立即 spawn), MPP 系统未初始化导致段错误
+static volatile int g_sys_init_count = 0;
+
+static int ensure_sys_init() {
+    if (g_sys_init_count == 0) {
+        int ret = RK_MPI_SYS_Init();
+        if (ret != RK_SUCCESS) {
+            printf("[rk_camera] RK_MPI_SYS_Init failed: %x\n", ret);
+            return -1;
+        }
+    }
+    g_sys_init_count++;
+    return 0;
+}
+
+static void maybe_sys_exit() {
+    if (g_sys_init_count > 0) {
+        g_sys_init_count--;
+        if (g_sys_init_count == 0) {
+            RK_MPI_SYS_Exit();
+        }
+    }
+}
 
 // 帧回调: Rust 侧通过 rk_camera_set_callback 设置
 typedef void (*frame_callback_t)(const uint8_t *data, uint32_t len, uint64_t pts, int is_keyframe);
@@ -244,13 +273,13 @@ static int venc_init(int width, int height, int fps, int bitrate_kbps) {
 // 返回 0 成功, 非0 失败
 int rk_camera_init(int width, int height, int fps, int bitrate_kbps) {
     if (g_initialized) return 0;
+    int ret;
 
     printf("[rk_camera] init %dx%d @%dfps, bitrate=%dkbps\n",
            width, height, fps, bitrate_kbps);
 
-    int ret = RK_MPI_SYS_Init();
-    if (ret != RK_SUCCESS) {
-        printf("[rk_camera] RK_MPI_SYS_Init failed: %x\n", ret);
+    // 确保 MPP 系统已初始化 (与 rk_audio_init 共享, 引用计数)
+    if (ensure_sys_init() != 0) {
         return -1;
     }
 
@@ -335,10 +364,147 @@ void rk_camera_deinit() {
     // ISP 反初始化 (在 VI 销毁之后)
     isp_deinit();
 
-    RK_MPI_SYS_Exit();
+    // 释放 MPP 系统引用 (与 rk_audio_deinit 共享, 引用计数归零时才真正 Exit)
+    maybe_sys_exit();
 
     g_initialized = 0;
     printf("[rk_camera] deinitialized\n");
+}
+
+// ============== 音频采集 (AI) ==============
+
+#define AI_DEV_ID   0
+#define AI_CHN_ID   0
+
+static pthread_t g_audio_thread;
+static volatile int g_audio_quit = 0;
+static volatile int g_audio_initialized = 0;
+
+// 音频帧回调: fn(data, len, pts_us)
+typedef void (*audio_callback_t)(const uint8_t *data, uint32_t len, uint64_t pts_us);
+static audio_callback_t g_audio_callback = NULL;
+
+// 音频取流线程
+static void *audio_get_stream_thread(void *arg) {
+    (void)arg;
+    AUDIO_FRAME_S frame;
+    int loopCount = 0;
+
+    printf("[rk_camera] audio thread started\n");
+
+    while (!g_audio_quit) {
+        int ret = RK_MPI_AI_GetFrame(AI_DEV_ID, AI_CHN_ID, &frame, RK_NULL, -1);
+        if (ret == RK_SUCCESS) {
+            void *pData = RK_MPI_MB_Handle2VirAddr(frame.pMbBlk);
+            uint32_t u32Len = frame.u32Len;
+
+            if (g_audio_callback && pData && u32Len > 0) {
+                g_audio_callback((const uint8_t *)pData, u32Len, 0);
+            }
+
+            if (loopCount == 0) {
+                printf("[rk_camera] first audio frame: len=%u\n", u32Len);
+            }
+            loopCount++;
+
+            RK_MPI_AI_ReleaseFrame(AI_DEV_ID, AI_CHN_ID, &frame, RK_NULL);
+        } else {
+            usleep(10 * 1000);
+        }
+    }
+
+    printf("[rk_camera] audio thread exit, total frames=%d\n", loopCount);
+    return NULL;
+}
+
+// 初始化音频采集 (AI)
+// sample_rate: 8000/16000/48000
+// 返回 0 成功
+int rk_audio_init(int sample_rate) {
+    if (g_audio_initialized) return 0;
+
+    printf("[rk_camera] audio init: %dHz\n", sample_rate);
+
+    // 确保 MPP 系统已初始化 (与 rk_camera_init 共享, 引用计数)
+    // 修复: 视频源 spawn 是延迟的 (等第一个 viewer 连接), 但音频 spawn 立即执行,
+    //       如果不调用 ensure_sys_init, RK_MPI_AI_* 会因 MPP 系统未初始化而段错误
+    if (ensure_sys_init() != 0) {
+        return -1;
+    }
+
+    AIO_ATTR_S aiAttr;
+    AI_CHN_PARAM_S pstParams;
+    int ret;
+
+    memset(&aiAttr, 0, sizeof(AIO_ATTR_S));
+    sprintf((char *)aiAttr.u8CardName, "%s", "hw:0,0");
+    aiAttr.soundCard.channels = 2;
+    aiAttr.soundCard.sampleRate = sample_rate;
+    aiAttr.soundCard.bitWidth = AUDIO_BIT_WIDTH_16;
+    aiAttr.enBitwidth = AUDIO_BIT_WIDTH_16;
+    aiAttr.enSamplerate = (AUDIO_SAMPLE_RATE_E)sample_rate;
+    aiAttr.enSoundmode = AUDIO_SOUND_MODE_MONO;
+    aiAttr.u32PtNumPerFrm = 1024;  // 每帧采样点数 (约 64ms @16kHz)
+    aiAttr.u32FrmNum = 4;
+    aiAttr.u32EXFlag = 0;
+    aiAttr.u32ChnCnt = 2;
+
+    ret = RK_MPI_AI_SetPubAttr(AI_DEV_ID, &aiAttr);
+    if (ret != RK_SUCCESS) {
+        printf("[rk_camera] RK_MPI_AI_SetPubAttr failed: %x\n", ret);
+        return -1;
+    }
+
+    ret = RK_MPI_AI_Enable(AI_DEV_ID);
+    if (ret != RK_SUCCESS) {
+        printf("[rk_camera] RK_MPI_AI_Enable failed: %x\n", ret);
+        return -1;
+    }
+
+    memset(&pstParams, 0, sizeof(AI_CHN_PARAM_S));
+    pstParams.s32UsrFrmDepth = 4;
+    ret = RK_MPI_AI_SetChnParam(AI_DEV_ID, AI_CHN_ID, &pstParams);
+    if (ret != RK_SUCCESS) {
+        printf("[rk_camera] RK_MPI_AI_SetChnParam failed: %x\n", ret);
+        return -1;
+    }
+
+    ret = RK_MPI_AI_EnableChn(AI_DEV_ID, AI_CHN_ID);
+    if (ret != RK_SUCCESS) {
+        printf("[rk_camera] RK_MPI_AI_EnableChn failed: %x\n", ret);
+        return -1;
+    }
+
+    // 启动音频取流线程
+    g_audio_quit = 0;
+    ret = pthread_create(&g_audio_thread, NULL, audio_get_stream_thread, NULL);
+    if (ret != 0) return -1;
+
+    g_audio_initialized = 1;
+    printf("[rk_camera] audio initialized\n");
+    return 0;
+}
+
+// 设置音频回调
+void rk_audio_set_callback(audio_callback_t cb) {
+    g_audio_callback = cb;
+}
+
+// 音频反初始化
+void rk_audio_deinit() {
+    if (!g_audio_initialized) return;
+
+    g_audio_quit = 1;
+    pthread_join(g_audio_thread, NULL);
+
+    RK_MPI_AI_DisableChn(AI_DEV_ID, AI_CHN_ID);
+    RK_MPI_AI_Disable(AI_DEV_ID);
+
+    // 释放 MPP 系统引用 (与 rk_camera_deinit 共享, 引用计数归零时才真正 Exit)
+    maybe_sys_exit();
+
+    g_audio_initialized = 0;
+    printf("[rk_camera] audio deinitialized\n");
 }
 
 // ---- Stubs for glibc functions missing in uclibc ----

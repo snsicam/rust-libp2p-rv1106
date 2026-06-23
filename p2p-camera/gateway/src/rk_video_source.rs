@@ -169,3 +169,99 @@ impl Drop for RkVideoSource {
         }
     }
 }
+
+// ============== 音频源 ==============
+
+/// C 侧的音频回调签名: fn(data, len, pts_us)
+type AudioCallback = extern "C" fn(*const u8, u32, u64);
+
+extern "C" {
+    fn rk_audio_init(sample_rate: std::ffi::c_int) -> std::ffi::c_int;
+    fn rk_audio_set_callback(cb: AudioCallback);
+    fn rk_audio_deinit();
+}
+
+/// 全局音频状态
+static GLOBAL_AUDIO_SENDER: Mutex<Option<Sender<MediaPacket>>> = Mutex::new(None);
+static GLOBAL_AUDIO_START_TIME: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// C 音频回调 — 在 AI 取流线程中调用
+extern "C" fn on_audio_frame(data: *const u8, len: u32, _pts_us: u64) {
+    let slice = unsafe { std::slice::from_raw_parts(data, len as usize) };
+
+    let timestamp_ms = GLOBAL_AUDIO_START_TIME.lock()
+        .ok()
+        .and_then(|t| t.as_ref().map(|s| s.elapsed().as_millis() as u64))
+        .unwrap_or(0);
+
+    let packet = MediaPacket::audio_pcm(timestamp_ms, Bytes::copy_from_slice(slice));
+
+    if let Ok(sender) = GLOBAL_AUDIO_SENDER.lock() {
+        if let Some(tx) = sender.as_ref() {
+            let _ = tx.send(packet);
+        }
+    }
+}
+
+/// RV1106 真实音频源 (AI 采集 PCM)
+pub struct RkAudioSource {
+    sample_rate: u32,
+}
+
+impl RkAudioSource {
+    pub fn new(sample_rate: u32) -> Self {
+        Self { sample_rate }
+    }
+
+    /// 在独立线程中启动音频采集
+    pub fn spawn(self, sender: Sender<MediaPacket>) -> thread::JoinHandle<()> {
+        let sample_rate = self.sample_rate;
+
+        thread::spawn(move || {
+            // 设置全局状态
+            {
+                let mut sender_guard = GLOBAL_AUDIO_SENDER.lock().unwrap();
+                *sender_guard = Some(sender);
+            }
+            {
+                let mut time_guard = GLOBAL_AUDIO_START_TIME.lock().unwrap();
+                *time_guard = Some(Instant::now());
+            }
+
+            // 初始化音频
+            let ret = unsafe { rk_audio_init(sample_rate as i32) };
+            if ret != 0 {
+                eprintln!("[RkAudioSource] rk_audio_init failed: {}", ret);
+                return;
+            }
+
+            // 设置回调
+            unsafe { rk_audio_set_callback(on_audio_frame); }
+
+            println!("[RkAudioSource] Audio started ({}Hz)", sample_rate);
+
+            // 等待停止
+            loop {
+                let should_stop = GLOBAL_AUDIO_SENDER.lock()
+                    .map(|s| s.is_none())
+                    .unwrap_or(true);
+                if should_stop {
+                    break;
+                }
+                thread::sleep(std::time::Duration::from_millis(1000));
+            }
+
+            // 清理
+            unsafe { rk_audio_deinit(); }
+            println!("[RkAudioSource] Audio stopped");
+        })
+    }
+}
+
+impl Drop for RkAudioSource {
+    fn drop(&mut self) {
+        if let Ok(mut s) = GLOBAL_AUDIO_SENDER.lock() {
+            *s = None;
+        }
+    }
+}

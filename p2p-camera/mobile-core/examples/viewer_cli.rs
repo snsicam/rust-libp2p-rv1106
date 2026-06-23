@@ -102,7 +102,21 @@ async fn main() -> Result<()> {
         .context("Failed to open video stream")?;
     println!("[Viewer] Video stream opened");
 
-    // ---- 4. 启动接收任务 ----
+    // ---- 3b. 打开音频 stream (可选) ----
+    let (audio_tx, mut audio_rx) = mpsc::channel::<MediaPacket>(60);
+    if !opt.no_audio {
+        match stream_control.open_stream(gateway, stream_protocols::AUDIO_PROTOCOL).await {
+            Ok(audio_stream) => {
+                println!("[Viewer] Audio stream opened");
+                tokio::spawn(receive_frames(gateway, audio_stream, audio_tx));
+            }
+            Err(e) => {
+                println!("[Viewer] Audio stream open failed (non-fatal): {e}");
+            }
+        }
+    }
+
+    // ---- 4. 启动视频接收任务 ----
     let (tx, mut rx) = mpsc::channel::<MediaPacket>(60);
     tokio::spawn(receive_frames(gateway, video_stream, tx));
 
@@ -115,6 +129,19 @@ async fn main() -> Result<()> {
         None
     };
 
+    #[cfg(feature = "player")]
+    let mut audio_player = if opt.play && !opt.no_audio {
+        match player::AudioPlayer::new(16000) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                println!("[Viewer] Audio player init failed (non-fatal): {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let mut output_file = if let Some(path) = &opt.output {
         Some(std::fs::File::create(path).context("Failed to create output file")?)
     } else {
@@ -123,6 +150,7 @@ async fn main() -> Result<()> {
 
     let mut frame_count: u64 = 0;
     let mut bytes_received: u64 = 0;
+    let mut audio_count: u64 = 0;
     let start = std::time::Instant::now();
 
     println!("[Viewer] Receiving video frames... (Ctrl+C to stop)");
@@ -144,6 +172,25 @@ async fn main() -> Result<()> {
                     }
                     e => {
                         tracing::debug!("[Viewer] Event: {:?}", e);
+                    }
+                }
+            }
+            // 接收音频帧
+            audio_packet = audio_rx.recv() => {
+                if let Some(packet) = audio_packet {
+                    audio_count += 1;
+                    if audio_count == 1 {
+                        println!("[Viewer] First audio frame: {} bytes, ts={}",
+                            packet.data.len(), packet.timestamp_ms);
+                    }
+                    // SDL 音频播放
+                    #[cfg(feature = "player")]
+                    if let Some(ap) = &mut audio_player {
+                        ap.write(&packet.data);
+                    }
+                    if audio_count % 250 == 0 {
+                        println!("[Viewer] Audio: {} frames, last {} bytes, ts={}",
+                            audio_count, packet.data.len(), packet.timestamp_ms);
                     }
                 }
             }
@@ -465,6 +512,77 @@ mod player {
             Ok(())
         }
     }
+
+    /// SDL2 音频播放器 — 播放 PCM 16LE 数据
+    pub struct AudioPlayer {
+        device: sdl2::audio::AudioDevice<AudioQueue>,
+        sample_rate: i32,
+    }
+
+    // SDL 音频回调使用的队列
+    struct AudioQueue {
+        buffer: std::collections::VecDeque<u8>,
+    }
+
+    impl sdl2::audio::AudioCallback for AudioQueue {
+        type Channel = i16;
+
+        fn callback(&mut self, out: &mut [i16]) {
+            for sample in out.iter_mut() {
+                // 从队列读取 2 字节 (一个 i16 采样)
+                if self.buffer.len() >= 2 {
+                    let lo = self.buffer.pop_front().unwrap();
+                    let hi = self.buffer.pop_front().unwrap();
+                    *sample = i16::from_le_bytes([lo, hi]);
+                } else {
+                    *sample = 0; // 队列空, 输出静音
+                }
+            }
+        }
+    }
+
+    impl AudioPlayer {
+        /// 创建音频播放器 (16kHz mono PCM16LE)
+        pub fn new(sample_rate: u32) -> Result<Self> {
+            let sdl_context = sdl2::init()
+                .map_err(|e| anyhow::anyhow!("SDL init: {e}"))?;
+            let audio_subsystem = sdl_context.audio()
+                .map_err(|e| anyhow::anyhow!("SDL audio: {e}"))?;
+
+            let desired_spec = sdl2::audio::AudioSpecDesired {
+                freq: Some(sample_rate as i32),
+                channels: Some(1),
+                samples: Some(1024),
+            };
+
+            let device = audio_subsystem.open_playback(None, &desired_spec, |spec| {
+                println!("[AudioPlayer] Opened: {}Hz {}ch {}samples",
+                    spec.freq, spec.channels, spec.samples);
+                AudioQueue {
+                    buffer: std::collections::VecDeque::with_capacity(65536),
+                }
+            }).map_err(|e| anyhow::anyhow!("SDL audio device: {e}"))?;
+
+            device.resume();
+            println!("[AudioPlayer] Started ({}Hz)", sample_rate);
+
+            Ok(Self {
+                device,
+                sample_rate: sample_rate as i32,
+            })
+        }
+
+        /// 写入 PCM 数据 (16LE mono)
+        pub fn write(&mut self, data: &[u8]) {
+            let mut queue = self.device.lock();
+            queue.buffer.extend(data);
+            // 限制缓冲大小, 避免延迟过大 (最多 0.5 秒)
+            let max_bytes = (self.sample_rate as usize) * 2 / 2; // 0.5s * 2 bytes
+            while queue.buffer.len() > max_bytes {
+                queue.buffer.pop_front();
+            }
+        }
+    }
 }
 
 // ---- NetworkBehaviour ----
@@ -518,6 +636,10 @@ struct Opt {
     /// 输出文件路径 (H.265 裸流, 可选)
     #[arg(long)]
     output: Option<std::path::PathBuf>,
+
+    /// 禁用音频流接收
+    #[arg(long, default_value_t = false)]
+    no_audio: bool,
 
     /// SDL 实时播放 (需 --features player 编译)
     #[cfg(feature = "player")]
