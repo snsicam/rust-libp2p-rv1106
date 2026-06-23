@@ -3,6 +3,7 @@
 # 用法:
 #   ./build.sh           # 默认 debug
 #   ./build.sh release   # release 模式
+#   ./build.sh player    # release + SDL 播放器 (viewer_cli --play)
 #   ./build.sh test      # 编译 + 运行测试
 
 set -e
@@ -42,6 +43,14 @@ case "$MODE" in
         echo "[5/5] Done."
         ;;
 
+    player)
+        echo "[1/3] Building relay-server + gateway (release)..."
+        cargo build -p relay-server -p gateway --release
+        echo "[2/3] Building viewer_cli (release, player feature)..."
+        cargo build --example viewer_cli -p mobile-core --release --features player
+        echo "[3/3] Done."
+        ;;
+
     debug|*)
         echo "[1/4] Building proto..."
         cargo build -p proto
@@ -61,16 +70,13 @@ echo "  Build SUCCESS"
 echo "=========================================="
 echo ""
 echo "Binaries:"
-echo "  Relay Server:  target/debug/relay-server"
-echo "  Gateway:       target/debug/gateway"
-echo "  Viewer CLI:    target/debug/examples/viewer_cli"
+echo "  Relay Server:  target/release/relay-server"
+echo "  Gateway:       target/release/gateway"
+echo "  Viewer CLI:    target/release/examples/viewer_cli"
 echo ""
-echo "Quick test:"
-echo "  # Terminal 1: Relay"
-echo "  RUST_LOG=info ./target/debug/relay-server --port 4001 --secret-key-seed 42"
+echo "Quick start (SDL player):"
+echo "  # Terminal 1: Server (relay + gateway)"
+echo "  ./p2p-camera/scripts/start_server.sh"
 echo ""
-echo "  # Terminal 2: Gateway"
-echo "  RUST_LOG=info ./target/debug/gateway --relay /ip4/127.0.0.1/tcp/4001/p2p/<RELAY_PEER> --video-file test.h265 --enable-audio"
-echo ""
-echo "  # Terminal 3: Viewer"
-echo "  RUST_LOG=info ./target/debug/examples/viewer_cli --relay /ip4/127.0.0.1/tcp/4001/p2p/<RELAY_PEER> --camera <GATEWAY_PEER> --output output.h265"
+echo "  # Terminal 2: Viewer (SDL playback)"
+echo "  ./p2p-camera/scripts/play_viewer.sh <relay_addr> <gateway_peer>"

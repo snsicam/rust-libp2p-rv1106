@@ -7,6 +7,11 @@ publish = false
 [lib]
 crate-type = ["cdylib", "staticlib"]  # .so for Android, .a for iOS
 
+[features]
+# SDL2 + ffmpeg 实时播放 (viewer_cli --play)
+# 编译: cargo build --example viewer_cli --features player
+player = ["dep:ffmpeg-next", "dep:sdl2"]
+
 [dependencies]
 libp2p = { workspace = true, features = [
     "tokio", "tcp", "quic", "noise", "yamux",
@@ -21,6 +26,18 @@ tracing = { workspace = true }
 crossbeam-channel = "0.5"
 
 proto = { path = "../proto" }
+
+# 可选: 实时播放 (player feature)
+# ffmpeg-next 版本需匹配系统 ffmpeg:
+#   "6" → ffmpeg 6.x (Ubuntu 24.04 默认 6.1.1)
+#   "7" → ffmpeg 7.x (需手动安装)
+# 注意: ffmpeg-next 6.1.1 的 codec/software-scaling 内部引用 format 模块,
+#       无法用 default-features=false 禁用 format, 必须保留默认 features.
+# 系统依赖 (Ubuntu): sudo apt install libavcodec-dev libavformat-dev libavutil-dev \
+#                                      libswscale-dev libswresample-dev libavfilter-dev \
+#                                      libavdevice-dev libsdl2-dev clang
+ffmpeg-next = { version = "6", optional = true }
+sdl2 = { version = "0.37", optional = true }
 
 [dev-dependencies]
 clap = { version = "4", features = ["derive"] }

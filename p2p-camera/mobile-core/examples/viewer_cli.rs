@@ -6,11 +6,15 @@
 //!     --camera <GATEWAY_PEER_ID> \
 //!     --output output.h265
 //!
+//! 实时播放 (需 --features player):
+//!   cargo build --example viewer_cli --features player
+//!   viewer_cli --relay ... --camera ... --play
+//!
 //! 验证流程:
 //!   1. 连接 Relay Server
 //!   2. 通过 Circuit 拨号 Gateway
 //!   3. 打开视频 stream 接收帧
-//!   4. 保存到文件 (可用 ffplay 播放)
+//!   4. 保存到文件 (可用 ffplay 播放) 或 SDL 实时播放 (--play, 需 --features player)
 //!   5. 打印接收统计
 
 use std::time::Duration;
@@ -32,7 +36,9 @@ use tracing_subscriber::EnvFilter;
 
 const STREAM_READ_BUF: usize = 65536;
 
-#[tokio::main]
+// SDL2 要求事件循环在主线程, 使用 current_thread runtime
+#[cfg_attr(feature = "player", tokio::main(flavor = "current_thread"))]
+#[cfg_attr(not(feature = "player"), tokio::main)]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
@@ -100,7 +106,15 @@ async fn main() -> Result<()> {
     let (tx, mut rx) = mpsc::channel::<MediaPacket>(60);
     tokio::spawn(receive_frames(gateway, video_stream, tx));
 
-    // ---- 5. 主循环: 驱动 swarm + 接收帧写文件 ----
+    // ---- 5. 初始化播放器/输出 ----
+    #[cfg(feature = "player")]
+    let mut player = if opt.play {
+        println!("[Viewer] Initializing SDL player...");
+        Some(player::VideoPlayer::new()?)
+    } else {
+        None
+    };
+
     let mut output_file = if let Some(path) = &opt.output {
         Some(std::fs::File::create(path).context("Failed to create output file")?)
     } else {
@@ -146,10 +160,23 @@ async fn main() -> Result<()> {
                 // 写入文件 (H.265 裸流, 可用 ffplay 播放)
                 if let Some(file) = &mut output_file {
                     use std::io::Write;
-                    // packet.data 是完整的 access unit (已含 start code)
-                    // 直接写入，不加额外 start code
                     file.write_all(&packet.data)?;
                     file.flush()?;
+                }
+
+                // SDL 实时播放
+                #[cfg(feature = "player")]
+                if let Some(p) = player.as_mut() {
+                    match p.render(&packet.data) {
+                        Ok(false) => {
+                            println!("[Viewer] Player window closed, stopping...");
+                            break;
+                        }
+                        Ok(true) => {}
+                        Err(e) => {
+                            tracing::error!("[Viewer] Player error: {e}");
+                        }
+                    }
                 }
 
                 // 每 100 帧打印统计
@@ -171,9 +198,11 @@ async fn main() -> Result<()> {
     println!("\n[Viewer] === Summary ===");
     println!("[Viewer] Total frames: {frame_count}");
     println!("[Viewer] Total bytes: {bytes_received}");
-    println!("[Viewer] Duration: {elapsed:.1}s");
-    println!("[Viewer] Avg fps: {:.1}", frame_count as f64 / elapsed);
-    println!("[Viewer] Avg bitrate: {:.0} kbps", (bytes_received * 8) as f64 / elapsed / 1000.0);
+    if elapsed > 0.0 {
+        println!("[Viewer] Duration: {elapsed:.1}s");
+        println!("[Viewer] Avg fps: {:.1}", frame_count as f64 / elapsed);
+        println!("[Viewer] Avg bitrate: {:.0} kbps", (bytes_received * 8) as f64 / elapsed / 1000.0);
+    }
 
     if let Some(path) = &opt.output {
         println!("[Viewer] Output saved to: {}", path.display());
@@ -243,6 +272,201 @@ async fn wait_for_event(
     }
 }
 
+// ---- SDL Player (player feature) ----
+
+#[cfg(feature = "player")]
+mod player {
+    use anyhow::{Context, Result};
+    use ffmpeg_next as ffmpeg;
+    use ffmpeg_next::codec::traits::Decoder;
+    use sdl2::event::Event;
+    use sdl2::keyboard::Keycode;
+    use sdl2::pixels::PixelFormatEnum;
+    use sdl2::rect::Rect;
+
+    /// 将 sdl2 的各种错误类型 (String / IntegerOrSdlError / UpdateTextureYUVError ...)
+    /// 统一转为 anyhow::Error
+    fn map_sdl<T, E: std::string::ToString>(r: std::result::Result<T, E>, ctx: &str) -> Result<T> {
+        r.map_err(|e| anyhow::anyhow!("SDL {ctx}: {}", e.to_string()))
+    }
+
+    /// H.265 解码 + SDL2 渲染的实时播放器
+    ///
+    /// SAFETY: `texture` 字段使用 `Texture<'static>`，实际生命周期绑定到 `canvas`。
+    /// Rust 保证 struct 字段按声明顺序 drop，因此 texture (在前) 先于 canvas drop。
+    pub struct VideoPlayer {
+        // texture 必须在 canvas 之前声明 (先 drop)
+        texture: Option<sdl2::render::Texture<'static>>,
+        canvas: sdl2::render::Canvas<sdl2::video::Window>,
+        decoder: ffmpeg::decoder::Video,
+        event_pump: sdl2::EventPump,
+        /// 格式转换器 (非 YUV420P → YUV420P)
+        scaler: Option<ffmpeg::software::scaling::Context>,
+        /// 转换后的 YUV 帧
+        yuv_frame: ffmpeg::frame::Video,
+        width: u32,
+        height: u32,
+        frame_count: u64,
+    }
+
+    impl VideoPlayer {
+        pub fn new() -> Result<Self> {
+            ffmpeg::init()?;
+
+            // 创建 H.265 解码器
+            let codec = ffmpeg::decoder::find(ffmpeg::codec::Id::HEVC)
+                .context("HEVC decoder not found (install libavcodec-dev / libavcodec-extra)")?;
+            let decoder = ffmpeg::codec::Context::new()
+                .decoder()
+                .open_as(codec)
+                .context("Failed to open HEVC decoder")?
+                .video()?;
+
+            // 初始化 SDL2
+            let sdl_context = map_sdl(sdl2::init(), "init")?;
+            let video_subsystem = map_sdl(sdl_context.video(), "video")?;
+
+            let window = video_subsystem
+                .window("P2P Camera Viewer", 1280, 720)
+                .position_centered()
+                .build()
+                .map_err(|e| anyhow::anyhow!("SDL window: {e}"))?;
+            let canvas = window
+                .into_canvas()
+                .accelerated()
+                .present_vsync()
+                .build()
+                .map_err(|e| anyhow::anyhow!("SDL canvas: {e}"))?;
+
+            let event_pump = map_sdl(sdl_context.event_pump(), "event_pump")?;
+
+            Ok(Self {
+                texture: None,
+                canvas,
+                decoder,
+                event_pump,
+                scaler: None,
+                yuv_frame: ffmpeg::frame::Video::empty(),
+                width: 0,
+                height: 0,
+                frame_count: 0,
+            })
+        }
+
+        /// 渲染一个 H.265 access unit, 返回 false 表示用户关闭窗口
+        pub fn render(&mut self, au: &[u8]) -> Result<bool> {
+            // 处理 SDL 事件 (退出检测)
+            for event in self.event_pump.poll_iter() {
+                match event {
+                    Event::Quit { .. }
+                    | Event::KeyDown {
+                        keycode: Some(Keycode::Escape),
+                        ..
+                    } => return Ok(false),
+                    _ => {}
+                }
+            }
+
+            // 发送数据给解码器
+            let mut packet = ffmpeg::Packet::new(au.len());
+            if let Some(data) = packet.data_mut() {
+                data.copy_from_slice(au);
+            }
+            self.decoder.send_packet(&packet)?;
+
+            // 接收并渲染所有可用帧
+            let mut frame = ffmpeg::frame::Video::empty();
+            loop {
+                match self.decoder.receive_frame(&mut frame) {
+                    Ok(()) => self.render_frame(&frame)?,
+                    Err(_) => break, // EAGAIN = 需要更多数据, 其他错误也停止
+                }
+            }
+
+            Ok(true)
+        }
+
+        fn render_frame(&mut self, frame: &ffmpeg::frame::Video) -> Result<()> {
+            use ffmpeg::format::pixel::Pixel;
+
+            let w = frame.width();
+            let h = frame.height();
+
+            // 分辨率变化 → 重建 texture + 调整窗口
+            if w != self.width || h != self.height || self.texture.is_none() {
+                self.width = w;
+                self.height = h;
+                let tc = self.canvas.texture_creator();
+                let tex = map_sdl(
+                    tc.create_texture_streaming(PixelFormatEnum::IYUV, w, h),
+                    "create_texture",
+                )?;
+                // SAFETY: tex 的生命周期绑定到 tc, tc 绑定到 self.canvas。
+                // 我们将 tex 存储在 self.texture 中 (声明在 canvas 之前, 先 drop)。
+                let tex: sdl2::render::Texture<'static> =
+                    unsafe { std::mem::transmute::<sdl2::render::Texture<'_>, sdl2::render::Texture<'static>>(tex) };
+                self.texture = Some(tex);
+                map_sdl(self.canvas.window_mut().set_size(w, h), "set_size")?;
+                println!("[Player] Video: {w}x{h} ({:?})", frame.format());
+            }
+
+            // 获取 YUV 平面数据 (转为 owned 以避免借用冲突)
+            let (y, ys, u, us, v, vs) = if frame.format() == Pixel::YUV420P {
+                (
+                    frame.data(0).to_vec(), frame.stride(0) as usize,
+                    frame.data(1).to_vec(), frame.stride(1) as usize,
+                    frame.data(2).to_vec(), frame.stride(2) as usize,
+                )
+            } else {
+                // 创建/更新 scaler
+                if self.scaler.is_none() {
+                    self.scaler = Some(
+                        ffmpeg::software::scaling::context::Context::get(
+                            frame.format(), w, h,
+                            Pixel::YUV420P, w, h,
+                            ffmpeg::software::scaling::Flags::BILINEAR,
+                        )
+                        .context("Failed to create scaler")?,
+                    );
+                }
+                // 转换到 YUV420P
+                self.yuv_frame = ffmpeg::frame::Video::new(Pixel::YUV420P, w, h);
+                {
+                    let scaler = self.scaler.as_mut().unwrap();
+                    scaler.run(frame, &mut self.yuv_frame)?;
+                }
+                (
+                    self.yuv_frame.data(0).to_vec(), self.yuv_frame.stride(0) as usize,
+                    self.yuv_frame.data(1).to_vec(), self.yuv_frame.stride(1) as usize,
+                    self.yuv_frame.data(2).to_vec(), self.yuv_frame.stride(2) as usize,
+                )
+            };
+
+            // 更新 texture + 渲染
+            if let Some(tex) = &mut self.texture {
+                map_sdl(tex.update_yuv(None, &y, ys, &u, us, &v, vs), "update_yuv")?;
+            }
+            self.canvas.clear();
+            map_sdl(
+                self.canvas.copy(
+                    self.texture.as_ref().unwrap(),
+                    None,
+                    Some(Rect::new(0, 0, self.width, self.height)),
+                ),
+                "copy",
+            )?;
+            self.canvas.present();
+
+            self.frame_count += 1;
+            if self.frame_count % 100 == 0 {
+                println!("[Player] Rendered {} frames", self.frame_count);
+            }
+
+            Ok(())
+        }
+    }
+}
+
 // ---- NetworkBehaviour ----
 
 #[derive(NetworkBehaviour)]
@@ -294,4 +518,9 @@ struct Opt {
     /// 输出文件路径 (H.265 裸流, 可选)
     #[arg(long)]
     output: Option<std::path::PathBuf>,
+
+    /// SDL 实时播放 (需 --features player 编译)
+    #[cfg(feature = "player")]
+    #[arg(long)]
+    play: bool,
 }
