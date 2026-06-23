@@ -14,11 +14,10 @@
 
 mod behaviour;
 mod media_source;
+#[cfg(feature = "rv1106")]
+mod rk_video_source;
 
-use std::{
-    path::PathBuf,
-    time::Duration,
-};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use behaviour::Behaviour;
@@ -94,26 +93,43 @@ async fn main() -> Result<()> {
     println!("[Gateway] Relay reservation confirmed!");
     println!("[Gateway] External address: /p2p-circuit/p2p/{peer_id}");
 
-    // ---- 初始化媒体源 (文件 or SDK) ----
+    // ---- 初始化媒体源 (文件 or RV1106 SDK) ----
     let (video_tx, _video_rx) = broadcast::channel::<MediaPacket>(BROADCAST_CAPACITY);
     let (audio_tx, _audio_rx) = broadcast::channel::<MediaPacket>(BROADCAST_CAPACITY);
 
     // 参数集缓存 (VPS/SPS/PPS) — 新 viewer 连接时先发送这些，避免 "PPS id out of range"
-    let mut param_sets: Option<std::sync::Arc<std::sync::Mutex<Option<Vec<Vec<u8>>>>>> = None;
+    let param_sets: Option<std::sync::Arc<std::sync::Mutex<Option<Vec<Vec<u8>>>>>>;
     // 视频源启动触发器 — 第一个 viewer 连接时才开始播放 (从文件头)
-    let mut video_start_trigger: Option<crossbeam_channel::Sender<()>> = None;
+    let mut video_start_trigger: Option<crossbeam_channel::Sender<()>>;
 
-    if let Some(video_path) = &opt.video_file {
-        let data = std::fs::read(video_path)
-            .context("Failed to read video file")?;
-        println!("[Gateway] Video file: {:?} ({} bytes)", video_path, data.len());
-        let source = media_source::FileVideoSource::from_file(data);
+    #[cfg(feature = "rv1106")]
+    {
+        // RV1106 真实摄像头
+        let width = opt.width.unwrap_or(1920);
+        let height = opt.height.unwrap_or(1080);
+        let fps = opt.fps.unwrap_or(25);
+        let bitrate = opt.bitrate.unwrap_or(4096);
+        println!("[Gateway] Video source: RV1106 camera {}x{} @{}fps {}kbps", width, height, fps, bitrate);
+        let source = rk_video_source::RkVideoSource::new(width, height, fps, bitrate);
         param_sets = Some(source.param_sets_handle());
         let (_, start_tx) = source.spawn(broadcast_sender_to_crossbeam(video_tx.clone()));
         video_start_trigger = Some(start_tx);
-        println!("[Gateway] Video source: file ({:?}) — waiting for first viewer to start", video_path);
-    } else {
-        println!("[Gateway] Video source: NONE (waiting for stream requests)");
+    }
+
+    #[cfg(not(feature = "rv1106"))]
+    {
+        if let Some(video_path) = &opt.video_file {
+            let data = std::fs::read(video_path)
+                .context("Failed to read video file")?;
+            println!("[Gateway] Video file: {:?} ({} bytes)", video_path, data.len());
+            let source = media_source::FileVideoSource::from_file(data);
+            param_sets = Some(source.param_sets_handle());
+            let (_, start_tx) = source.spawn(broadcast_sender_to_crossbeam(video_tx.clone()));
+            video_start_trigger = Some(start_tx);
+            println!("[Gateway] Video source: file ({:?}) — waiting for first viewer to start", video_path);
+        } else {
+            println!("[Gateway] Video source: NONE (waiting for stream requests)");
+        }
     }
 
     // 音频源: 模拟静音 (for 原型)
@@ -365,11 +381,32 @@ struct Opt {
     #[arg(long, default_value = "listen")]
     mode: String,
 
-    /// 视频裸流文件 (H.265) — 代替 SDK 回调
+    /// 视频裸流文件 (H.265) — 代替 SDK 回调 (非 rv1106 feature)
+    #[cfg(not(feature = "rv1106"))]
     #[arg(long)]
-    video_file: Option<PathBuf>,
+    video_file: Option<std::path::PathBuf>,
 
     /// 启用模拟音频 (静音)
     #[arg(long, default_value_t = false)]
     enable_audio: bool,
+
+    /// [rv1106] 视频宽度
+    #[cfg(feature = "rv1106")]
+    #[arg(long)]
+    width: Option<u32>,
+
+    /// [rv1106] 视频高度
+    #[cfg(feature = "rv1106")]
+    #[arg(long)]
+    height: Option<u32>,
+
+    /// [rv1106] 帧率
+    #[cfg(feature = "rv1106")]
+    #[arg(long)]
+    fps: Option<u32>,
+
+    /// [rv1106] 码率 (kbps)
+    #[cfg(feature = "rv1106")]
+    #[arg(long)]
+    bitrate: Option<u32>,
 }

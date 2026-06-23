@@ -3,6 +3,8 @@
 //! 当前阶段: 从文件模拟读取 (H.265 raw + PCM raw)
 //! 后续替换: RV1106 SDK FFI 回调 → crossbeam_channel
 
+#![allow(dead_code)]  // FileVideoSource 在 rv1106 feature 下不使用
+
 use bytes::Bytes;
 use crossbeam_channel::Sender;
 use proto::media_packet::MediaPacket;
