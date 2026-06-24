@@ -52,7 +52,8 @@ trap cleanup EXIT INT TERM
 
 # ---- 启动 Relay ----
 echo "[2/3] Starting relay-server (port 4001)..."
-"$RELAY_BIN" --port 4001 --secret-key-seed 42 > "$LOG_DIR/relay.log" 2>&1 &
+RELAY_KEY="$LOG_DIR/relay-server.key"
+"$RELAY_BIN" --port 4001 --key-file "$RELAY_KEY" > "$LOG_DIR/relay.log" 2>&1 &
 RELAY_PID=$!
 
 # 等待 relay 就绪, 提取 PeerId
@@ -73,7 +74,8 @@ RELAY_ADDR="/ip4/127.0.0.1/tcp/4001/p2p/$RELAY_PEER"
 
 # ---- 启动 Gateway ----
 echo "[3/3] Starting gateway..."
-"$GATEWAY_BIN" --relay "$RELAY_ADDR" --video-file "$VIDEO_FILE" > "$LOG_DIR/gateway.log" 2>&1 &
+GATEWAY_KEY="$LOG_DIR/gateway.key"
+"$GATEWAY_BIN" --relay "$RELAY_ADDR" --video-file "$VIDEO_FILE" --key-file "$GATEWAY_KEY" > "$LOG_DIR/gateway.log" 2>&1 &
 GATEWAY_PID=$!
 
 # 等待 gateway 就绪, 提取 PeerId
@@ -99,7 +101,7 @@ echo "  Relay Addr:   $RELAY_ADDR"
 echo "  Gateway Peer: $GATEWAY_PEER"
 echo ""
 echo "  在另一个终端运行:"
-echo "    $SCRIPT_DIR/play_viewer.sh $RELAY_ADDR $GATEWAY_PEER"
+echo "    $SCRIPT_DIR/play_viewer.sh run $RELAY_ADDR $GATEWAY_PEER"
 echo ""
 echo "  Logs: $LOG_DIR/{relay,gateway}.log"
 echo "  Ctrl+C to stop"

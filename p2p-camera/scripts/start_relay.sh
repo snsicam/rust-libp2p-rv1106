@@ -17,13 +17,13 @@ LOG_DIR="$SCRIPT_DIR/logs"
 mkdir -p "$LOG_DIR"
 
 PORT=4001
-SEED=42
+KEY_FILE="$SCRIPT_DIR/relay-server.key"
 
 # 解析参数
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --port) PORT="$2"; shift 2 ;;
-        --seed) SEED="$2"; shift 2 ;;
+        --key-file) KEY_FILE="$2"; shift 2 ;;
         *) echo "[ERROR] Unknown arg: $1"; exit 1 ;;
     esac
 done
@@ -47,8 +47,8 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 # ---- 启动 Relay ----
-echo "[2/2] Starting relay-server on port $PORT..."
-"$RELAY_BIN" --port "$PORT" --secret-key-seed "$SEED" > "$LOG_DIR/relay.log" 2>&1 &
+echo "[2/2] Starting relay-server on port $PORT (key: $KEY_FILE)..."
+"$RELAY_BIN" --port "$PORT" --key-file "$KEY_FILE" > "$LOG_DIR/relay.log" 2>&1 &
 RELAY_PID=$!
 
 # 等待 relay 就绪, 提取 PeerId
@@ -80,7 +80,10 @@ echo "  ---- RV1106 上运行 (gateway) ----"
 echo "  gateway --relay $RELAY_ADDR --video-file /tmp/test.h265"
 echo ""
 echo "  ---- PC 上运行 (viewer, SDL 播放) ----"
-echo "  $SCRIPT_DIR/play_viewer.sh $RELAY_ADDR <GATEWAY_PEER>"
+echo "  # 先编译 viewer"
+echo "  $SCRIPT_DIR/play_viewer.sh build"
+echo "  # 再运行 viewer"
+echo "  $SCRIPT_DIR/play_viewer.sh run $RELAY_ADDR <GATEWAY_PEER>"
 echo "  (GATEWAY_PEER 从 RV1106 gateway 启动日志获取)"
 echo ""
 echo "  Log: $LOG_DIR/relay.log"

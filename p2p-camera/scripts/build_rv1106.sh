@@ -37,8 +37,8 @@ if [ "$RV1106_MODE" = true ]; then
     TOOLCHAIN_DIR="${RV1106_TOOLCHAIN:-/home/song/samba/work/rv1106/luckfox-pico/tools/linux/toolchain/arm-rockchip830-linux-uclibcgnueabihf}"
 else
     # 文件模式: musl target (静态链接, 同 ping)
-    TARGET="armv7-unknown-linux-musleabihf"
-    GCC_NAME="armv7l-linux-musleabihf-gcc"
+    TARGET="armv7-unknown-linux-gnueabihf"
+    GCC_NAME="armv7l-linux-gnueabihf-gcc"
 fi
 
 GATEWAY_BIN="$PROJECT_ROOT/target/$TARGET/release/gateway"
@@ -80,12 +80,25 @@ export CFLAGS_${TARGET_UNDERSCORE}="-fPIC"
 
 # ---- rv1106 模式: 设置 SDK 路径 ----
 if [ "$RV1106_MODE" = true ]; then
-    export RV1106_SDK_INCLUDE="${RV1106_SDK_INCLUDE:-/usr/include}"
+    SDK_ROOT="${RV1106_SDK_ROOT:-/home/song/samba/work/rv1106/lubancat}"
+
+    # SDK 头文件路径 — rockit MPI 头文件 (rk_mpi_sys.h 等)
+    # 如果未设置, 自动检测 SDK 源码树中的 include 路径
+    if [ -z "${RV1106_SDK_INCLUDE:-}" ]; then
+        ROCKIT_INC="$SDK_ROOT/media/rockit/rockit/mpi/sdk/include"
+        if [ -f "$ROCKIT_INC/rk_mpi_sys.h" ]; then
+            export RV1106_SDK_INCLUDE="$ROCKIT_INC"
+        else
+            echo "[ERROR] rockit include dir not found. Checked:"
+            echo "  $ROCKIT_INC/rk_mpi_sys.h"
+            echo "Set RV1106_SDK_INCLUDE manually"
+            exit 1
+        fi
+    fi
 
     # SDK 库路径 — librockit_full.so / librkaiq.so / librockchip_mpp.so 在不同目录, 用冒号分隔
     # 如果未设置, 自动检测 SDK 源码树中的 .so 路径
     if [ -z "${RV1106_SDK_LIB:-}" ]; then
-        SDK_ROOT="${RV1106_SDK_ROOT:-/home/song/samba/work/rv1106/lubancat}"
         ROCKIT_LIB="$SDK_ROOT/media/rockit/rockit/lib/lib32"
         RKAIQ_LIB="$SDK_ROOT/media/isp/release_camera_engine_rkaiq_rv1106_arm-rockchip830-linux-uclibcgnueabihf/lib"
         MPP_LIB="$SDK_ROOT/media/mpp/release_mpp_rv1106_arm-rockchip830-linux-uclibcgnueabihf/lib"
