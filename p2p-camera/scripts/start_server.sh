@@ -29,12 +29,12 @@ VSIZE=$(stat -c%s "$VIDEO_FILE" 2>/dev/null || stat -f%z "$VIDEO_FILE" 2>/dev/nu
 echo "[INFO] Video: $VIDEO_FILE ($VSIZE bytes)"
 
 # ---- 编译 ----
-echo "[1/3] Building relay-server + gateway (release)..."
+echo "[1/3] Building relay-server + gateway (debug)..."
 cd "$PROJECT_ROOT"
-cargo build --release -p relay-server -p gateway 2>&1 | tail -3
+cargo build -p relay-server -p gateway 2>&1 | tail -3
 
-RELAY_BIN="$PROJECT_ROOT/target/release/relay-server"
-GATEWAY_BIN="$PROJECT_ROOT/target/release/gateway"
+RELAY_BIN="$PROJECT_ROOT/target/debug/relay-server"
+GATEWAY_BIN="$PROJECT_ROOT/target/debug/gateway"
 
 # ---- 进程管理 ----
 RELAY_PID=""

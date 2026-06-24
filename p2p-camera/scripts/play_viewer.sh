@@ -26,7 +26,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 LOG_DIR="$SCRIPT_DIR/logs"
-VIEWER_BIN="$PROJECT_ROOT/target/release/examples/viewer_cli"
+VIEWER_BIN="$PROJECT_ROOT/target/debug/examples/viewer_cli"
 
 # ---- 修复 ffmpeg-sys-next bindgen 找不到 GCC limits.h 的问题 ----
 # libclang 默认不搜索 GCC 内部 include 目录, 需手动指定
@@ -44,9 +44,9 @@ setup_bindgen() {
 do_build() {
     setup_bindgen
 
-    echo "[INFO] Building viewer_cli (with SDL player)..."
+    echo "[INFO] Building viewer_cli (with SDL player, debug)..."
     cd "$PROJECT_ROOT"
-    if ! cargo build --release --example viewer_cli -p mobile-core --features player; then
+    if ! cargo build --example viewer_cli -p mobile-core --features player; then
         echo "[ERROR] Build failed. See errors above."
         exit 1
     fi

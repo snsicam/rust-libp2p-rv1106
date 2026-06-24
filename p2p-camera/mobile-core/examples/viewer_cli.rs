@@ -305,14 +305,14 @@ async fn run_viewer_session(
         .with_tcp(
             tcp::Config::default().nodelay(true),
             noise::Config::new,
-            yamux::Config::default,
+            libp2p::yamux::Config::default,
         )?
         .with_quic()
-        .with_relay_client(noise::Config::new, yamux::Config::default)?
+        .with_relay_client(noise::Config::new, libp2p::yamux::Config::default)?
         .with_behaviour(|key, relay_client| {
             Ok(ViewerBehaviour::new(key.public(), relay_client))
         })?
-        .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
+        .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(120)))
         .build();
 
     // ---- 监听本地 QUIC + TCP ----

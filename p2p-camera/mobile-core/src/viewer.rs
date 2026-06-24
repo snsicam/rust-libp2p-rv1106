@@ -15,7 +15,7 @@ use libp2p::{
     core::multiaddr::{Multiaddr, Protocol},
     dcutr, identify, noise, ping, relay,
     swarm::{NetworkBehaviour, SwarmEvent},
-    tcp, yamux, Swarm, PeerId,
+    tcp, Swarm, PeerId,
 };
 use libp2p_stream::{self, Control};
 use proto::{
@@ -55,14 +55,14 @@ impl P2pViewer {
             .with_tcp(
                 tcp::Config::default().nodelay(true),
                 noise::Config::new,
-                yamux::Config::default,
+                libp2p::yamux::Config::default,
             )?
             .with_quic()
-            .with_relay_client(noise::Config::new, yamux::Config::default)?
+            .with_relay_client(noise::Config::new, libp2p::yamux::Config::default)?
             .with_behaviour(|key, relay_client| {
                 Ok(ViewerBehaviour::new(key.public(), relay_client))
             })?
-            .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
+            .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(120)))
             .build();
 
         let stream_control = swarm.behaviour().stream.new_control();

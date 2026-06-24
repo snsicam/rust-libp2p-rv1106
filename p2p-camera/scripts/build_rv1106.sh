@@ -34,14 +34,14 @@ if [ "$RV1106_MODE" = true ]; then
     # 摄像头模式: glibc target + Rockchip uclibc 工具链 (动态链接 SDK)
     TARGET="armv7-unknown-linux-gnueabihf"
     GCC_NAME="arm-rockchip830-linux-uclibcgnueabihf-gcc"
-    TOOLCHAIN_DIR="${RV1106_TOOLCHAIN:-/home/song/samba/work/rv1106/luckfox-pico/tools/linux/toolchain/arm-rockchip830-linux-uclibcgnueabihf}"
+    TOOLCHAIN_DIR="${RV1106_TOOLCHAIN:-$PROJECT_ROOT/toolchain/arm-rockchip830-linux-uclibcgnueabihf}"
 else
     # 文件模式: musl target (静态链接, 同 ping)
     TARGET="armv7-unknown-linux-gnueabihf"
     GCC_NAME="armv7l-linux-gnueabihf-gcc"
 fi
 
-GATEWAY_BIN="$PROJECT_ROOT/target/$TARGET/release/gateway"
+GATEWAY_BIN="$PROJECT_ROOT/target/$TARGET/debug/gateway"
 
 cd "$PROJECT_ROOT"
 
@@ -133,9 +133,9 @@ echo ""
 echo "[2/3] Building gateway for RV1106..."
 
 if [ "$RV1106_MODE" = true ]; then
-    cargo build --release -p gateway --target "$TARGET" --features rv1106
+    cargo build -p gateway --target "$TARGET" --features rv1106
 else
-    cargo build --release -p gateway --target "$TARGET"
+    cargo build -p gateway --target "$TARGET"
 fi
 
 # ---- 验证产物 ----

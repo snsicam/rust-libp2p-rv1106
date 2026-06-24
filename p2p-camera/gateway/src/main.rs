@@ -35,7 +35,7 @@ use libp2p::{
     core::multiaddr::{Multiaddr, Protocol},
     dcutr, identity, noise, relay,
     swarm::SwarmEvent,
-    tcp, yamux,
+    tcp,
     PeerId,
 };
 use proto::{
@@ -196,10 +196,10 @@ async fn run_gateway_session(
         .with_tcp(
             tcp::Config::default().nodelay(true),
             noise::Config::new,
-            yamux::Config::default,
+            libp2p::yamux::Config::default,
         )?
         .with_quic()
-        .with_relay_client(noise::Config::new, yamux::Config::default)?
+        .with_relay_client(noise::Config::new, libp2p::yamux::Config::default)?
         .with_behaviour(|key, relay_client| {
             Ok(Behaviour::new(key.public(), relay_client))
         })?
