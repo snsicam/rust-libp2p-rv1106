@@ -21,9 +21,19 @@ extern "C" {
     fn rk_camera_init(width: std::ffi::c_int, height: std::ffi::c_int,
                       fps: std::ffi::c_int, bitrate_kbps: std::ffi::c_int) -> std::ffi::c_int;
     fn rk_camera_set_callback(cb: FrameCallback);
-    #[allow(dead_code)]
     fn rk_camera_request_idr() -> std::ffi::c_int;
     fn rk_camera_deinit();
+}
+
+/// 请求 IDR 关键帧 — 用于 broadcast 丢帧后让 viewer 解码器重新同步
+pub fn request_idr() {
+    unsafe { rk_camera_request_idr(); }
+}
+
+/// 获取当前缓存的 VPS/SPS/PPS (从全局状态实时读取)
+/// 新 viewer 连接时调用，确保拿到最新的参数集
+pub fn get_param_sets() -> Vec<Vec<u8>> {
+    GLOBAL_PARAM_SETS.lock().map(|ps| ps.clone()).unwrap_or_default()
 }
 
 /// 全局状态 — C 回调是全局函数, 需要全局访问 sender

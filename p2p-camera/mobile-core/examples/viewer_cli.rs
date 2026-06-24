@@ -66,6 +66,13 @@ async fn main() -> Result<()> {
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
         .build();
 
+    // ---- 监听本地 QUIC + TCP (DCUtR hole punch 前提: 双方都需要本地 socket) ----
+    swarm.listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse()
+        .context("Invalid local QUIC listen addr")?)?;
+    swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()
+        .context("Invalid local TCP listen addr")?)?;
+    println!("[Viewer] Listening on local QUIC + TCP (for DCUtR hole punch)");
+
     // ---- 1. 连接 Relay ----
     let relay_addr: Multiaddr = opt.relay.parse().context("Invalid relay address")?;
     println!("[Viewer] Dialing relay: {relay_addr}");
@@ -94,21 +101,24 @@ async fn main() -> Result<()> {
 
     println!("[Viewer] Connected to gateway {gateway}");
 
-    // ---- 3. 打开视频 stream ----
+    // ---- 3. 打开视频 stream (初始走 circuit, DCUtR 成功后迁移到直连) ----
     let mut stream_control = swarm.behaviour().stream.new_control();
     let video_stream = stream_control
         .open_stream(gateway, stream_protocols::VIDEO_PROTOCOL)
         .await
         .context("Failed to open video stream")?;
-    println!("[Viewer] Video stream opened");
+    println!("[Viewer] Video stream opened (via relay circuit)");
 
     // ---- 3b. 打开音频 stream (可选) ----
     let (audio_tx, mut audio_rx) = mpsc::channel::<MediaPacket>(60);
+    let mut audio_abort_handle: Option<tokio::task::AbortHandle> = None;
     if !opt.no_audio {
         match stream_control.open_stream(gateway, stream_protocols::AUDIO_PROTOCOL).await {
             Ok(audio_stream) => {
-                println!("[Viewer] Audio stream opened");
-                tokio::spawn(receive_frames(gateway, audio_stream, audio_tx));
+                println!("[Viewer] Audio stream opened (via relay circuit)");
+                let h = tokio::spawn(receive_frames(gateway, audio_stream, audio_tx.clone()))
+                    .abort_handle();
+                audio_abort_handle = Some(h);
             }
             Err(e) => {
                 println!("[Viewer] Audio stream open failed (non-fatal): {e}");
@@ -118,7 +128,11 @@ async fn main() -> Result<()> {
 
     // ---- 4. 启动视频接收任务 ----
     let (tx, mut rx) = mpsc::channel::<MediaPacket>(60);
-    tokio::spawn(receive_frames(gateway, video_stream, tx));
+    let mut video_abort_handle: Option<tokio::task::AbortHandle> =
+        Some(tokio::spawn(receive_frames(gateway, video_stream, tx.clone())).abort_handle());
+
+    // DCUtR 直连升级标记 (用于 Summary 统计)
+    let mut direct_upgraded = false;
 
     // ---- 5. 初始化播放器/输出 ----
     #[cfg(feature = "player")]
@@ -162,13 +176,54 @@ async fn main() -> Result<()> {
                 match event {
                     SwarmEvent::Behaviour(ViewerBehaviourEvent::Dcutr(
                         dcutr::Event { result: Ok(_), remote_peer_id, .. },
+                    )) if !direct_upgraded => {
+                        println!("[Viewer] DCUtR direct connection established with {remote_peer_id}, upgrading streams...");
+                        // 在直连上开新 video stream (libp2p 会优先选择最新建立的直连 connection)
+                        match stream_control.open_stream(gateway, stream_protocols::VIDEO_PROTOCOL).await {
+                            Ok(new_stream) => {
+                                // abort 旧的 circuit 接收 task (会关闭旧 stream, gateway 侧收到 EOF 自然结束)
+                                if let Some(h) = video_abort_handle.take() { h.abort(); }
+                                let handle = tokio::spawn(receive_frames(gateway, new_stream, tx.clone())).abort_handle();
+                                video_abort_handle = Some(handle);
+                                direct_upgraded = true;
+                                println!("[Viewer] Video stream upgraded to direct connection");
+                            }
+                            Err(e) => {
+                                println!("[Viewer] Failed to open direct video stream (staying on circuit): {e}");
+                            }
+                        }
+                        // 音频也迁移到直连
+                        if direct_upgraded && !opt.no_audio {
+                            match stream_control.open_stream(gateway, stream_protocols::AUDIO_PROTOCOL).await {
+                                Ok(new_stream) => {
+                                    if let Some(h) = audio_abort_handle.take() { h.abort(); }
+                                    let handle = tokio::spawn(receive_frames(gateway, new_stream, audio_tx.clone())).abort_handle();
+                                    audio_abort_handle = Some(handle);
+                                    println!("[Viewer] Audio stream upgraded to direct connection");
+                                }
+                                Err(e) => {
+                                    println!("[Viewer] Failed to open direct audio stream: {e}");
+                                }
+                            }
+                        }
+                    }
+                    SwarmEvent::Behaviour(ViewerBehaviourEvent::Dcutr(
+                        dcutr::Event { result: Ok(_), .. },
                     )) => {
-                        println!("[Viewer] DCUtR direct connection established with {remote_peer_id}");
+                        // 已迁移, 忽略重复 DCUtR 事件
                     }
                     SwarmEvent::Behaviour(ViewerBehaviourEvent::Dcutr(
                         dcutr::Event { result: Err(e), remote_peer_id, .. },
                     )) => {
-                        tracing::warn!("[Viewer] DCUtR failed with {remote_peer_id}: {e}");
+                        println!("[Viewer] DCUtR hole punch FAILED with {remote_peer_id}: {e} (staying on relay circuit)");
+                    }
+                    SwarmEvent::Behaviour(ViewerBehaviourEvent::Identify(
+                        identify::Event::Received { info, .. },
+                    )) => {
+                        // 打印 identify 观察到的地址 (DCUtR 依赖这些地址做 hole punch)
+                        println!("[Viewer] Identify: observed_addr={}, listen_addrs={}",
+                            info.observed_addr,
+                            info.listen_addrs.len());
                     }
                     e => {
                         tracing::debug!("[Viewer] Event: {:?}", e);
@@ -243,6 +298,7 @@ async fn main() -> Result<()> {
 
     let elapsed = start.elapsed().as_secs_f64();
     println!("\n[Viewer] === Summary ===");
+    println!("[Viewer] Direct connection (DCUtR): {}", if direct_upgraded { "YES (hole punched, no relay bandwidth)" } else { "NO (relay circuit)" });
     println!("[Viewer] Total frames: {frame_count}");
     println!("[Viewer] Total bytes: {bytes_received}");
     if elapsed > 0.0 {

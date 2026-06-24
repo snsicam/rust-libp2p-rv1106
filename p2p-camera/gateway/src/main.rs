@@ -71,6 +71,14 @@ async fn main() -> Result<()> {
 
     println!("[Gateway] PeerId: {peer_id}");
 
+    // ---- 监听本地 QUIC + TCP (DCUtR hole punch 前提: 需要本地 socket 用于打洞) ----
+    // 端口 0 = 随机端口, 避免 RV1106 上端口冲突
+    swarm.listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse()
+        .context("Invalid local QUIC listen addr")?)?;
+    swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()
+        .context("Invalid local TCP listen addr")?)?;
+    println!("[Gateway] Listening on local QUIC + TCP (for DCUtR hole punch)");
+
     // ---- 连接 Relay Server ----
     let relay_addr: Multiaddr = opt.relay.parse()
         .context("Invalid relay address")?;
@@ -195,8 +203,13 @@ async fn main() -> Result<()> {
                         anyhow::bail!("Relay reservation failed: {e}");
                     }
 
-                    SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                        println!("[Gateway] Connection established: {peer_id}");
+                    SwarmEvent::NewListenAddr { address, .. } => {
+                        println!("[Gateway] Listening on: {address}");
+                    }
+
+                    SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+                        let role = if endpoint.is_dialer() { "outgoing" } else { "incoming" };
+                        println!("[Gateway] Connection established: {peer_id} ({role})");
                     }
 
                     _ => {
@@ -215,6 +228,9 @@ async fn main() -> Result<()> {
                         let _ = tx.send(());
                     }
                     // 先发送缓存的 VPS/SPS/PPS，让 viewer 立即能解码
+                    #[cfg(feature = "rv1106")]
+                    let init_nals = rk_video_source::get_param_sets();
+                    #[cfg(not(feature = "rv1106"))]
                     let init_nals = param_sets.as_ref().and_then(|ps| {
                         ps.lock().ok()?.as_ref().map(|v| v.clone())
                     }).unwrap_or_default();
@@ -248,6 +264,9 @@ async fn wait_for_connection(
             SwarmEvent::OutgoingConnectionError { error, .. } => {
                 anyhow::bail!("Failed to connect: {error}");
             }
+            SwarmEvent::NewListenAddr { address, .. } => {
+                println!("[Gateway] Listening on: {address}");
+            }
             _ => {}
         }
     }
@@ -271,6 +290,9 @@ async fn wait_for_reservation(
                 ..
             } if listener_id == reservation_id => {
                 anyhow::bail!("Reservation request rejected: {e}");
+            }
+            SwarmEvent::NewListenAddr { address, .. } => {
+                println!("[Gateway] Listening on: {address}");
             }
             _ => {}
         }
@@ -326,8 +348,10 @@ async fn stream_video_to_viewer(
                 }
             }
             Err(broadcast::error::RecvError::Lagged(n)) => {
-                tracing::warn!("Video stream to {peer_id} lagged by {n} frames");
-                // 继续, 跳过丢失的帧
+                tracing::warn!("Video stream to {peer_id} lagged by {n} frames, requesting IDR");
+                // 丢帧后请求 IDR，让 viewer 解码器在下一个关键帧重新同步
+                #[cfg(feature = "rv1106")]
+                rk_video_source::request_idr();
             }
             Err(broadcast::error::RecvError::Closed) => {
                 println!("[Gateway] Broadcast closed for {peer_id} after {frame_count} frames");
