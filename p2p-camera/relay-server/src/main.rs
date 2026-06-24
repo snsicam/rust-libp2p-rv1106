@@ -6,6 +6,9 @@
 //! 2. 节点身份交换 (Identify)
 //! 3. 保活检测 (Ping)
 //!
+//! 固定身份: 首次运行自动生成 Ed25519 密钥并保存到 key_file，
+//!           后续启动从文件读取，保证 PeerId 不变。
+//!
 //! 注意: 此节点不包含 stream::Behaviour，它只做连接中继，不参与媒体流。
 
 mod behaviour;
@@ -13,6 +16,7 @@ mod behaviour;
 use std::{
     error::Error,
     net::{Ipv4Addr, Ipv6Addr},
+    path::PathBuf,
 };
 
 use behaviour::Behaviour;
@@ -34,12 +38,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let opt = Opt::parse();
 
-    // 确定性密钥, 保证 PeerId 不变 (方便配置)
-    let keypair = {
-        let mut bytes = [0u8; 32];
-        bytes[0] = opt.secret_key_seed;
-        identity::Keypair::ed25519_from_bytes(bytes).expect("only errors on wrong length")
-    };
+    // 从文件加载固定身份密钥, 保证 PeerId 不变 (方便配置)
+    let keypair = load_or_create_keypair(&opt.key_file)?;
     let peer_id = keypair.public().to_peer_id();
 
     let mut swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
@@ -124,11 +124,33 @@ struct Opt {
     #[arg(long, default_value_t = false)]
     use_ipv6: bool,
 
-    /// 确定性密钥种子 (0-255)
-    #[arg(long, default_value_t = 42)]
-    secret_key_seed: u8,
+    /// 身份密钥文件 (protobuf 格式)
+    /// 首次运行自动生成，后续启动从此文件读取以保证 PeerId 不变
+    #[arg(long, default_value = "relay-server.key")]
+    key_file: PathBuf,
 
     /// 监听端口
     #[arg(long, default_value_t = 4001)]
     port: u16,
+}
+
+/// 从文件加载密钥，不存在则生成新密钥并保存
+fn load_or_create_keypair(key_file: &PathBuf) -> Result<identity::Keypair, Box<dyn Error>> {
+    if key_file.exists() {
+        let data = std::fs::read(key_file)?;
+        let keypair = identity::Keypair::from_protobuf_encoding(&data)
+            .map_err(|e| format!("Failed to decode key file {}: {e}", key_file.display()))?;
+        tracing::info!("Loaded identity from {}", key_file.display());
+        Ok(keypair)
+    } else {
+        let keypair = identity::Keypair::generate_ed25519();
+        let data = keypair.to_protobuf_encoding()
+            .map_err(|e| format!("Failed to encode keypair: {e}"))?;
+        if let Some(parent) = key_file.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(key_file, &data)?;
+        tracing::info!("Generated new identity → {}", key_file.display());
+        Ok(keypair)
+    }
 }
