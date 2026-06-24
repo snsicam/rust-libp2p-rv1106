@@ -1,6 +1,6 @@
 //! RV1106 摄像头视频源 — 通过 Rockchip SDK 获取 H.265 硬编码流
 //!
-//! 编译要求: --features rv1106 + 交叉编译到 armv7-unknown-linux-musleabihf
+//! 编译要求: --features rv1106 + 交叉编译到 armv7-unknown-linux-gnueabihf
 //! 链接: librk_camera.so (由 rk_camera.c 编译) + librockit_full.so + librkaiq.so
 //!
 //! 数据流:

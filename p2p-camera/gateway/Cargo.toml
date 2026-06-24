@@ -6,7 +6,7 @@ publish = false
 
 [features]
 # RV1106 真实摄像头 (链接 librk_camera.so + librockit_full.so)
-# 编译: cargo build --features rv1106 --target armv7-unknown-linux-musleabihf
+# 编译: cargo build --features rv1106 --target armv7-unknown-linux-gnueabihf
 rv1106 = []
 
 [dependencies]

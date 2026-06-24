@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 // RV1106 Camera SDK C shim — 封装 VI + VENC 初始化为简单接口
-// 编译: armv7l-linux-musleabihf-gcc -shared -fPIC -o librk_camera.so rk_camera.c \
+// 编译: armv7l-linux-gnueabihf-gcc -shared -fPIC -o librk_camera.so rk_camera.c \
 //       -I<rockit_sdk_include_dir> -lrockit_full -lrkaiq
 //
 // 这个 shim 封装了复杂的 VI/VENC 初始化逻辑, Rust 侧只需调用:
