@@ -250,13 +250,13 @@ fn drain_channel(
     bytes_received: &mut u64,
     start: &std::time::Instant,
     output_file: &mut Option<std::fs::File>,
-    #[cfg(feature = "player")] player: Option<&mut player::VideoPlayer>,
+    #[cfg(feature = "player")] mut player: Option<&mut player::VideoPlayer>,
 ) {
     while let Ok(packet) = rx.try_recv() {
         if !process_video_frame(
             packet, frame_count, bytes_received, start, output_file,
             #[cfg(feature = "player")]
-            player,
+            player.as_mut().map(|p| &mut **p),
         ) {
             break;
         }
@@ -267,12 +267,12 @@ fn drain_channel(
 fn drain_audio_channel(
     audio_rx: &mut mpsc::Receiver<MediaPacket>,
     audio_count: &mut u64,
-    #[cfg(feature = "player")] audio_player: Option<&mut player::AudioPlayer>,
+    #[cfg(feature = "player")] mut audio_player: Option<&mut player::AudioPlayer>,
 ) {
-    while let Ok(_packet) = audio_rx.try_recv() {
+    while let Ok(packet) = audio_rx.try_recv() {
         *audio_count += 1;
         #[cfg(feature = "player")]
-        if let Some(ap) = audio_player {
+        if let Some(ap) = audio_player.as_mut().map(|p| &mut **p) {
             ap.write(&packet.data);
         }
     }
@@ -549,7 +549,6 @@ async fn wait_for_event(
 mod player {
     use anyhow::{Context, Result};
     use ffmpeg_next as ffmpeg;
-    use ffmpeg_next::codec::traits::Decoder;
     use sdl2::event::Event;
     use sdl2::keyboard::Keycode;
     use sdl2::pixels::PixelFormatEnum;
