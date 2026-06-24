@@ -54,18 +54,22 @@ if ! rustup target list --installed 2>/dev/null | grep -q "$TARGET"; then
     exit 1
 fi
 
+# 优先将 toolchain bin 加入 PATH (cargo build 需要)
+if [ -n "${TOOLCHAIN_DIR:-}" ] && [ -d "$TOOLCHAIN_DIR/bin" ]; then
+    export PATH="$TOOLCHAIN_DIR/bin:$PATH"
+fi
+
 GCC_PATH=$(which "$GCC_NAME" 2>/dev/null || echo "")
 if [ -z "$GCC_PATH" ]; then
-    # 尝试在 TOOLCHAIN_DIR 中查找
-    if [ -x "$TOOLCHAIN_DIR/bin/$GCC_NAME" ]; then
-        export PATH="$TOOLCHAIN_DIR/bin:$PATH"
-        GCC_PATH="$TOOLCHAIN_DIR/bin/$GCC_NAME"
+    echo "[ERROR] Cross compiler '$GCC_NAME' not found."
+    if [ "$RV1106_MODE" = true ]; then
+        echo "  Tried: $TOOLCHAIN_DIR/bin/$GCC_NAME"
+        echo "  Set RV1106_TOOLCHAIN to Rockchip toolchain dir"
     else
-        echo "[ERROR] Cross compiler '$GCC_NAME' not found."
-        echo "  For file mode: install musl toolchain from https://musl.cc/"
-        echo "  For rv1106 mode: set RV1106_TOOLCHAIN to Rockchip toolchain dir"
-        exit 1
+        echo "  Install: apt-get install gcc-arm-linux-gnueabihf"
+        echo "  Then:    ln -sf /usr/bin/arm-linux-gnueabihf-gcc /usr/local/bin/armv7l-linux-gnueabihf-gcc"
     fi
+    exit 1
 fi
 
 echo "      target:  $TARGET"
@@ -77,6 +81,11 @@ echo "      rv1106:  $RV1106_MODE"
 TARGET_UNDERSCORE=$(echo "$TARGET" | tr '-' '_')
 export CC_${TARGET_UNDERSCORE}="$GCC_NAME"
 export CFLAGS_${TARGET_UNDERSCORE}="-fPIC"
+
+# rv1106 模式: 覆盖 cargo linker 为 Rockchip 工具链
+if [ "$RV1106_MODE" = true ]; then
+    export CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER="$GCC_NAME"
+fi
 
 # ---- rv1106 模式: 设置 SDK 路径 ----
 if [ "$RV1106_MODE" = true ]; then

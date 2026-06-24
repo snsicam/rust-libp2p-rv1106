@@ -1,13 +1,8 @@
 # 交叉编译配置
 # x86_64 编译不受影响
 
-# 文件模式: armv7 musl 静态链接 (Step 1, ping 同款)
-[target.armv7-unknown-linux-musleabihf]
-linker = "armv7l-linux-musleabihf-gcc"
-rustflags = ["-C", "target-feature=+crt-static"]
-
-# RV1106 摄像头模式: armv7 glibc 动态链接 (Step 2, 匹配 uclibc ABI)
-# 用 Rockchip uclibc 工具链的 linker, 动态链接 SDK .so
+# 统一使用 armv7-unknown-linux-gnueabihf target
+# linker 默认使用通用 arm-linux-gnueabihf-gcc
+# rv1106 模式通过 build_rv1106.sh 设置 CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER 覆盖
 [target.armv7-unknown-linux-gnueabihf]
-linker = "arm-rockchip830-linux-uclibcgnueabihf-gcc"
-# 不加 crt-static, 允许动态链接 librockit_full.so / librkaiq.so
+linker = "armv7l-linux-gnueabihf-gcc"
