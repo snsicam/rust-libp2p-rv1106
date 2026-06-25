@@ -423,12 +423,19 @@ async fn run_viewer_session(
                     info.observed_addr,
                     info.listen_addrs.len());
             }
-            SwarmEvent::ConnectionClosed { peer_id, .. } => {
+            SwarmEvent::ConnectionClosed { peer_id, num_established, .. } => {
                 if peer_id == gateway {
-                    println!("[Viewer] Gateway connection closed");
-                    return Err(anyhow::anyhow!("Gateway connection closed"));
+                    if num_established == 0 {
+                        // 所有到 Gateway 的连接都已关闭 (circuit + direct 都没了)
+                        println!("[Viewer] Gateway connection closed (no remaining connections)");
+                        return Err(anyhow::anyhow!("Gateway connection closed"));
+                    } else {
+                        // DCUtR 直连建立后, 旧的 circuit 连接会被关闭, 但直连仍在
+                        println!("[Viewer] Circuit connection to gateway closed, {num_established} direct remaining");
+                    }
+                } else {
+                    tracing::warn!("[Viewer] Connection closed: {peer_id} ({num_established} remaining)");
                 }
-                tracing::warn!("[Viewer] Connection closed: {peer_id}");
             }
             e => {
                 tracing::debug!("[Viewer] Event: {:?}", e);
