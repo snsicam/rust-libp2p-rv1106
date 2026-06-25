@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 use futures::{AsyncReadExt, StreamExt};
 use libp2p::{
     core::multiaddr::{Multiaddr, Protocol},
-    dcutr, identify, noise, ping, relay,
+    dcutr, identify, noise, relay,
     swarm::{NetworkBehaviour, SwarmEvent},
     tcp, Swarm, PeerId,
 };
@@ -62,7 +62,9 @@ impl P2pViewer {
             .with_behaviour(|key, relay_client| {
                 Ok(ViewerBehaviour::new(key.public(), relay_client))
             })?
-            .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(120)))
+            // Viewer 不需要 idle timeout: 视频流持续传输保持连接活跃，
+        // 连接断开由 stream 层检测（read 返回 0 或 error）
+        .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(0)))
             .build();
 
         let stream_control = swarm.behaviour().stream.new_control();
@@ -216,7 +218,6 @@ pub struct ViewerBehaviour {
     pub relay_client: relay::client::Behaviour,
     pub dcutr: dcutr::Behaviour,
     pub identify: identify::Behaviour,
-    pub ping: libp2p::ping::Behaviour,
     pub stream: libp2p_stream::Behaviour,
 }
 
@@ -234,10 +235,6 @@ impl ViewerBehaviour {
                     "/p2p-camera-viewer/1.0.0".to_string(),
                     local_public_key,
                 ),
-            ),
-            ping: ping::Behaviour::new(
-                ping::Config::default()
-                    .with_interval(Duration::from_secs(10)),
             ),
             stream: libp2p_stream::Behaviour::new(),
         }
