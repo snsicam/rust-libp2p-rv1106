@@ -7,6 +7,7 @@
 #   ./start_relay.sh build              # 编译 relay-server
 #   ./start_relay.sh run                # 运行 relay-server (默认 0.0.0.0:4001)
 #   ./start_relay.sh run --port 5001     # 指定端口运行
+#   ./start_relay.sh run --public-ip 1.2.3.4  # 指定外网 IP (云服务器场景)
 #   ./start_relay.sh                    # 编译 + 运行 (等价于 build + run)
 #
 # 连接信息会打印出来, 供 RV1106 gateway 和 PC viewer 使用
@@ -21,6 +22,7 @@ mkdir -p "$LOG_DIR"
 PORT=4001
 KEY_FILE="$SCRIPT_DIR/relay-server.key"
 RELAY_BIN="$PROJECT_ROOT/target/debug/relay-server"
+PUBLIC_IP=""
 
 # 解析子命令
 DO_BUILD=false
@@ -38,6 +40,7 @@ while [[ $# -gt 0 ]]; do
         run)   DO_RUN=true; shift ;;
         --port) PORT="$2"; shift 2 ;;
         --key-file) KEY_FILE="$2"; shift 2 ;;
+        --public-ip) PUBLIC_IP="$2"; shift 2 ;;
         *) echo "[ERROR] Unknown arg: $1"; exit 1 ;;
     esac
 done
@@ -88,7 +91,12 @@ if [ "$DO_RUN" = true ]; then
     fi
 
     # 获取本机 IP (用于 RV1106 连接)
-    LOCAL_IP=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "127.0.0.1")
+    # 优先用 --public-ip (云服务器场景), 否则取本机 IP
+    if [ -n "$PUBLIC_IP" ]; then
+        LOCAL_IP="$PUBLIC_IP"
+    else
+        LOCAL_IP=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "127.0.0.1")
+    fi
     RELAY_ADDR="/ip4/$LOCAL_IP/tcp/$PORT/p2p/$RELAY_PEER"
 
     # ---- 打印连接信息 ----

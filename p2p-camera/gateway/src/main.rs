@@ -33,7 +33,7 @@ use crossbeam_channel::Sender;
 use futures::{AsyncWriteExt, StreamExt};
 use libp2p::{
     core::multiaddr::{Multiaddr, Protocol},
-    dcutr, identity, noise, relay,
+    dcutr, identify, identity, noise, relay,
     swarm::SwarmEvent,
     tcp,
     PeerId,
@@ -266,9 +266,17 @@ async fn run_gateway_session(
                             println!("[Gateway] DCUtR direct connection established with {remote_peer_id}");
                         }
                         Err(err) => {
-                            tracing::warn!("DCUtR failed with {remote_peer_id}: {err}");
+                            println!("[Gateway] DCUtR failed with {remote_peer_id}: {err} (staying on relay)");
                         }
                     },
+
+                    SwarmEvent::Behaviour(behaviour::BehaviourEvent::Identify(
+                        identify::Event::Received { info, .. },
+                    )) => {
+                        println!("[Gateway] Identify: observed_addr={}, listen_addrs={}",
+                            info.observed_addr,
+                            info.listen_addrs.len());
+                    }
 
                     SwarmEvent::ListenerClosed {
                         listener_id,
