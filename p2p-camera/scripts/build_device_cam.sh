@@ -1,5 +1,5 @@
 #!/bin/bash
-# build_rv1106.sh — 交叉编译 gateway 到 RV1106
+# build_rv1106.sh — 交叉编译 device-cam 到 RV1106
 #
 # 两种模式:
 #   ./build_rv1106.sh              # 文件模式 (musl 静态链接, 从文件读视频)
@@ -41,7 +41,7 @@ else
     GCC_NAME="armv7l-linux-gnueabihf-gcc"
 fi
 
-GATEWAY_BIN="$PROJECT_ROOT/target/$TARGET/debug/gateway"
+DEVICE_CAM_BIN="$PROJECT_ROOT/target/$TARGET/debug/device-cam"
 
 cd "$PROJECT_ROOT"
 
@@ -130,12 +130,12 @@ fi
 
 # ---- 编译 ----
 echo ""
-echo "[2/3] Building gateway for RV1106..."
+echo "[2/3] Building device-cam for RV1106..."
 
 if [ "$RV1106_MODE" = true ]; then
-    cargo build -p gateway --target "$TARGET" --features rv1106
+    cargo build -p device-cam --target "$TARGET" --features rv1106
 else
-    cargo build -p gateway --target "$TARGET"
+    cargo build -p device-cam --target "$TARGET"
 fi
 
 # ---- 验证产物 ----
@@ -143,24 +143,24 @@ echo ""
 echo "[3/3] Build complete!"
 echo ""
 echo "============================================"
-echo "  Binary: $GATEWAY_BIN"
+echo "  Binary: $DEVICE_CAM_BIN"
 echo "  Target: $TARGET"
 echo "  Mode:   $( [ "$RV1106_MODE" = true ] && echo "rv1106 (camera SDK)" || echo "file" )"
 echo "============================================"
-file "$GATEWAY_BIN" 2>/dev/null || true
+file "$DEVICE_CAM_BIN" 2>/dev/null || true
 echo ""
-ls -lh "$GATEWAY_BIN"
+ls -lh "$DEVICE_CAM_BIN"
 
 # ---- deploy 模式 ----
 if [ "$DEPLOY" = true ]; then
     RV1106_HOST="${RV1106_HOST:-192.168.1.100}"
     echo ""
     echo "[Deploy] Copying to RV1106 ($RV1106_HOST)..."
-    scp "$GATEWAY_BIN" "root@$RV1106_HOST:/usr/bin/gateway"
+    scp "$DEVICE_CAM_BIN" "root@$RV1106_HOST:/usr/bin/device-cam"
     echo "[Deploy] Done. Run on RV1106:"
     if [ "$RV1106_MODE" = true ]; then
-        echo "  gateway --relay <relay_addr> --width 1920 --height 1080 --fps 25 --bitrate 4096"
+        echo "  device-cam --relay <relay_addr> --width 1920 --height 1080 --fps 25 --bitrate 4096"
     else
-        echo "  gateway --relay <relay_addr> --video-file /tmp/test.h265"
+        echo "  device-cam --relay <relay_addr> --video-file /tmp/test.h265"
     fi
 fi

@@ -1,4 +1,4 @@
-//! Gateway NetworkBehaviour
+//! DeviceCam NetworkBehaviour
 //!
 //! 组合 relay client + DCUtR + identify + stream 四个行为。
 
@@ -23,9 +23,9 @@ impl Behaviour {
         local_public_key: libp2p::identity::PublicKey,
         relay_client: relay::client::Behaviour,
     ) -> Self {
-        info!("[Gateway] Creating new Behaviour with DCUtR and Relay client");
+        info!("[DeviceCam] Creating new Behaviour with DCUtR and Relay client");
         let identify_config = identify::Config::new(
-            "/p2p-camera-gateway/1.0.0".to_string(),
+            "/p2p-camera-device-cam/1.0.0".to_string(),
             local_public_key.clone(),
         );
         Self::new_with_identify_config(local_public_key, relay_client, identify_config)
@@ -38,9 +38,9 @@ impl Behaviour {
         identify_config: identify::Config,
     ) -> Self {
         let peer_id = local_public_key.to_peer_id();
-        info!("[Gateway] Creating new Behaviour for peer_id: {}", peer_id);
-        info!("[Gateway] DCUtR enabled for direct connection upgrade");
-        info!("[Gateway] Relay client enabled for circuit fallback");
+        info!("[DeviceCam] Creating new Behaviour for peer_id: {}", peer_id);
+        info!("[DeviceCam] DCUtR enabled for direct connection upgrade");
+        info!("[DeviceCam] Relay client enabled for circuit fallback");
         Self {
             relay_client,  // 使用 builder 传入的，不能自己构造
             dcutr: dcutr::Behaviour::new(peer_id),

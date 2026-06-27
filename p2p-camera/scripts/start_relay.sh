@@ -1,7 +1,7 @@
 #!/bin/bash
 # start_relay.sh — 在 PC/云服务器上启动 relay-server
 #
-# relay-server 跑在公网或局域网 PC 上, 为 RV1106 gateway 和 viewer 提供中继
+# relay-server 跑在公网或局域网 PC 上, 为 RV1106 device-cam 和 viewer 提供中继
 #
 # 用法:
 #   ./start_relay.sh build              # 编译 relay-server
@@ -10,7 +10,7 @@
 #   ./start_relay.sh run --public-ip 1.2.3.4  # 指定外网 IP (云服务器场景)
 #   ./start_relay.sh                    # 编译 + 运行 (等价于 build + run)
 #
-# 连接信息会打印出来, 供 RV1106 gateway 和 PC viewer 使用
+# 连接信息会打印出来, 供 RV1106 device-cam 和 PC viewer 使用
 
 set -euo pipefail
 
@@ -107,12 +107,12 @@ if [ "$DO_RUN" = true ]; then
     echo "  Relay PeerId: $RELAY_PEER"
     echo "  Relay Addr:   $RELAY_ADDR"
     echo ""
-    echo "  ---- RV1106 上运行 (gateway) ----"
-    echo "  gateway --relay $RELAY_ADDR --video-file /tmp/test.h265"
+    echo "  ---- RV1106 上运行 (device-cam) ----"
+    echo "  device-cam --relay $RELAY_ADDR --video-file /tmp/test.h265"
     echo ""
     echo "  ---- PC 上运行 (viewer, SDL 播放) ----"
-    echo "  $SCRIPT_DIR/play_viewer.sh run $RELAY_ADDR <GATEWAY_PEER>"
-    echo "  (GATEWAY_PEER 从 RV1106 gateway 启动日志获取)"
+    echo "  $SCRIPT_DIR/play_viewer.sh run $RELAY_ADDR <DEVICE_CAM_PEER>"
+    echo "  (DEVICE_CAM_PEER 从 RV1106 device-cam 启动日志获取)"
     echo ""
     echo "  Log: $LOG_DIR/relay.log"
     echo "  Ctrl+C to stop"

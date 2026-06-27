@@ -3,8 +3,8 @@
 #
 # 用法:
 #   编译:   ./play_viewer.sh build
-#   运行:   ./play_viewer.sh run <relay_addr> <gateway_peer>
-#   一键:   ./play_viewer.sh all <relay_addr> <gateway_peer>
+#   运行:   ./play_viewer.sh run <relay_addr> <device_cam_peer>
+#   一键:   ./play_viewer.sh all <relay_addr> <device_cam_peer>
 #
 # 示例:
 #   # 仅编译
@@ -62,13 +62,13 @@ do_build() {
 # ---- 运行 viewer ----
 do_run() {
     if [ $# -lt 2 ]; then
-        echo "Usage: $0 run <relay_addr> <gateway_peer>"
+        echo "Usage: $0 run <relay_addr> <device_cam_peer>"
         echo "Example: $0 run /ip4/127.0.0.1/tcp/4001/p2p/12D3KooW... 12D3KooW..."
         exit 1
     fi
 
     local relay_addr="$1"
-    local gateway_peer="$2"
+    local device_cam_peer="$2"
 
     if [ ! -f "$VIEWER_BIN" ]; then
         echo "[ERROR] viewer_cli not found at $VIEWER_BIN"
@@ -83,7 +83,7 @@ do_run() {
     echo "  P2P Camera Viewer (SDL Player)"
     echo "============================================"
     echo "  Relay:  $relay_addr"
-    echo "  Camera: $gateway_peer"
+    echo "  Camera: $device_cam_peer"
     echo ""
     echo "  ESC / Close window to quit"
     echo "============================================"
@@ -94,7 +94,7 @@ do_run() {
     # 前台运行, Ctrl+C 或关窗退出
     "$VIEWER_BIN" \
         --relay "$relay_addr" \
-        --camera "$gateway_peer" \
+        --camera "$device_cam_peer" \
         --play \
         2>&1 | tee "$LOG_DIR/viewer.log"
 }

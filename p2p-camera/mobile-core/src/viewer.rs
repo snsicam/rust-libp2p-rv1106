@@ -2,7 +2,7 @@
 //!
 //! 负责:
 //! 1. 连接 Relay Server
-//! 2. 通过 Circuit 拨号 Gateway
+//! 2. 通过 Circuit 拨号 DeviceCam
 //! 3. DCUtR 直连协商
 //! 4. 打开视频/音频 stream
 //! 5. 接收 MediaPacket → 送入 Jitter Buffer
@@ -87,11 +87,11 @@ impl P2pViewer {
         })
     }
 
-    /// 连接 Relay 并通过 Circuit 拨号 Gateway
+    /// 连接 Relay 并通过 Circuit 拨号 DeviceCam
     pub async fn connect(
         &mut self,
         relay_addr: &str,
-        gateway_peer_id: &str,
+        device_cam_peer_id: &str,
     ) -> Result<()> {
         // 1. 连接 Relay
         let relay: Multiaddr = relay_addr.parse()?;
@@ -100,24 +100,24 @@ impl P2pViewer {
         // 等待连接建立
         self.wait_for_connection().await?;
 
-        // 2. 通过 Circuit 拨号 Gateway
-        let gateway: PeerId = gateway_peer_id.parse()?;
+        // 2. 通过 Circuit 拨号 DeviceCam
+        let device_cam: PeerId = device_cam_peer_id.parse()?;
         let circuit_addr = relay
             .with(Protocol::P2pCircuit)
-            .with(Protocol::P2p(gateway));
+            .with(Protocol::P2p(device_cam));
 
         self.swarm.dial(circuit_addr)?;
         self.wait_for_connection().await?;
 
         // 3. 打开视频 stream
         let video_stream = self.stream_control
-            .open_stream(gateway, stream_protocols::VIDEO_PROTOCOL)
+            .open_stream(device_cam, stream_protocols::VIDEO_PROTOCOL)
             .await
             .context("Failed to open video stream")?;
 
         // 4. 打开音频 stream
         let audio_stream = self.stream_control
-            .open_stream(gateway, stream_protocols::AUDIO_PROTOCOL)
+            .open_stream(device_cam, stream_protocols::AUDIO_PROTOCOL)
             .await
             .context("Failed to open audio stream")?;
 
@@ -127,8 +127,8 @@ impl P2pViewer {
         let video_sender = self.video_sender.clone();
         let audio_sender = self.audio_sender.clone();
 
-        tokio::spawn(Self::receive_frames(gateway, video_stream, video_sender));
-        tokio::spawn(Self::receive_frames(gateway, audio_stream, audio_sender));
+        tokio::spawn(Self::receive_frames(device_cam, video_stream, video_sender));
+        tokio::spawn(Self::receive_frames(device_cam, audio_stream, audio_sender));
 
         self.connected = true;
         Ok(())

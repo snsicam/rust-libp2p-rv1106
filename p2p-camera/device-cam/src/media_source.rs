@@ -18,7 +18,7 @@ pub struct FileVideoSource {
     nal_units: Vec<Vec<u8>>,
     current: usize,
     /// 缓存最新的 VPS/SPS/PPS (用于新 viewer 快速恢复)
-    /// 通过 Arc<Mutex> 共享给 gateway，在新 viewer 连接时读取
+    /// 通过 Arc<Mutex> 共享给 device-cam，在新 viewer 连接时读取
     latest_param_sets: std::sync::Arc<std::sync::Mutex<Option<Vec<Vec<u8>>>>>,
 }
 
@@ -44,7 +44,7 @@ impl FileVideoSource {
             }
         }
         println!(
-            "[Gateway] FileVideoSource: {} bytes → {} access units (VPS={}, SPS={}, PPS={}, IDR={}, other={})",
+            "[DeviceCam] FileVideoSource: {} bytes → {} access units (VPS={}, SPS={}, PPS={}, IDR={}, other={})",
             data.len(), access_units.len(), vps, sps, pps, idr, other
         );
 
@@ -73,7 +73,7 @@ impl FileVideoSource {
 
     /// 在独立线程中运行，通过 Sender 发送视频帧
     /// 返回 (JoinHandle, start_trigger) — 调用 start_trigger.send(()) 开始播放
-    /// 这样可以让 gateway 在第一个 viewer 连接时才开始播放，从文件头发送
+    /// 这样可以让 device-cam 在第一个 viewer 连接时才开始播放，从文件头发送
     pub fn spawn(self, sender: Sender<MediaPacket>) -> (thread::JoinHandle<()>, Sender<()>) {
         let (start_tx, start_rx) = crossbeam_channel::bounded::<()>(1);
         let handle = thread::spawn(move || {
@@ -82,7 +82,7 @@ impl FileVideoSource {
             let _ = start_rx.recv();
 
             let start = Instant::now();
-            println!("[Gateway] Video source started (from beginning of file)");
+            println!("[DeviceCam] Video source started (from beginning of file)");
 
             loop {
                 let data = this.next_frame();

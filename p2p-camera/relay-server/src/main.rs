@@ -72,7 +72,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .with(Protocol::QuicV1);
     swarm.listen_on(quic_addr.clone())?;
 
-    // ---- 打印关键信息 (Gateway / Viewer 需要) ----
+    // ---- 打印关键信息 (DeviceCam / Viewer 需要) ----
     println!("╔══════════════════════════════════════════╗");
     println!("║     P2P Camera Relay Server              ║");
     println!("╠══════════════════════════════════════════╣");

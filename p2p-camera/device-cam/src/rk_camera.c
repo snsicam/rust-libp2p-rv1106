@@ -42,7 +42,7 @@ static rk_aiq_sys_ctx_t *g_aiq_ctx = NULL;  // ISP AIQ 上下文
 
 // RK_MPI_SYS_Init/Exit 引用计数 — camera 和 audio 各自 init 时 +1, deinit 时 -1
 // 当计数归零时才真正调用 RK_MPI_SYS_Exit
-// 解决: 当 audio 先于 camera 初始化时 (例如 gateway 启动后还没有 viewer 连接,
+// 解决: 当 audio 先于 camera 初始化时 (例如 device-cam 启动后还没有 viewer 连接,
 //       视频 spawn 等待 start_trigger, 但音频立即 spawn), MPP 系统未初始化导致段错误
 static volatile int g_sys_init_count = 0;
 

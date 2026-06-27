@@ -1,4 +1,4 @@
-//! P2P Camera Gateway — 运行在 RV1106 上的媒体网关
+//! P2P Camera DeviceCam — 运行在 RV1106 上的媒体网关
 //!
 //! 职责:
 //! 1. 连接 Relay Server 并在其上预约 (Circuit Relay v2 Reservation)
@@ -60,7 +60,7 @@ async fn main() -> Result<()> {
 
     let opt = Opt::parse();
 
-    validate_gateway_config(&opt);
+    validate_device_cam_config(&opt);
 
     // ---- 初始化媒体源 (文件 or RV1106 SDK) ----
     // 媒体源独立于 P2P 连接，在重连期间持续运行
@@ -77,7 +77,7 @@ async fn main() -> Result<()> {
         let height = opt.height.unwrap_or(1080);
         let fps = opt.fps.unwrap_or(25);
         let bitrate = opt.bitrate.unwrap_or(4096);
-        println!("[Gateway] Video source: RV1106 camera {}x{} @{}fps {}kbps", width, height, fps, bitrate);
+        println!("[DeviceCam] Video source: RV1106 camera {}x{} @{}fps {}kbps", width, height, fps, bitrate);
         let source = rk_video_source::RkVideoSource::new(width, height, fps, bitrate);
         param_sets = Some(source.param_sets_handle());
         let (_, _start_tx) = source.spawn(broadcast_sender_to_crossbeam(video_tx.clone()));
@@ -89,16 +89,16 @@ async fn main() -> Result<()> {
         if let Some(video_path) = &opt.video_file {
             let data = std::fs::read(video_path)
                 .context("Failed to read video file")?;
-            println!("[Gateway] Video file: {:?} ({} bytes)", video_path, data.len());
+            println!("[DeviceCam] Video file: {:?} ({} bytes)", video_path, data.len());
             let source = media_source::FileVideoSource::from_file(data);
             param_sets = Some(source.param_sets_handle());
             // 文件源在第一个 viewer 连接时启动 (循环播放模式)
             let (_stop_tx, _start_tx) = source.spawn(broadcast_sender_to_crossbeam(video_tx.clone()));
             // 立即开始播放 (不再等第一个 viewer)
             let _ = _start_tx.send(());
-            println!("[Gateway] Video source: file ({:?}) — started", video_path);
+            println!("[DeviceCam] Video source: file ({:?}) — started", video_path);
         } else {
-            println!("[Gateway] Video source: NONE (waiting for stream requests)");
+            println!("[DeviceCam] Video source: NONE (waiting for stream requests)");
             param_sets = None;
         }
     }
@@ -109,7 +109,7 @@ async fn main() -> Result<()> {
         if opt.enable_audio {
             let source = rk_video_source::RkAudioSource::new(16000);
             source.spawn(broadcast_sender_to_crossbeam(audio_tx.clone()));
-            println!("[Gateway] Audio source: RV1106 AI (16kHz mono)");
+            println!("[DeviceCam] Audio source: RV1106 AI (16kHz mono)");
         }
     }
 
@@ -118,14 +118,14 @@ async fn main() -> Result<()> {
         if opt.enable_audio {
             let source = media_source::SilenceAudioSource::new(16000, 1);
             source.spawn(broadcast_sender_to_crossbeam(audio_tx.clone()));
-            println!("[Gateway] Audio source: silence (16kHz mono)");
+            println!("[DeviceCam] Audio source: silence (16kHz mono)");
         }
     }
 
     // ---- 加载/生成固定身份密钥 (保证 PeerId 不变) ----
     let keypair = load_or_create_keypair(&opt.key_file)?;
     let peer_id = keypair.public().to_peer_id();
-    println!("[Gateway] PeerId: {peer_id}");
+    println!("[DeviceCam] PeerId: {peer_id}");
 
     // ---- 重连循环: Relay 断开时自动重连 ----
     let relay_addr: Multiaddr = opt.relay.parse()
@@ -136,11 +136,11 @@ async fn main() -> Result<()> {
     loop {
         reconnect_attempt += 1;
         if reconnect_attempt > 1 {
-            tracing::warn!("[Gateway] Reconnecting to relay (attempt {reconnect_attempt})...");
+            tracing::warn!("[DeviceCam] Reconnecting to relay (attempt {reconnect_attempt})...");
             tokio::time::sleep(RECONNECT_DELAY).await;
         }
 
-        match run_gateway_session(
+        match run_device_cam_session(
             keypair.clone(),
             relay_addr.clone(),
             video_tx.clone(),
@@ -151,7 +151,7 @@ async fn main() -> Result<()> {
         ).await {
             Ok(()) => break, // 正常退出
             Err(e) => {
-                tracing::error!("[Gateway] Session ended: {e}");
+                tracing::error!("[DeviceCam] Session ended: {e}");
                 // 继续循环 → 自动重连
             }
         }
@@ -167,7 +167,7 @@ fn load_or_create_keypair(key_file: &PathBuf) -> Result<identity::Keypair> {
             .with_context(|| format!("Failed to read key file: {}", key_file.display()))?;
         let keypair = identity::Keypair::from_protobuf_encoding(&data)
             .with_context(|| format!("Failed to decode key file: {}", key_file.display()))?;
-        println!("[Gateway] Loaded identity from {}", key_file.display());
+        println!("[DeviceCam] Loaded identity from {}", key_file.display());
         Ok(keypair)
     } else {
         let keypair = identity::Keypair::generate_ed25519();
@@ -179,15 +179,15 @@ fn load_or_create_keypair(key_file: &PathBuf) -> Result<identity::Keypair> {
         }
         std::fs::write(key_file, &data)
             .with_context(|| format!("Failed to write key file: {}", key_file.display()))?;
-        println!("[Gateway] Generated new identity → {}", key_file.display());
+        println!("[DeviceCam] Generated new identity → {}", key_file.display());
         Ok(keypair)
     }
 }
 
-/// 一次完整的 Gateway 会话: 连接 Relay → 预约 → 接受 stream 请求
+/// 一次完整的 DeviceCam 会话: 连接 Relay → 预约 → 接受 stream 请求
 ///
 /// 返回 Err 表示需要重连
-async fn run_gateway_session(
+async fn run_device_cam_session(
     keypair: identity::Keypair,
     relay_addr: Multiaddr,
     video_tx: broadcast::Sender<MediaPacket>,
@@ -209,7 +209,7 @@ async fn run_gateway_session(
         .with_relay_client(noise::Config::new, libp2p::yamux::Config::default)?
         .with_behaviour(|key, relay_client| {
             let identify_config = identify::Config::new(
-                "/p2p-camera-gateway/1.0.0".to_string(),
+                "/p2p-camera-device-cam/1.0.0".to_string(),
                 key.public().clone(),
             )
             .with_push_listen_addr_updates(true);
@@ -222,8 +222,8 @@ async fn run_gateway_session(
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(120)))
         .build();
 
-    println!("[Gateway] PeerId: {peer_id}");
-    tracing::info!("[Gateway] push_listen_addr_updates enabled for DCUtR");
+    println!("[DeviceCam] PeerId: {peer_id}");
+    tracing::info!("[DeviceCam] push_listen_addr_updates enabled for DCUtR");
 
     let mut connection_times: HashMap<PeerId, Instant> = HashMap::new();
 
@@ -234,7 +234,7 @@ async fn run_gateway_session(
     swarm.listen_on(udp_addr)?;
     swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()
         .context("Invalid local TCP listen addr")?)?;
-    println!("[Gateway] Listening on QUIC (port {}) and TCP",
+    println!("[DeviceCam] Listening on QUIC (port {}) and TCP",
         if udp_port != 0 { udp_port.to_string() } else { "random".to_string() });
 
     // ---- 手动添加外部地址（若指定） ----
@@ -245,12 +245,12 @@ async fn run_gateway_session(
         let ext_addr: Multiaddr = format!("/ip4/{}/udp/{}/quic-v1", ip, udp_port).parse()
             .context("Invalid external address")?;
         swarm.add_external_address(ext_addr);
-        println!("[Gateway] Added external address: /ip4/{}/udp/{}/quic-v1", ip, udp_port);
+        println!("[DeviceCam] Added external address: /ip4/{}/udp/{}/quic-v1", ip, udp_port);
     }
 
     // ---- 连接 Relay Server ----
     swarm.dial(relay_addr.clone())?;
-    println!("[Gateway] Dialing relay: {relay_addr}");
+    println!("[DeviceCam] Dialing relay: {relay_addr}");
 
     // 等待与 Relay 的连接建立
     wait_for_connection(&mut swarm).await?;
@@ -259,13 +259,13 @@ async fn run_gateway_session(
     let reservation_id = swarm.listen_on(
         relay_addr.with(Protocol::P2pCircuit),
     )?;
-    println!("[Gateway] Requesting relay reservation...");
+    println!("[DeviceCam] Requesting relay reservation...");
 
     // 等待预约成功
     wait_for_reservation(&mut swarm, reservation_id).await?;
 
-    println!("[Gateway] Relay reservation confirmed!");
-    println!("[Gateway] External address: /p2p-circuit/p2p/{peer_id}");
+    println!("[DeviceCam] Relay reservation confirmed!");
+    println!("[DeviceCam] External address: /p2p-circuit/p2p/{peer_id}");
 
     // ---- Stream 控制 ----
     let mut stream_control = swarm.behaviour().new_stream_control();
@@ -289,24 +289,24 @@ async fn run_gateway_session(
                     SwarmEvent::Behaviour(behaviour::BehaviourEvent::RelayClient(
                         relay::client::Event::ReservationReqAccepted { .. },
                     )) => {
-                        println!("[Gateway] Relay reservation accepted!");
+                        println!("[DeviceCam] Relay reservation accepted!");
                     }
 
                     SwarmEvent::Behaviour(behaviour::BehaviourEvent::Dcutr(
                         dcutr::Event { remote_peer_id, result, .. },
                     )) => match result {
                         Ok(_conn_id) => {
-                            tracing::info!("[Gateway] DCUtR direct connection established with {remote_peer_id}");
-                            tracing::info!("[Gateway] Direct connection upgrade successful - switching from relay to direct connection");
+                            tracing::info!("[DeviceCam] DCUtR direct connection established with {remote_peer_id}");
+                            tracing::info!("[DeviceCam] Direct connection upgrade successful - switching from relay to direct connection");
                         }
                         Err(err) => {
                             let err_str = err.to_string();
-                            tracing::warn!("[Gateway] DCUtR failed with {remote_peer_id}: {err}");
-                            tracing::warn!("[Gateway] Hole punch failed - continuing to use relay connection");
+                            tracing::warn!("[DeviceCam] DCUtR failed with {remote_peer_id}: {err}");
+                            tracing::warn!("[DeviceCam] Hole punch failed - continuing to use relay connection");
                             if err_str.contains("timeout") {
-                                tracing::warn!("[Gateway] DCUtR failure cause: NAT type incompatibility or firewall blocking UDP");
+                                tracing::warn!("[DeviceCam] DCUtR failure cause: NAT type incompatibility or firewall blocking UDP");
                             } else if err_str.contains("IO error") || err_str.contains("connection refused") || err_str.contains("network unreachable") {
-                                tracing::warn!("[Gateway] DCUtR failure cause: network unreachable or connection refused");
+                                tracing::warn!("[DeviceCam] DCUtR failure cause: network unreachable or connection refused");
                             }
                         }
                     },
@@ -314,7 +314,7 @@ async fn run_gateway_session(
                     SwarmEvent::Behaviour(behaviour::BehaviourEvent::Identify(
                         identify::Event::Received { info, .. },
                     )) => {
-                        tracing::info!("[Gateway] Identify received from peer:");
+                        tracing::info!("[DeviceCam] Identify received from peer:");
                         tracing::info!("  - Observed address: {}", info.observed_addr);
                         tracing::info!("  - Listen addresses ({} total):", info.listen_addrs.len());
                         for (i, addr) in info.listen_addrs.iter().enumerate() {
@@ -322,15 +322,15 @@ async fn run_gateway_session(
                         }
                         if let Some(Protocol::Ip4(ip)) = info.observed_addr.iter().find(|p| matches!(p, Protocol::Ip4(_))) {
                             if ip.is_private() {
-                                tracing::warn!("[Gateway] WARNING: Observed address is private IP ({}) - DCUtR may fail!", ip);
+                                tracing::warn!("[DeviceCam] WARNING: Observed address is private IP ({}) - DCUtR may fail!", ip);
                             } else {
-                                tracing::info!("[Gateway] Observed address is public IP ({}) - good for DCUtR", ip);
+                                tracing::info!("[DeviceCam] Observed address is public IP ({}) - good for DCUtR", ip);
                             }
                         }
                         if info.observed_addr.iter().any(|p| matches!(p, Protocol::QuicV1)) {
-                            tracing::info!("[Gateway] Observed address protocol: QUIC - good for DCUtR hole punching");
+                            tracing::info!("[DeviceCam] Observed address protocol: QUIC - good for DCUtR hole punching");
                         } else if info.observed_addr.iter().any(|p| matches!(p, Protocol::Tcp(_))) {
-                            tracing::warn!("[Gateway] Observed address protocol: TCP only - DCUtR will produce TCP candidates, hole punching unlikely to succeed");
+                            tracing::warn!("[DeviceCam] Observed address protocol: TCP only - DCUtR will produce TCP candidates, hole punching unlikely to succeed");
                         }
                     }
 
@@ -344,14 +344,14 @@ async fn run_gateway_session(
                     }
 
                     SwarmEvent::NewListenAddr { address, .. } => {
-                        println!("[Gateway] Listening on: {address}");
+                        println!("[DeviceCam] Listening on: {address}");
                     }
 
                     SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
                         let role = if endpoint.is_dialer() { "outgoing" } else { "incoming" };
                         let addr = endpoint.get_remote_address().clone();
                         connection_times.insert(peer_id, Instant::now());
-                        tracing::info!("[Gateway] Connection established:");
+                        tracing::info!("[DeviceCam] Connection established:");
                         tracing::info!("  - Peer ID: {peer_id}");
                         tracing::info!("  - Role: {role}");
                         tracing::info!("  - Remote address: {addr}");
@@ -371,7 +371,7 @@ async fn run_gateway_session(
                             .map(|t| t.elapsed())
                             .map(|d| format!("{:.1}s", d.as_secs_f64()))
                             .unwrap_or_else(|| "unknown".to_string());
-                        tracing::warn!("[Gateway] Connection closed:");
+                        tracing::warn!("[DeviceCam] Connection closed:");
                         tracing::warn!("  - Peer ID: {peer_id}");
                         tracing::warn!("  - Role: {role}");
                         tracing::warn!("  - Remote address: {addr}");
@@ -397,7 +397,7 @@ async fn run_gateway_session(
             video = incoming_video.next() => {
                 if let Some((peer_id, stream)) = video {
                     let rx = video_tx.subscribe();
-                    println!("[Gateway] New video viewer: {peer_id}");
+                    println!("[DeviceCam] New video viewer: {peer_id}");
                     #[cfg(feature = "rv1106")]
                     let init_nals = rk_video_source::get_param_sets();
                     #[cfg(not(feature = "rv1106"))]
@@ -415,7 +415,7 @@ async fn run_gateway_session(
             audio = incoming_audio.next() => {
                 if let Some((peer_id, stream)) = audio {
                     let rx = audio_tx.subscribe();
-                    println!("[Gateway] New audio viewer: {peer_id}");
+                    println!("[DeviceCam] New audio viewer: {peer_id}");
                     tokio::spawn(stream_audio_to_viewer(peer_id, stream, rx));
                 } else {
                     return Err(anyhow::anyhow!("Audio stream accept channel closed"));
@@ -437,14 +437,14 @@ async fn wait_for_connection(
         }
         match tokio::time::timeout(remaining, swarm.select_next_some()).await {
             Ok(SwarmEvent::ConnectionEstablished { peer_id, .. }) => {
-                println!("[Gateway] Connected to relay {peer_id}");
+                println!("[DeviceCam] Connected to relay {peer_id}");
                 return Ok(());
             }
             Ok(SwarmEvent::OutgoingConnectionError { error, .. }) => {
                 anyhow::bail!("Failed to connect to relay: {error}");
             }
             Ok(SwarmEvent::NewListenAddr { address, .. }) => {
-                println!("[Gateway] Listening on: {address}");
+                println!("[DeviceCam] Listening on: {address}");
             }
             Err(_elapsed) => {
                 anyhow::bail!("Timeout waiting for relay connection");
@@ -474,7 +474,7 @@ async fn wait_for_reservation(
                 anyhow::bail!("Reservation request rejected: {e}");
             }
             SwarmEvent::NewListenAddr { address, .. } => {
-                println!("[Gateway] Listening on: {address}");
+                println!("[DeviceCam] Listening on: {address}");
             }
             _ => {}
         }
@@ -508,7 +508,7 @@ async fn stream_video_to_viewer(
             tracing::warn!("Init flush to {peer_id} failed: {e}");
             return;
         }
-        println!("[Gateway] Sent {} init NALs to {peer_id}", init_nals.len());
+        println!("[DeviceCam] Sent {} init NALs to {peer_id}", init_nals.len());
     }
 
     loop {
@@ -525,7 +525,7 @@ async fn stream_video_to_viewer(
                 }
                 frame_count += 1;
                 if frame_count == 1 {
-                    println!("[Gateway] First frame sent to {peer_id} ({} bytes, keyframe={})",
+                    println!("[DeviceCam] First frame sent to {peer_id} ({} bytes, keyframe={})",
                         encoded.len(), packet.is_keyframe());
                 }
             }
@@ -536,13 +536,13 @@ async fn stream_video_to_viewer(
                 rk_video_source::request_idr();
             }
             Err(broadcast::error::RecvError::Closed) => {
-                println!("[Gateway] Broadcast closed for {peer_id} after {frame_count} frames");
+                println!("[DeviceCam] Broadcast closed for {peer_id} after {frame_count} frames");
                 break;
             }
         }
     }
     let _ = stream.close().await;
-    println!("[Gateway] Video stream to {peer_id} ended ({frame_count} frames sent)");
+    println!("[DeviceCam] Video stream to {peer_id} ended ({frame_count} frames sent)");
 }
 
 /// 发送音频帧到指定 viewer
@@ -589,7 +589,7 @@ fn broadcast_sender_to_crossbeam(tx: broadcast::Sender<MediaPacket>) -> Sender<M
 }
 
 #[derive(Debug, Parser)]
-#[command(name = "p2p-camera gateway")]
+#[command(name = "p2p-camera device-cam")]
 struct Opt {
     /// Relay Server 地址
     #[arg(long)]
@@ -601,7 +601,7 @@ struct Opt {
 
     /// 身份密钥文件 (protobuf 格式)
     /// 首次运行自动生成，后续启动从此文件读取以保证 PeerId 不变
-    #[arg(long, default_value = "gateway.key")]
+    #[arg(long, default_value = "device-cam.key")]
     key_file: PathBuf,
 
     /// 视频裸流文件 (H.265) — 代替 SDK 回调 (非 rv1106 feature)
@@ -642,12 +642,12 @@ struct Opt {
     external_ip: Option<String>,
 }
 
-fn validate_gateway_config(opt: &Opt) {
+fn validate_device_cam_config(opt: &Opt) {
     let relay_str = &opt.relay;
     if relay_str.contains("/tcp/") && !relay_str.contains("/quic-v1") {
-        tracing::warn!("[Gateway] WARNING: Using TCP relay connection - DCUtR will only produce TCP candidates, hole punching unlikely to succeed. Use /udp/<port>/quic-v1 instead");
+        tracing::warn!("[DeviceCam] WARNING: Using TCP relay connection - DCUtR will only produce TCP candidates, hole punching unlikely to succeed. Use /udp/<port>/quic-v1 instead");
     } else if relay_str.contains("/quic-v1") {
-        tracing::info!("[Gateway] Relay connection protocol: QUIC - good for DCUtR hole punching");
+        tracing::info!("[DeviceCam] Relay connection protocol: QUIC - good for DCUtR hole punching");
     }
 
     if let Some(ref ip) = opt.external_ip {
@@ -658,19 +658,19 @@ fn validate_gateway_config(opt: &Opt) {
                     _ => unreachable!(),
                 };
                 if v4.is_private() {
-                    tracing::error!("[Gateway] ERROR: External IP {} is a private IP - must be a public IP for DCUtR", ip);
+                    tracing::error!("[DeviceCam] ERROR: External IP {} is a private IP - must be a public IP for DCUtR", ip);
                     std::process::exit(1);
                 }
             }
         } else {
-            tracing::error!("[Gateway] ERROR: Invalid external IP address: {}", ip);
+            tracing::error!("[DeviceCam] ERROR: Invalid external IP address: {}", ip);
             std::process::exit(1);
         }
     }
 
     if let Some(port) = opt.udp_port {
         if port == 0 {
-            tracing::warn!("[Gateway] WARNING: Using random UDP port - cannot configure port forwarding for DCUtR");
+            tracing::warn!("[DeviceCam] WARNING: Using random UDP port - cannot configure port forwarding for DCUtR");
         }
     }
 }

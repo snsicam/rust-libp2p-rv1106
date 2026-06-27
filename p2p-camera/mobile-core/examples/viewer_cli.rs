@@ -3,19 +3,19 @@
 //! 用法:
 //!   cargo run --example viewer_cli -- \
 //!     --relay /ip4/127.0.0.1/tcp/4001/p2p/<RELAY_PEER> \
-//!     --camera <GATEWAY_PEER_ID> \
+//!     --camera <DEVICE_CAM_PEER_ID> \
 //!     --output output.h265
 //!
 //! 实时播放 (需 --features player):
 //!   cargo build --example viewer_cli --features player
 //!   viewer_cli --relay ... --camera ... --play
 //!
-//! 自动重连: 连接断开时自动重新连接 Relay + Gateway + 打开 stream，
+//! 自动重连: 连接断开时自动重新连接 Relay + DeviceCam + 打开 stream，
 //!           播放器和输出文件持续运行不中断。
 //!
 //! 验证流程:
 //!   1. 连接 Relay Server
-//!   2. 通过 Circuit 拨号 Gateway
+//!   2. 通过 Circuit 拨号 DeviceCam
 //!   3. 打开视频 stream 接收帧
 //!   4. 保存到文件 (可用 ffplay 播放) 或 SDL 实时播放 (--play, 需 --features player)
 //!   5. 打印接收统计
@@ -120,7 +120,7 @@ async fn main() -> Result<()> {
     let (session_tx, mut session_rx) = mpsc::channel::<SessionEvent>(1);
 
     let relay_addr_str = opt.relay.clone();
-    let gateway_str = opt.camera.clone();
+    let device_cam_str = opt.camera.clone();
     let no_audio = opt.no_audio;
     let udp_port = opt.udp_port;
     let external_ip = opt.external_ip.clone();
@@ -134,7 +134,7 @@ async fn main() -> Result<()> {
     // 启动初始 session (后台任务) — 传入克隆的 external_ip
     spawn_session(
         relay_addr_str.clone(),
-        gateway_str.clone(),
+        device_cam_str.clone(),
         no_audio,
         udp_port,
         external_ip.clone(), // 克隆以拥有所有权
@@ -168,7 +168,7 @@ async fn main() -> Result<()> {
                         // 重新启动 session — 再次克隆 external_ip
                         spawn_session(
                             relay_addr_str.clone(),
-                            gateway_str.clone(),
+                            device_cam_str.clone(),
                             no_audio,
                             udp_port,
                             external_ip.clone(), // 重新克隆
@@ -255,7 +255,7 @@ enum SessionEvent {
 /// 在后台启动一个 viewer session
 fn spawn_session(
     relay_addr_str: String,
-    gateway_str: String,
+    device_cam_str: String,
     no_audio: bool,
     udp_port: Option<u16>,
     external_ip: Option<String>, // 拥有所有权，调用者需克隆
@@ -266,7 +266,7 @@ fn spawn_session(
     tokio::spawn(async move {
         let result = run_viewer_session(
             &relay_addr_str,
-            &gateway_str,
+            &device_cam_str,
             no_audio,
             udp_port,
             external_ip, // 直接移动进 run_viewer_session
@@ -322,13 +322,13 @@ fn drain_audio_channel(
     }
 }
 
-/// 一次 Viewer 会话: 连接 Relay → Circuit 拨号 Gateway → 打开 stream → 驱动 swarm
+/// 一次 Viewer 会话: 连接 Relay → Circuit 拨号 DeviceCam → 打开 stream → 驱动 swarm
 ///
 /// 帧接收通过 spawn 的 receive_frames task → channel → 主循环消费。
 /// 本函数只负责 swarm 事件循环，连接断开时返回 Err 通知主循环重连。
 async fn run_viewer_session(
     relay_addr_str: &str,
-    gateway_str: &str,
+    device_cam_str: &str,
     no_audio: bool,
     udp_port: Option<u16>,
     external_ip: Option<String>,
@@ -338,7 +338,7 @@ async fn run_viewer_session(
 ) -> Result<()> {
     let relay_addr: Multiaddr = relay_addr_str.parse()
         .context("Invalid relay address")?;
-    let gateway: PeerId = gateway_str.parse()
+    let device_cam: PeerId = device_cam_str.parse()
         .context("Invalid camera PeerId")?;
 
     let keypair = libp2p::identity::Keypair::generate_ed25519();
@@ -401,23 +401,23 @@ async fn run_viewer_session(
         SwarmEvent::ConnectionEstablished { .. }
     ), "relay connection").await?;
 
-    // ---- 2. 通过 Circuit 拨号 Gateway ----
+    // ---- 2. 通过 Circuit 拨号 DeviceCam ----
     let circuit_addr = relay_addr
         .with(Protocol::P2pCircuit)
-        .with(Protocol::P2p(gateway));
-    println!("[Viewer] Dialing gateway via circuit: {circuit_addr}");
+        .with(Protocol::P2p(device_cam));
+    println!("[Viewer] Dialing device-cam via circuit: {circuit_addr}");
     swarm.dial(circuit_addr)?;
     wait_for_event(&mut swarm, |e| matches!(
         e,
-        SwarmEvent::ConnectionEstablished { peer_id, .. } if *peer_id == gateway
-    ), "gateway circuit connection").await?;
+        SwarmEvent::ConnectionEstablished { peer_id, .. } if *peer_id == device_cam
+    ), "device-cam circuit connection").await?;
 
-    println!("[Viewer] Connected to gateway {gateway}");
+    println!("[Viewer] Connected to device-cam {device_cam}");
 
     // ---- 3. 打开 video stream ----
     let mut stream_control = swarm.behaviour().stream.new_control();
     let video_stream = stream_control
-        .open_stream(gateway, stream_protocols::VIDEO_PROTOCOL)
+        .open_stream(device_cam, stream_protocols::VIDEO_PROTOCOL)
         .await
         .context("Failed to open video stream")?;
     println!("[Viewer] Video stream opened");
@@ -425,10 +425,10 @@ async fn run_viewer_session(
     // ---- 3b. 打开 audio stream (可选) ----
     let mut audio_abort_handle: Option<tokio::task::AbortHandle> = None;
     if !no_audio {
-        match stream_control.open_stream(gateway, stream_protocols::AUDIO_PROTOCOL).await {
+        match stream_control.open_stream(device_cam, stream_protocols::AUDIO_PROTOCOL).await {
             Ok(audio_stream) => {
                 println!("[Viewer] Audio stream opened");
-                let h = tokio::spawn(receive_frames(gateway, audio_stream, audio_tx.clone()))
+                let h = tokio::spawn(receive_frames(device_cam, audio_stream, audio_tx.clone()))
                     .abort_handle();
                 audio_abort_handle = Some(h);
             }
@@ -440,7 +440,7 @@ async fn run_viewer_session(
 
     // ---- 4. 启动视频接收任务 ----
     let mut video_abort_handle: Option<tokio::task::AbortHandle> =
-        Some(tokio::spawn(receive_frames(gateway, video_stream, video_tx.clone())).abort_handle());
+        Some(tokio::spawn(receive_frames(device_cam, video_stream, video_tx.clone())).abort_handle());
 
     let mut direct_upgraded = false;
 
@@ -451,10 +451,10 @@ async fn run_viewer_session(
                 dcutr::Event { result: Ok(_), remote_peer_id, .. },
             )) if !direct_upgraded => {
                 println!("[Viewer] DCUtR direct connection established with {remote_peer_id}, upgrading streams...");
-                match stream_control.open_stream(gateway, stream_protocols::VIDEO_PROTOCOL).await {
+                match stream_control.open_stream(device_cam, stream_protocols::VIDEO_PROTOCOL).await {
                     Ok(new_stream) => {
                         if let Some(h) = video_abort_handle.take() { h.abort(); }
-                        let handle = tokio::spawn(receive_frames(gateway, new_stream, video_tx.clone())).abort_handle();
+                        let handle = tokio::spawn(receive_frames(device_cam, new_stream, video_tx.clone())).abort_handle();
                         video_abort_handle = Some(handle);
                         direct_upgraded = true;
                         let _ = event_tx.send(SessionEvent::DirectUpgraded).await;
@@ -465,10 +465,10 @@ async fn run_viewer_session(
                     }
                 }
                 if direct_upgraded && !no_audio {
-                    match stream_control.open_stream(gateway, stream_protocols::AUDIO_PROTOCOL).await {
+                    match stream_control.open_stream(device_cam, stream_protocols::AUDIO_PROTOCOL).await {
                         Ok(new_stream) => {
                             if let Some(h) = audio_abort_handle.take() { h.abort(); }
-                            let handle = tokio::spawn(receive_frames(gateway, new_stream, audio_tx.clone())).abort_handle();
+                            let handle = tokio::spawn(receive_frames(device_cam, new_stream, audio_tx.clone())).abort_handle();
                             audio_abort_handle = Some(handle);
                             println!("[Viewer] Audio stream upgraded to direct connection");
                         }
@@ -512,14 +512,14 @@ async fn run_viewer_session(
                 }
             }
             SwarmEvent::ConnectionClosed { peer_id, num_established, .. } => {
-                if peer_id == gateway {
+                if peer_id == device_cam {
                     if num_established == 0 {
-                        // 所有到 Gateway 的连接都已关闭 (circuit + direct 都没了)
-                        println!("[Viewer] Gateway connection closed (no remaining connections)");
-                        return Err(anyhow::anyhow!("Gateway connection closed"));
+                        // 所有到 DeviceCam 的连接都已关闭 (circuit + direct 都没了)
+                        println!("[Viewer] DeviceCam connection closed (no remaining connections)");
+                        return Err(anyhow::anyhow!("DeviceCam connection closed"));
                     } else {
                         // DCUtR 直连建立后, 旧的 circuit 连接会被关闭, 但直连仍在
-                        println!("[Viewer] Circuit connection to gateway closed, {num_established} direct remaining");
+                        println!("[Viewer] Circuit connection to device-cam closed, {num_established} direct remaining");
                     }
                 } else {
                     tracing::warn!("[Viewer] Connection closed: {peer_id} ({num_established} remaining)");
@@ -929,7 +929,7 @@ struct Opt {
     #[arg(long)]
     relay: String,
 
-    /// 摄像头 (Gateway) PeerId
+    /// 摄像头 (DeviceCam) PeerId
     #[arg(long)]
     camera: String,
 

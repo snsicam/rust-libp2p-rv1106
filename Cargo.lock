@@ -1284,6 +1284,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "device-cam"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "cc",
+ "clap",
+ "crossbeam-channel",
+ "futures",
+ "libp2p",
+ "libp2p-stream",
+ "proto",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1833,26 +1853,6 @@ dependencies = [
  "log",
  "ringbuf",
  "rustc_version",
-]
-
-[[package]]
-name = "gateway"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytes",
- "cc",
- "clap",
- "crossbeam-channel",
- "futures",
- "libp2p",
- "libp2p-stream",
- "proto",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

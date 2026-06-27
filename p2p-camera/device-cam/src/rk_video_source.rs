@@ -84,7 +84,7 @@ pub struct RkVideoSource {
     height: u32,
     fps: u32,
     bitrate_kbps: u32,
-    /// 参数集缓存 handle (供 gateway 在新 viewer 连接时读取)
+    /// 参数集缓存 handle (供 device-cam 在新 viewer 连接时读取)
     param_sets: Arc<Mutex<Option<Vec<Vec<u8>>>>>,
 }
 
