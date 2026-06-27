@@ -85,33 +85,151 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!("║ Listening QUIC: {quic_addr}");
     println!("╚══════════════════════════════════════════╝");
 
+    // ---- 手动添加公网外部地址（若指定） ----
+    if let Some(ref ip_str) = opt.public_ip {
+        let ip: std::net::IpAddr = ip_str.parse()
+            .map_err(|e| format!("Invalid --public-ip '{}': {e}", ip_str))?;
+        if let std::net::IpAddr::V4(v4) = ip {
+            if v4.is_private() {
+                tracing::error!("[Relay] ERROR: --public-ip {} is a private IP - must be a public IP", ip_str);
+                return Err("Public IP must not be a private address".into());
+            }
+        }
+        if ip.is_ipv4() {
+            let ext_tcp: Multiaddr = format!("/ip4/{}/tcp/{}", ip_str, opt.port).parse()
+                .map_err(|e| format!("Invalid external TCP address: {e}"))?;
+            let ext_quic: Multiaddr = format!("/ip4/{}/udp/{}/quic-v1", ip_str, opt.port).parse()
+                .map_err(|e| format!("Invalid external QUIC address: {e}"))?;
+            swarm.add_external_address(ext_tcp);
+            swarm.add_external_address(ext_quic);
+            tracing::info!("[Relay] Added external addresses for public IP: {}", ip_str);
+        } else {
+            let ext_tcp: Multiaddr = format!("/ip6/{}/tcp/{}", ip_str, opt.port).parse()
+                .map_err(|e| format!("Invalid external TCP address: {e}"))?;
+            let ext_quic: Multiaddr = format!("/ip6/{}/udp/{}/quic-v1", ip_str, opt.port).parse()
+                .map_err(|e| format!("Invalid external QUIC address: {e}"))?;
+            swarm.add_external_address(ext_tcp);
+            swarm.add_external_address(ext_quic);
+            tracing::info!("[Relay] Added external addresses for public IPv6: {}", ip_str);
+        }
+    } else {
+        tracing::warn!("[Relay] No --public-ip specified, relay may advertise private IP via hostname -I");
+    }
+
     // ---- 事件循环 ----
     loop {
         match swarm.select_next_some().await {
             SwarmEvent::Behaviour(behaviour::BehaviourEvent::Identify(
                 identify::Event::Received {
-                    info: identify::Info { observed_addr, .. },
-                    ..
+                    info: identify::Info { observed_addr, listen_addrs, .. },
+                    peer_id: client_peer_id,
+                    .. // 忽略 connection_id 等额外字段，兼容不同 libp2p 版本
                 },
             )) => {
-                tracing::debug!("Observed address: {observed_addr}");
+                // ---- 打印 Relay 观察到的地址和客户端公告的监听地址 ----
+                tracing::info!("[Relay] ===== Identify from {} =====", client_peer_id);
+                tracing::info!("[Relay] Observed address: {}", observed_addr);
+                tracing::info!("[Relay] Listen addresses ({} total):", listen_addrs.len());
+                for (i, addr) in listen_addrs.iter().enumerate() {
+                    tracing::info!("[Relay]   [{}]: {}", i, addr);
+                }
+                
+                // 提取 observed_addr 的 IP 和端口
+                let mut ip = String::new();
+                let mut port = String::new();
+                let mut protocol = String::new();
+                for p in observed_addr.iter() {
+                    match p {
+                        Protocol::Ip4(addr) => {
+                            ip = addr.to_string();
+                            if addr.is_private() {
+                                tracing::warn!("[Relay] WARNING: Observed IP {} is private - DCUtR may fail!", addr);
+                            } else {
+                                tracing::info!("[Relay] Observed IP {} is public - good for DCUtR", addr);
+                            }
+                        }
+                        Protocol::Ip6(addr) => {
+                            ip = addr.to_string();
+                            tracing::info!("[Relay] Observed IPv6: {}", addr);
+                        }
+                        Protocol::Tcp(p) => {
+                            port = p.to_string();
+                            protocol = "TCP".to_string();
+                        }
+                        Protocol::Udp(p) => {
+                            port = p.to_string();
+                            protocol = "UDP".to_string();
+                        }
+                        Protocol::QuicV1 => {
+                            protocol = format!("{} QUIC", protocol);
+                        }
+                        _ => {}
+                    }
+                }
+                if !ip.is_empty() && !port.is_empty() {
+                    tracing::info!("[Relay] Observed: IP={}, Port={}, Protocol={}", ip, port, protocol);
+                }
+                
+                // 将观察到的地址添加到外部地址集（有助于 Relay 自身地址发现，但非必须）
                 swarm.add_external_address(observed_addr.clone());
             }
 
             SwarmEvent::NewListenAddr { address, .. } => {
-                tracing::info!("Listening on {address}");
+                tracing::info!("Listening on {}", address);
+                if let Some(Protocol::Ip4(ip)) = address.iter().find(|p| matches!(p, Protocol::Ip4(_))) {
+                    if ip.is_unspecified() || ip.is_private() {
+                        tracing::warn!("[Relay] WARNING: Listening on private/unspecified address ({}) - clients may not be able to connect", ip);
+                    }
+                }
             }
 
-            SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                tracing::info!("Connection established with {peer_id}");
+            SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+                let addr = endpoint.get_remote_address().clone();
+                let role = if endpoint.is_dialer() { "outgoing" } else { "incoming" };
+                let conn_type = if addr.iter().any(|p| matches!(p, Protocol::QuicV1)) {
+                    "QUIC"
+                } else if addr.iter().any(|p| matches!(p, Protocol::Tcp(_))) {
+                    "TCP"
+                } else {
+                    "Other"
+                };
+                tracing::info!("[Relay] ===== Connection established =====");
+                tracing::info!("[Relay] Peer ID: {}", peer_id);
+                tracing::info!("[Relay] Role: {}", role);
+                tracing::info!("[Relay] Remote address: {}", addr);
+                tracing::info!("[Relay] Client connection protocol: {}", conn_type);
+                if addr.iter().any(|p| matches!(p, Protocol::P2pCircuit)) {
+                    tracing::info!("[Relay] Type: Relay Circuit connection");
+                } else if addr.iter().any(|p| matches!(p, Protocol::QuicV1)) {
+                    tracing::info!("[Relay] Type: QUIC direct connection");
+                } else if addr.iter().any(|p| matches!(p, Protocol::Tcp(_))) {
+                    tracing::info!("[Relay] Type: TCP connection");
+                }
             }
 
-            SwarmEvent::ConnectionClosed { peer_id, .. } => {
-                tracing::info!("Connection closed with {peer_id}");
+            SwarmEvent::ConnectionClosed { peer_id, endpoint, cause, num_established, .. } => {
+                let addr = endpoint.get_remote_address().clone();
+                let role = if endpoint.is_dialer() { "outgoing" } else { "incoming" };
+                tracing::warn!("[Relay] ===== Connection closed =====");
+                tracing::warn!("[Relay] Peer ID: {}", peer_id);
+                tracing::warn!("[Relay] Role: {}", role);
+                tracing::warn!("[Relay] Remote address: {}", addr);
+                if let Some(cause) = cause {
+                    tracing::warn!("[Relay] Cause: {}", cause);
+                }
+                tracing::warn!("[Relay] Remaining established connections: {}", num_established);
             }
 
+            SwarmEvent::Behaviour(behaviour::BehaviourEvent::Relay(event)) => {
+                // 记录 Relay 事件
+                tracing::info!("[Relay] Relay event occurred: {:?}", event);
+                // 简单记录事件类型，不深入匹配具体事件，因为 libp2p 版本可能有差异
+                {
+                    tracing::debug!("[Relay] Relay event: {:?}", event);
+                }
+            }
             e => {
-                tracing::debug!("{:?}", e);
+                tracing::debug!("[Relay] Event: {:?}", e);
             }
         }
     }
@@ -125,13 +243,17 @@ struct Opt {
     use_ipv6: bool,
 
     /// 身份密钥文件 (protobuf 格式)
-    /// 首次运行自动生成，后续启动从此文件读取以保证 PeerId 不变
     #[arg(long, default_value = "relay-server.key")]
     key_file: PathBuf,
 
     /// 监听端口
     #[arg(long, default_value_t = 4001)]
     port: u16,
+
+    /// 公网 IP 地址（替代 hostname -I 自动检测）
+    /// 在云服务器上 hostname -I 可能返回内网 IP，必须手动指定公网 IP
+    #[arg(long)]
+    public_ip: Option<String>,
 }
 
 /// 从文件加载密钥，不存在则生成新密钥并保存

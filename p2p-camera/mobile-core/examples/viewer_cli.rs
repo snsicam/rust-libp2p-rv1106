@@ -50,6 +50,40 @@ async fn main() -> Result<()> {
 
     let opt = Opt::parse();
 
+    // ---- 参数校验 ----
+    {
+        let relay_str = &opt.relay;
+        if relay_str.contains("/tcp/") && !relay_str.contains("/quic-v1") {
+            tracing::warn!("[Viewer] WARNING: Using TCP relay connection - DCUtR hole punching will NOT work! Use /udp/<port>/quic-v1 instead");
+        } else if relay_str.contains("/quic-v1") {
+            tracing::info!("[Viewer] Relay connection protocol: QUIC - good for DCUtR hole punching");
+        }
+
+        if let Some(ref ip) = opt.external_ip {
+            if let Ok(addr) = ip.parse::<std::net::IpAddr>() {
+                if addr.is_ipv4() {
+                    let v4 = match addr {
+                        std::net::IpAddr::V4(v4) => v4,
+                        _ => unreachable!(),
+                    };
+                    if v4.is_private() {
+                        tracing::error!("[Viewer] ERROR: External IP {} is a private IP - must be a public IP for DCUtR", ip);
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                tracing::error!("[Viewer] ERROR: Invalid external IP address: {}", ip);
+                std::process::exit(1);
+            }
+        }
+
+        if let Some(port) = opt.udp_port {
+            if port == 0 {
+                tracing::warn!("[Viewer] WARNING: Using random UDP port - cannot configure port forwarding for DCUtR");
+            }
+        }
+    }
+
     // ---- 初始化播放器/输出 (独立于 P2P 连接，重连期间不中断) ----
     #[cfg(feature = "player")]
     let mut player = if opt.play {
@@ -88,6 +122,8 @@ async fn main() -> Result<()> {
     let relay_addr_str = opt.relay.clone();
     let gateway_str = opt.camera.clone();
     let no_audio = opt.no_audio;
+    let udp_port = opt.udp_port;
+    let external_ip = opt.external_ip.clone();
 
     let mut frame_count: u64 = 0;
     let mut bytes_received: u64 = 0;
@@ -95,11 +131,13 @@ async fn main() -> Result<()> {
     let mut direct_upgraded = false;
     let start = std::time::Instant::now();
 
-    // 启动初始 session (后台任务)
+    // 启动初始 session (后台任务) — 传入克隆的 external_ip
     spawn_session(
         relay_addr_str.clone(),
         gateway_str.clone(),
         no_audio,
+        udp_port,
+        external_ip.clone(), // 克隆以拥有所有权
         tx.clone(),
         audio_tx.clone(),
         session_tx.clone(),
@@ -127,11 +165,13 @@ async fn main() -> Result<()> {
                             #[cfg(feature = "player")]
                             audio_player.as_mut());
 
-                        // 重新启动 session
+                        // 重新启动 session — 再次克隆 external_ip
                         spawn_session(
                             relay_addr_str.clone(),
                             gateway_str.clone(),
                             no_audio,
+                            udp_port,
+                            external_ip.clone(), // 重新克隆
                             tx.clone(),
                             audio_tx.clone(),
                             session_tx.clone(),
@@ -217,6 +257,8 @@ fn spawn_session(
     relay_addr_str: String,
     gateway_str: String,
     no_audio: bool,
+    udp_port: Option<u16>,
+    external_ip: Option<String>, // 拥有所有权，调用者需克隆
     video_tx: mpsc::Sender<MediaPacket>,
     audio_tx: mpsc::Sender<MediaPacket>,
     event_tx: mpsc::Sender<SessionEvent>,
@@ -226,6 +268,8 @@ fn spawn_session(
             &relay_addr_str,
             &gateway_str,
             no_audio,
+            udp_port,
+            external_ip, // 直接移动进 run_viewer_session
             video_tx,
             audio_tx,
             event_tx.clone(),
@@ -286,6 +330,8 @@ async fn run_viewer_session(
     relay_addr_str: &str,
     gateway_str: &str,
     no_audio: bool,
+    udp_port: Option<u16>,
+    external_ip: Option<String>,
     video_tx: mpsc::Sender<MediaPacket>,
     audio_tx: mpsc::Sender<MediaPacket>,
     event_tx: mpsc::Sender<SessionEvent>,
@@ -310,18 +356,42 @@ async fn run_viewer_session(
         .with_quic()
         .with_relay_client(noise::Config::new, libp2p::yamux::Config::default)?
         .with_behaviour(|key, relay_client| {
-            Ok(ViewerBehaviour::new(key.public(), relay_client))
+            // 启用 push_listen_addr_updates
+            let identify_config = identify::Config::new(
+                "/p2p-camera-viewer/1.0.0".to_string(),
+                key.public().clone(),
+            )
+            .with_push_listen_addr_updates(true);
+            Ok(ViewerBehaviour::new_with_identify_config(
+                key.public().clone(),
+                relay_client,
+                identify_config,
+            ))
         })?
         // Viewer 不需要 idle timeout: 视频流持续传输保持连接活跃
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(0)))
         .build();
 
-    // ---- 监听本地 QUIC + TCP ----
-    swarm.listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse()
-        .context("Invalid local QUIC listen addr")?)?;
+    // ---- 监听本地 QUIC (固定端口，若指定) ----
+    let udp_port = udp_port.unwrap_or(0);
+    let udp_addr = format!("/ip4/0.0.0.0/udp/{}/quic-v1", udp_port).parse()
+        .context("Invalid local QUIC listen addr")?;
+    swarm.listen_on(udp_addr)?;
     swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()
         .context("Invalid local TCP listen addr")?)?;
-    println!("[Viewer] Listening on local QUIC + TCP (for DCUtR hole punch)");
+    println!("[Viewer] Listening on QUIC (port {}) and TCP",
+        if udp_port != 0 { udp_port.to_string() } else { "random".to_string() });
+
+    // ---- 手动添加外部地址（若指定） ----
+    if let Some(ip) = external_ip {
+        if udp_port == 0 {
+            anyhow::bail!("--external-ip requires --udp-port to be fixed");
+        }
+        let ext_addr: Multiaddr = format!("/ip4/{}/udp/{}/quic-v1", ip, udp_port).parse()
+            .context("Invalid external address")?;
+        swarm.add_external_address(ext_addr);
+        println!("[Viewer] Added external address: /ip4/{}/udp/{}/quic-v1", ip, udp_port);
+    }
 
     // ---- 1. 连接 Relay ----
     println!("[Viewer] Dialing relay: {relay_addr}");
@@ -414,14 +484,32 @@ async fn run_viewer_session(
             SwarmEvent::Behaviour(ViewerBehaviourEvent::Dcutr(
                 dcutr::Event { result: Err(e), remote_peer_id, .. },
             )) => {
-                println!("[Viewer] DCUtR hole punch FAILED with {remote_peer_id}: {e} (staying on relay circuit)");
+                let err_str = e.to_string();
+                tracing::warn!("[Viewer] DCUtR hole punch FAILED with {remote_peer_id}: {e} (staying on relay circuit)");
+                if err_str.contains("timeout") {
+                    tracing::warn!("[Viewer] DCUtR failure cause: NAT type incompatibility or firewall blocking UDP");
+                } else if err_str.contains("IO error") || err_str.contains("connection refused") || err_str.contains("network unreachable") {
+                    tracing::warn!("[Viewer] DCUtR failure cause: network unreachable or connection refused");
+                }
             }
             SwarmEvent::Behaviour(ViewerBehaviourEvent::Identify(
                 identify::Event::Received { info, .. },
             )) => {
-                println!("[Viewer] Identify: observed_addr={}, listen_addrs={}",
+                tracing::info!("[Viewer] Identify: observed_addr={}, listen_addrs={}",
                     info.observed_addr,
                     info.listen_addrs.len());
+                if let Some(Protocol::Ip4(ip)) = info.observed_addr.iter().find(|p| matches!(p, Protocol::Ip4(_))) {
+                    if ip.is_private() {
+                        tracing::warn!("[Viewer] WARNING: Observed address is private IP ({}) - DCUtR may fail!", ip);
+                    } else {
+                        tracing::info!("[Viewer] Observed address is public IP ({}) - good for DCUtR", ip);
+                    }
+                }
+                if info.observed_addr.iter().any(|p| matches!(p, Protocol::QuicV1)) {
+                    tracing::info!("[Viewer] Observed address protocol: QUIC - good for DCUtR hole punching");
+                } else if info.observed_addr.iter().any(|p| matches!(p, Protocol::Tcp(_))) {
+                    tracing::warn!("[Viewer] Observed address protocol: TCP only - DCUtR will produce TCP candidates, hole punching unlikely to succeed");
+                }
             }
             SwarmEvent::ConnectionClosed { peer_id, num_established, .. } => {
                 if peer_id == gateway {
@@ -810,16 +898,23 @@ impl ViewerBehaviour {
         local_public_key: libp2p::identity::PublicKey,
         relay_client: relay::client::Behaviour,
     ) -> Self {
+        let identify_config = identify::Config::new(
+            "/p2p-camera-viewer/1.0.0".to_string(),
+            local_public_key.clone(),
+        );
+        Self::new_with_identify_config(local_public_key, relay_client, identify_config)
+    }
+
+    fn new_with_identify_config(
+        local_public_key: libp2p::identity::PublicKey,
+        relay_client: relay::client::Behaviour,
+        identify_config: identify::Config,
+    ) -> Self {
         let peer_id = local_public_key.to_peer_id();
         Self {
             relay_client,
             dcutr: dcutr::Behaviour::new(peer_id),
-            identify: identify::Behaviour::new(
-                identify::Config::new(
-                    "/p2p-camera-viewer/1.0.0".to_string(),
-                    local_public_key,
-                ),
-            ),
+            identify: identify::Behaviour::new(identify_config),
             stream: libp2p_stream::Behaviour::new(),
         }
     }
@@ -850,4 +945,12 @@ struct Opt {
     #[cfg(feature = "player")]
     #[arg(long)]
     play: bool,
+
+    /// QUIC UDP 监听端口（固定以便端口映射）
+    #[arg(long)]
+    udp_port: Option<u16>,
+
+    /// 手动指定公网 IP（配合 --udp-port 使用）
+    #[arg(long)]
+    external_ip: Option<String>,
 }

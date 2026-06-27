@@ -22,8 +22,9 @@ mod media_source;
 #[cfg(feature = "rv1106")]
 mod rk_video_source;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use behaviour::Behaviour;
@@ -58,6 +59,8 @@ async fn main() -> Result<()> {
         .init();
 
     let opt = Opt::parse();
+
+    validate_gateway_config(&opt);
 
     // ---- 初始化媒体源 (文件 or RV1106 SDK) ----
     // 媒体源独立于 P2P 连接，在重连期间持续运行
@@ -143,6 +146,8 @@ async fn main() -> Result<()> {
             video_tx.clone(),
             audio_tx.clone(),
             param_sets.clone(),
+            opt.udp_port,
+            opt.external_ip.clone(), // 克隆以避免移动
         ).await {
             Ok(()) => break, // 正常退出
             Err(e) => {
@@ -187,33 +192,61 @@ async fn run_gateway_session(
     relay_addr: Multiaddr,
     video_tx: broadcast::Sender<MediaPacket>,
     audio_tx: broadcast::Sender<MediaPacket>,
-    param_sets: Option<std::sync::Arc<std::sync::Mutex<Option<Vec<Vec<u8>>>>>>,
+    _param_sets: Option<std::sync::Arc<std::sync::Mutex<Option<Vec<Vec<u8>>>>>>, // 添加下划线前缀消除警告
+    udp_port: Option<u16>,
+    external_ip: Option<String>,
 ) -> Result<()> {
     let peer_id = keypair.public().to_peer_id();
 
     let mut swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
         .with_tcp(
-            tcp::Config::default().nodelay(true),
+            tcp::Config::default(),
             noise::Config::new,
             libp2p::yamux::Config::default,
         )?
         .with_quic()
         .with_relay_client(noise::Config::new, libp2p::yamux::Config::default)?
         .with_behaviour(|key, relay_client| {
-            Ok(Behaviour::new(key.public(), relay_client))
+            let identify_config = identify::Config::new(
+                "/p2p-camera-gateway/1.0.0".to_string(),
+                key.public().clone(),
+            )
+            .with_push_listen_addr_updates(true);
+            Ok(Behaviour::new_with_identify_config(
+                key.public().clone(),
+                relay_client,
+                identify_config,
+            ))
         })?
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(120)))
         .build();
 
     println!("[Gateway] PeerId: {peer_id}");
+    tracing::info!("[Gateway] push_listen_addr_updates enabled for DCUtR");
 
-    // ---- 监听本地 QUIC + TCP (DCUtR hole punch 前提: 需要本地 socket 用于打洞) ----
-    swarm.listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse()
-        .context("Invalid local QUIC listen addr")?)?;
+    let mut connection_times: HashMap<PeerId, Instant> = HashMap::new();
+
+    // ---- 监听本地 QUIC (固定端口，若指定) ----
+    let udp_port = udp_port.unwrap_or(0);
+    let udp_addr = format!("/ip4/0.0.0.0/udp/{}/quic-v1", udp_port).parse()
+        .context("Invalid local QUIC listen addr")?;
+    swarm.listen_on(udp_addr)?;
     swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()
         .context("Invalid local TCP listen addr")?)?;
-    println!("[Gateway] Listening on local QUIC + TCP (for DCUtR hole punch)");
+    println!("[Gateway] Listening on QUIC (port {}) and TCP",
+        if udp_port != 0 { udp_port.to_string() } else { "random".to_string() });
+
+    // ---- 手动添加外部地址（若指定） ----
+    if let Some(ip) = external_ip {
+        if udp_port == 0 {
+            anyhow::bail!("--external-ip requires --udp-port to be fixed (to know the external UDP port)");
+        }
+        let ext_addr: Multiaddr = format!("/ip4/{}/udp/{}/quic-v1", ip, udp_port).parse()
+            .context("Invalid external address")?;
+        swarm.add_external_address(ext_addr);
+        println!("[Gateway] Added external address: /ip4/{}/udp/{}/quic-v1", ip, udp_port);
+    }
 
     // ---- 连接 Relay Server ----
     swarm.dial(relay_addr.clone())?;
@@ -263,19 +296,42 @@ async fn run_gateway_session(
                         dcutr::Event { remote_peer_id, result, .. },
                     )) => match result {
                         Ok(_conn_id) => {
-                            println!("[Gateway] DCUtR direct connection established with {remote_peer_id}");
+                            tracing::info!("[Gateway] DCUtR direct connection established with {remote_peer_id}");
+                            tracing::info!("[Gateway] Direct connection upgrade successful - switching from relay to direct connection");
                         }
                         Err(err) => {
-                            println!("[Gateway] DCUtR failed with {remote_peer_id}: {err} (staying on relay)");
+                            let err_str = err.to_string();
+                            tracing::warn!("[Gateway] DCUtR failed with {remote_peer_id}: {err}");
+                            tracing::warn!("[Gateway] Hole punch failed - continuing to use relay connection");
+                            if err_str.contains("timeout") {
+                                tracing::warn!("[Gateway] DCUtR failure cause: NAT type incompatibility or firewall blocking UDP");
+                            } else if err_str.contains("IO error") || err_str.contains("connection refused") || err_str.contains("network unreachable") {
+                                tracing::warn!("[Gateway] DCUtR failure cause: network unreachable or connection refused");
+                            }
                         }
                     },
 
                     SwarmEvent::Behaviour(behaviour::BehaviourEvent::Identify(
                         identify::Event::Received { info, .. },
                     )) => {
-                        println!("[Gateway] Identify: observed_addr={}, listen_addrs={}",
-                            info.observed_addr,
-                            info.listen_addrs.len());
+                        tracing::info!("[Gateway] Identify received from peer:");
+                        tracing::info!("  - Observed address: {}", info.observed_addr);
+                        tracing::info!("  - Listen addresses ({} total):", info.listen_addrs.len());
+                        for (i, addr) in info.listen_addrs.iter().enumerate() {
+                            tracing::info!("    [{}]: {}", i, addr);
+                        }
+                        if let Some(Protocol::Ip4(ip)) = info.observed_addr.iter().find(|p| matches!(p, Protocol::Ip4(_))) {
+                            if ip.is_private() {
+                                tracing::warn!("[Gateway] WARNING: Observed address is private IP ({}) - DCUtR may fail!", ip);
+                            } else {
+                                tracing::info!("[Gateway] Observed address is public IP ({}) - good for DCUtR", ip);
+                            }
+                        }
+                        if info.observed_addr.iter().any(|p| matches!(p, Protocol::QuicV1)) {
+                            tracing::info!("[Gateway] Observed address protocol: QUIC - good for DCUtR hole punching");
+                        } else if info.observed_addr.iter().any(|p| matches!(p, Protocol::Tcp(_))) {
+                            tracing::warn!("[Gateway] Observed address protocol: TCP only - DCUtR will produce TCP candidates, hole punching unlikely to succeed");
+                        }
                     }
 
                     SwarmEvent::ListenerClosed {
@@ -293,15 +349,42 @@ async fn run_gateway_session(
 
                     SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
                         let role = if endpoint.is_dialer() { "outgoing" } else { "incoming" };
-                        println!("[Gateway] Connection established: {peer_id} ({role})");
+                        let addr = endpoint.get_remote_address().clone();
+                        connection_times.insert(peer_id, Instant::now());
+                        tracing::info!("[Gateway] Connection established:");
+                        tracing::info!("  - Peer ID: {peer_id}");
+                        tracing::info!("  - Role: {role}");
+                        tracing::info!("  - Remote address: {addr}");
+                        if addr.iter().any(|p| matches!(p, Protocol::P2pCircuit)) {
+                            tracing::info!("  - Type: Relay Circuit connection");
+                        } else if addr.iter().any(|p| matches!(p, Protocol::QuicV1)) {
+                            tracing::info!("  - Type: QUIC direct connection");
+                        } else {
+                            tracing::info!("  - Type: Other connection");
+                        }
                     }
 
-                    SwarmEvent::ConnectionClosed { peer_id, .. } => {
-                        // 如果 Relay 连接断开 → 返回 Err 触发重连
-                        // (swarm 内部知道哪个 peer 是 relay，但我们直接对所有 relay 连接断开做反应)
-                        tracing::warn!("[Gateway] Connection closed: {peer_id}");
-                        // 用 behaviour 判断是不是 relay 连接断开比较困难，
-                        // 我们通过 relay client 状态来判断 — 如果预约 listener 也关了就会在 ListenerClosed 处理
+                    SwarmEvent::ConnectionClosed { peer_id, endpoint, cause, num_established, .. } => {
+                        let role = if endpoint.is_dialer() { "outgoing" } else { "incoming" };
+                        let addr = endpoint.get_remote_address().clone();
+                        let duration = connection_times.remove(&peer_id)
+                            .map(|t| t.elapsed())
+                            .map(|d| format!("{:.1}s", d.as_secs_f64()))
+                            .unwrap_or_else(|| "unknown".to_string());
+                        tracing::warn!("[Gateway] Connection closed:");
+                        tracing::warn!("  - Peer ID: {peer_id}");
+                        tracing::warn!("  - Role: {role}");
+                        tracing::warn!("  - Remote address: {addr}");
+                        tracing::warn!("  - Connection duration: {duration}");
+                        if let Some(cause) = cause {
+                            tracing::warn!("  - Cause: {cause}");
+                        }
+                        tracing::warn!("  - Remaining established connections: {num_established}");
+                        if addr.iter().any(|p| matches!(p, Protocol::P2pCircuit)) {
+                            tracing::warn!("  - Type: Relay Circuit connection - may trigger reconnect");
+                        } else if addr.iter().any(|p| matches!(p, Protocol::QuicV1)) {
+                            tracing::warn!("  - Type: QUIC direct connection - falling back to relay");
+                        }
                     }
 
                     _ => {
@@ -318,7 +401,7 @@ async fn run_gateway_session(
                     #[cfg(feature = "rv1106")]
                     let init_nals = rk_video_source::get_param_sets();
                     #[cfg(not(feature = "rv1106"))]
-                    let init_nals = param_sets.as_ref().and_then(|ps| {
+                    let init_nals = _param_sets.as_ref().and_then(|ps| {
                         ps.lock().ok()?.as_ref().map(|v| v.clone())
                     }).unwrap_or_default();
                     tokio::spawn(stream_video_to_viewer(peer_id, stream, rx, init_nals));
@@ -549,4 +632,45 @@ struct Opt {
     #[cfg(feature = "rv1106")]
     #[arg(long)]
     bitrate: Option<u32>,
+
+    /// QUIC UDP 监听端口（若固定，便于端口映射）
+    #[arg(long)]
+    udp_port: Option<u16>,
+
+    /// 手动指定公网 IP（配合 --udp-port 使用）
+    #[arg(long)]
+    external_ip: Option<String>,
+}
+
+fn validate_gateway_config(opt: &Opt) {
+    let relay_str = &opt.relay;
+    if relay_str.contains("/tcp/") && !relay_str.contains("/quic-v1") {
+        tracing::warn!("[Gateway] WARNING: Using TCP relay connection - DCUtR will only produce TCP candidates, hole punching unlikely to succeed. Use /udp/<port>/quic-v1 instead");
+    } else if relay_str.contains("/quic-v1") {
+        tracing::info!("[Gateway] Relay connection protocol: QUIC - good for DCUtR hole punching");
+    }
+
+    if let Some(ref ip) = opt.external_ip {
+        if let Ok(addr) = ip.parse::<std::net::IpAddr>() {
+            if addr.is_ipv4() {
+                let v4 = match addr {
+                    std::net::IpAddr::V4(v4) => v4,
+                    _ => unreachable!(),
+                };
+                if v4.is_private() {
+                    tracing::error!("[Gateway] ERROR: External IP {} is a private IP - must be a public IP for DCUtR", ip);
+                    std::process::exit(1);
+                }
+            }
+        } else {
+            tracing::error!("[Gateway] ERROR: Invalid external IP address: {}", ip);
+            std::process::exit(1);
+        }
+    }
+
+    if let Some(port) = opt.udp_port {
+        if port == 0 {
+            tracing::warn!("[Gateway] WARNING: Using random UDP port - cannot configure port forwarding for DCUtR");
+        }
+    }
 }

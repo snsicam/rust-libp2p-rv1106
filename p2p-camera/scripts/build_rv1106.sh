@@ -89,7 +89,7 @@ fi
 
 # ---- rv1106 模式: 设置 SDK 路径 ----
 if [ "$RV1106_MODE" = true ]; then
-    SDK_ROOT="${RV1106_SDK_ROOT:-$PROJECT_ROOT/../../rv1106/RV1106_Linux_SDK}"
+    SDK_ROOT="${RV1106_SDK_ROOT:-$PROJECT_ROOT/RV1106_Linux_SDK}"
 
     # SDK 头文件路径 — rockit MPI 头文件 (rk_mpi_sys.h 等)
     # 如果未设置, 自动检测 SDK 源码树中的 include 路径

@@ -25,6 +25,7 @@ use proto::{
 use tokio::sync::mpsc;
 
 use crate::jitter_buffer::AvJitterBuffer;
+use crate::net_diag::{ConnectionQuality, ConnectionType, NatDiagnostic, NatDiagnosis};
 
 const STREAM_READ_BUF: usize = 65536; // 64KB
 
@@ -33,15 +34,12 @@ pub struct P2pViewer {
     swarm: Swarm<ViewerBehaviour>,
     stream_control: Control,
     jitter: AvJitterBuffer,
-    /// 视频帧 → UI 层
     video_sender: mpsc::Sender<MediaPacket>,
-    /// UI 层 → 视频帧 (给 Native 层轮询)
     video_receiver: mpsc::Receiver<MediaPacket>,
-    /// 音频帧 → UI 层
     audio_sender: mpsc::Sender<MediaPacket>,
-    /// UI 层 → 音频帧
     audio_receiver: mpsc::Receiver<MediaPacket>,
-    /// 连接状态
+    nat_diagnostic: NatDiagnostic,
+    connection_quality: ConnectionQuality,
     pub connected: bool,
 }
 
@@ -76,13 +74,15 @@ impl P2pViewer {
             swarm,
             stream_control,
             jitter: AvJitterBuffer::new(
-                Duration::from_millis(100),  // 视频缓冲 100ms
-                Duration::from_millis(50),   // 音频缓冲 50ms
+                Duration::from_millis(100),
+                Duration::from_millis(50),
             ),
             video_sender,
             video_receiver,
             audio_sender,
             audio_receiver,
+            nat_diagnostic: NatDiagnostic::new(0),
+            connection_quality: ConnectionQuality::default(),
             connected: false,
         })
     }
@@ -154,13 +154,81 @@ impl P2pViewer {
                 SwarmEvent::Behaviour(ViewerBehaviourEvent::Dcutr(
                     dcutr::Event { result: Ok(_), remote_peer_id, .. },
                 )) => {
-                    println!("[Viewer] Direct connection established with {remote_peer_id}");
+                    tracing::info!("[Viewer] DCUtR direct connection established with {remote_peer_id}");
+                    tracing::info!("[Viewer] Direct Connection Upgrade successful - switching from relay to direct connection");
+                    self.connection_quality.direct_upgraded = true;
+                    self.connection_quality.connection_type = ConnectionType::QuicDirect;
+                    self.connection_quality.last_dcutr_result = Some(Ok(()));
+                }
+                SwarmEvent::Behaviour(ViewerBehaviourEvent::Dcutr(
+                    dcutr::Event { result: Err(err), remote_peer_id, .. },
+                )) => {
+                    let err_str = err.to_string();
+                    tracing::warn!("[Viewer] DCUtR failed with {remote_peer_id}: {err}");
+                    if err_str.contains("timeout") {
+                        tracing::warn!("[Viewer] DCUtR failure cause: NAT type incompatibility or firewall blocking UDP");
+                    } else if err_str.contains("IO error") || err_str.contains("connection refused") || err_str.contains("network unreachable") {
+                        tracing::warn!("[Viewer] DCUtR failure cause: network unreachable or connection refused");
+                    }
+                    self.connection_quality.last_dcutr_result = Some(Err(err_str));
+                }
+                SwarmEvent::Behaviour(ViewerBehaviourEvent::Identify(
+                    identify::Event::Received { info, .. },
+                )) => {
+                    tracing::info!("[Viewer] Identify: observed_addr={}", info.observed_addr);
+                    self.nat_diagnostic.record_observed(&info.observed_addr);
+                    if let Some(Protocol::Ip4(ip)) = info.observed_addr.iter().find(|p| matches!(p, Protocol::Ip4(_))) {
+                        if ip.is_private() {
+                            tracing::warn!("[Viewer] WARNING: Observed address is private IP ({}) - DCUtR may fail!", ip);
+                        } else {
+                            tracing::info!("[Viewer] Observed address is public IP ({}) - good for DCUtR", ip);
+                        }
+                    }
+                    if info.observed_addr.iter().any(|p| matches!(p, Protocol::QuicV1)) {
+                        tracing::info!("[Viewer] Observed address protocol: QUIC - good for DCUtR hole punching");
+                    } else if info.observed_addr.iter().any(|p| matches!(p, Protocol::Tcp(_))) {
+                        tracing::warn!("[Viewer] Observed address protocol: TCP only - DCUtR will produce TCP candidates, hole punching unlikely to succeed");
+                    }
+                    let diag = self.nat_diagnostic.diagnose();
+                    tracing::info!("[Viewer] NAT diagnosis: {}", diag.nat_type.description());
+                }
+                SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+                    let addr = endpoint.get_remote_address().clone();
+                    self.connection_quality.active_connections += 1;
+                    if addr.iter().any(|p| matches!(p, Protocol::P2pCircuit)) {
+                        self.connection_quality.connection_type = ConnectionType::RelayCircuit;
+                    } else if addr.iter().any(|p| matches!(p, Protocol::QuicV1)) {
+                        self.connection_quality.connection_type = ConnectionType::QuicDirect;
+                    }
+                    tracing::debug!("[Viewer] Connection established: {peer_id}, active={}", self.connection_quality.active_connections);
+                }
+                SwarmEvent::ConnectionClosed { peer_id, num_established, .. } => {
+                    self.connection_quality.active_connections = num_established as usize;
+                    if num_established == 0 {
+                        tracing::warn!("[Viewer] All connections to {peer_id} closed");
+                        self.connection_quality.connection_type = ConnectionType::Disconnected;
+                        self.connection_quality.direct_upgraded = false;
+                    } else {
+                        tracing::info!("[Viewer] Connection to {peer_id} closed, {num_established} remaining");
+                    }
                 }
                 _ => {
                     tracing::debug!("Viewer swarm event: {:?}", event);
                 }
             }
         }
+    }
+
+    pub fn nat_diagnosis(&self) -> Option<NatDiagnosis> {
+        if self.nat_diagnostic.observed_history_is_empty() {
+            None
+        } else {
+            Some(self.nat_diagnostic.diagnose())
+        }
+    }
+
+    pub fn connection_quality(&self) -> &ConnectionQuality {
+        &self.connection_quality
     }
 
     // ---- 内部方法 ----
@@ -228,13 +296,14 @@ impl ViewerBehaviour {
     ) -> Self {
         let peer_id = local_public_key.to_peer_id();
         Self {
-            relay_client,  // 使用 builder 传入的
+            relay_client,
             dcutr: dcutr::Behaviour::new(peer_id),
             identify: identify::Behaviour::new(
                 identify::Config::new(
                     "/p2p-camera-viewer/1.0.0".to_string(),
                     local_public_key,
-                ),
+                )
+                .with_push_listen_addr_updates(true),
             ),
             stream: libp2p_stream::Behaviour::new(),
         }

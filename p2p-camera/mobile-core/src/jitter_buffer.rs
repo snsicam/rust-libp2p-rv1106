@@ -143,6 +143,6 @@ impl TrackBuffer {
         }
         let first = self.frames.front().unwrap().packet.timestamp_ms;
         let last = self.frames.back().unwrap().packet.timestamp_ms;
-        Duration::from_millis((last - first) as u64)
+        Duration::from_millis(last - first)
     }
 }

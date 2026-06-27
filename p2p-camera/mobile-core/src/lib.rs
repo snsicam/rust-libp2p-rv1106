@@ -4,8 +4,10 @@
 //! 当前阶段: 提供 Rust API, C FFI 在后续阶段添加。
 
 pub mod jitter_buffer;
+pub mod net_diag;
 pub mod viewer;
 
 // Re-export key types
+pub use net_diag::{ConnectionType, ConnectionQuality, NatDiagnosis, NatType};
 pub use proto::media_packet::{MediaPacket, MediaTrack};
 pub use viewer::P2pViewer;
