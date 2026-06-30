@@ -147,7 +147,6 @@ async fn main() -> Result<()> {
             audio_tx.clone(),
             param_sets.clone(),
             opt.udp_port,
-            opt.external_ip.clone(), // 克隆以避免移动
         ).await {
             Ok(()) => break, // 正常退出
             Err(e) => {
@@ -194,7 +193,6 @@ async fn run_device_cam_session(
     audio_tx: broadcast::Sender<MediaPacket>,
     _param_sets: Option<std::sync::Arc<std::sync::Mutex<Option<Vec<Vec<u8>>>>>>, // 添加下划线前缀消除警告
     udp_port: Option<u16>,
-    external_ip: Option<String>,
 ) -> Result<()> {
     let peer_id = keypair.public().to_peer_id();
 
@@ -237,16 +235,7 @@ async fn run_device_cam_session(
     println!("[DeviceCam] Listening on QUIC (port {}) and TCP",
         if udp_port != 0 { udp_port.to_string() } else { "random".to_string() });
 
-    // ---- 手动添加外部地址（若指定） ----
-    if let Some(ip) = external_ip {
-        if udp_port == 0 {
-            anyhow::bail!("--external-ip requires --udp-port to be fixed (to know the external UDP port)");
-        }
-        let ext_addr: Multiaddr = format!("/ip4/{}/udp/{}/quic-v1", ip, udp_port).parse()
-            .context("Invalid external address")?;
-        swarm.add_external_address(ext_addr);
-        println!("[DeviceCam] Added external address: /ip4/{}/udp/{}/quic-v1", ip, udp_port);
-    }
+    // ---- 外部地址由 identify 协议自动发现（公网 IP）和 NewListenAddr 事件自动注入（本地 IP） ----
 
     // ---- 连接 Relay Server ----
     swarm.dial(relay_addr.clone())?;
@@ -308,6 +297,10 @@ async fn run_device_cam_session(
                             } else if err_str.contains("IO error") || err_str.contains("connection refused") || err_str.contains("network unreachable") {
                                 tracing::warn!("[DeviceCam] DCUtR failure cause: network unreachable or connection refused");
                             }
+                            tracing::warn!("[DeviceCam] If both peers are behind symmetric NAT, DCUtR cannot succeed. Consider:");
+                            tracing::warn!("[DeviceCam]   1. Configure port forwarding on router (map external UDP port → device internal UDP port)");
+                            tracing::warn!("[DeviceCam]   2. Use --external-ip and --udp-port to advertise correct external address");
+                            tracing::info!("[DeviceCam]   3. Relay circuit will continue to work as fallback");
                         }
                     },
 
@@ -329,6 +322,16 @@ async fn run_device_cam_session(
                         }
                         if info.observed_addr.iter().any(|p| matches!(p, Protocol::QuicV1)) {
                             tracing::info!("[DeviceCam] Observed address protocol: QUIC - good for DCUtR hole punching");
+                            // NAT 端口映射检测: observed_addr 的 UDP 端口与本地监听端口不一致时，可能是对称型 NAT
+                            if let Some(Protocol::Udp(observed_port)) = info.observed_addr.iter().find(|p| matches!(p, Protocol::Udp(_))) {
+                                if udp_port != 0 && observed_port != udp_port {
+                                    tracing::warn!("[DeviceCam] NAT port mapping detected: local UDP port {} → observed UDP port {}", udp_port, observed_port);
+                                    tracing::warn!("[DeviceCam] This may indicate symmetric NAT, which prevents DCUtR hole-punching");
+                                    tracing::info!("[DeviceCam] Consider configuring port forwarding: router maps external UDP {} → internal UDP {}", observed_port, udp_port);
+                                } else if udp_port != 0 && observed_port == udp_port {
+                                    tracing::info!("[DeviceCam] Observed UDP port {} matches local QUIC port - good for DCUtR", observed_port);
+                                }
+                            }
                         } else if info.observed_addr.iter().any(|p| matches!(p, Protocol::Tcp(_))) {
                             tracing::warn!("[DeviceCam] Observed address protocol: TCP only - DCUtR will produce TCP candidates, hole punching unlikely to succeed");
                         }
@@ -345,6 +348,21 @@ async fn run_device_cam_session(
 
                     SwarmEvent::NewListenAddr { address, .. } => {
                         println!("[DeviceCam] Listening on: {address}");
+
+                        // 将本地 QUIC 地址注入为 DCUtR 候选地址
+                        // 同 NAT 场景下，本地地址可直接路由，解决 NAT hairpin 不支持的问题
+                        // 使用黑名单策略：排除回环和未指定地址，其余本地网卡地址均可作为候选
+                        // （包括 172.32.x.x 等 is_private() 不覆盖的 VPN/Docker 地址）
+                        let is_quic = address.iter().any(|p| matches!(p, Protocol::QuicV1));
+                        let is_relayed = address.iter().any(|p| matches!(p, Protocol::P2pCircuit));
+                        if is_quic && !is_relayed {
+                            if let Some(Protocol::Ip4(ip)) = address.iter().find(|p| matches!(p, Protocol::Ip4(_))) {
+                                if !ip.is_loopback() && !ip.is_unspecified() {
+                                    swarm.add_external_address(address.clone());
+                                    tracing::info!("[DeviceCam] Added local address as DCUtR candidate: {address}");
+                                }
+                            }
+                        }
                     }
 
                     SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
@@ -636,10 +654,6 @@ struct Opt {
     /// QUIC UDP 监听端口（若固定，便于端口映射）
     #[arg(long)]
     udp_port: Option<u16>,
-
-    /// 手动指定公网 IP（配合 --udp-port 使用）
-    #[arg(long)]
-    external_ip: Option<String>,
 }
 
 fn validate_device_cam_config(opt: &Opt) {
@@ -648,24 +662,6 @@ fn validate_device_cam_config(opt: &Opt) {
         tracing::warn!("[DeviceCam] WARNING: Using TCP relay connection - DCUtR will only produce TCP candidates, hole punching unlikely to succeed. Use /udp/<port>/quic-v1 instead");
     } else if relay_str.contains("/quic-v1") {
         tracing::info!("[DeviceCam] Relay connection protocol: QUIC - good for DCUtR hole punching");
-    }
-
-    if let Some(ref ip) = opt.external_ip {
-        if let Ok(addr) = ip.parse::<std::net::IpAddr>() {
-            if addr.is_ipv4() {
-                let v4 = match addr {
-                    std::net::IpAddr::V4(v4) => v4,
-                    _ => unreachable!(),
-                };
-                if v4.is_private() {
-                    tracing::error!("[DeviceCam] ERROR: External IP {} is a private IP - must be a public IP for DCUtR", ip);
-                    std::process::exit(1);
-                }
-            }
-        } else {
-            tracing::error!("[DeviceCam] ERROR: Invalid external IP address: {}", ip);
-            std::process::exit(1);
-        }
     }
 
     if let Some(port) = opt.udp_port {

@@ -59,24 +59,6 @@ async fn main() -> Result<()> {
             tracing::info!("[Viewer] Relay connection protocol: QUIC - good for DCUtR hole punching");
         }
 
-        if let Some(ref ip) = opt.external_ip {
-            if let Ok(addr) = ip.parse::<std::net::IpAddr>() {
-                if addr.is_ipv4() {
-                    let v4 = match addr {
-                        std::net::IpAddr::V4(v4) => v4,
-                        _ => unreachable!(),
-                    };
-                    if v4.is_private() {
-                        tracing::error!("[Viewer] ERROR: External IP {} is a private IP - must be a public IP for DCUtR", ip);
-                        std::process::exit(1);
-                    }
-                }
-            } else {
-                tracing::error!("[Viewer] ERROR: Invalid external IP address: {}", ip);
-                std::process::exit(1);
-            }
-        }
-
         if let Some(port) = opt.udp_port {
             if port == 0 {
                 tracing::warn!("[Viewer] WARNING: Using random UDP port - cannot configure port forwarding for DCUtR");
@@ -123,7 +105,6 @@ async fn main() -> Result<()> {
     let device_cam_str = opt.camera.clone();
     let no_audio = opt.no_audio;
     let udp_port = opt.udp_port;
-    let external_ip = opt.external_ip.clone();
 
     let mut frame_count: u64 = 0;
     let mut bytes_received: u64 = 0;
@@ -131,13 +112,12 @@ async fn main() -> Result<()> {
     let mut direct_upgraded = false;
     let start = std::time::Instant::now();
 
-    // 启动初始 session (后台任务) — 传入克隆的 external_ip
+    // 启动初始 session (后台任务)
     spawn_session(
         relay_addr_str.clone(),
         device_cam_str.clone(),
         no_audio,
         udp_port,
-        external_ip.clone(), // 克隆以拥有所有权
         tx.clone(),
         audio_tx.clone(),
         session_tx.clone(),
@@ -165,13 +145,12 @@ async fn main() -> Result<()> {
                             #[cfg(feature = "player")]
                             audio_player.as_mut());
 
-                        // 重新启动 session — 再次克隆 external_ip
+                        // 重新启动 session
                         spawn_session(
                             relay_addr_str.clone(),
                             device_cam_str.clone(),
                             no_audio,
                             udp_port,
-                            external_ip.clone(), // 重新克隆
                             tx.clone(),
                             audio_tx.clone(),
                             session_tx.clone(),
@@ -258,7 +237,6 @@ fn spawn_session(
     device_cam_str: String,
     no_audio: bool,
     udp_port: Option<u16>,
-    external_ip: Option<String>, // 拥有所有权，调用者需克隆
     video_tx: mpsc::Sender<MediaPacket>,
     audio_tx: mpsc::Sender<MediaPacket>,
     event_tx: mpsc::Sender<SessionEvent>,
@@ -269,7 +247,6 @@ fn spawn_session(
             &device_cam_str,
             no_audio,
             udp_port,
-            external_ip, // 直接移动进 run_viewer_session
             video_tx,
             audio_tx,
             event_tx.clone(),
@@ -331,7 +308,6 @@ async fn run_viewer_session(
     device_cam_str: &str,
     no_audio: bool,
     udp_port: Option<u16>,
-    external_ip: Option<String>,
     video_tx: mpsc::Sender<MediaPacket>,
     audio_tx: mpsc::Sender<MediaPacket>,
     event_tx: mpsc::Sender<SessionEvent>,
@@ -368,8 +344,8 @@ async fn run_viewer_session(
                 identify_config,
             ))
         })?
-        // Viewer 不需要 idle timeout: 视频流持续传输保持连接活跃
-        .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(0)))
+        // idle timeout 120s: DCUtR handler 在重试期间需要 keep-alive，0 会导致连接被意外关闭
+        .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(120)))
         .build();
 
     // ---- 监听本地 QUIC (固定端口，若指定) ----
@@ -382,16 +358,7 @@ async fn run_viewer_session(
     println!("[Viewer] Listening on QUIC (port {}) and TCP",
         if udp_port != 0 { udp_port.to_string() } else { "random".to_string() });
 
-    // ---- 手动添加外部地址（若指定） ----
-    if let Some(ip) = external_ip {
-        if udp_port == 0 {
-            anyhow::bail!("--external-ip requires --udp-port to be fixed");
-        }
-        let ext_addr: Multiaddr = format!("/ip4/{}/udp/{}/quic-v1", ip, udp_port).parse()
-            .context("Invalid external address")?;
-        swarm.add_external_address(ext_addr);
-        println!("[Viewer] Added external address: /ip4/{}/udp/{}/quic-v1", ip, udp_port);
-    }
+    // ---- 外部地址由 identify 协议自动发现（公网 IP）和 NewListenAddr 事件自动注入（本地 IP） ----
 
     // ---- 1. 连接 Relay ----
     println!("[Viewer] Dialing relay: {relay_addr}");
@@ -491,6 +458,10 @@ async fn run_viewer_session(
                 } else if err_str.contains("IO error") || err_str.contains("connection refused") || err_str.contains("network unreachable") {
                     tracing::warn!("[Viewer] DCUtR failure cause: network unreachable or connection refused");
                 }
+                tracing::warn!("[Viewer] If both peers are behind symmetric NAT, DCUtR cannot succeed. Consider:");
+                tracing::warn!("[Viewer]   1. Configure port forwarding on router (map external UDP port → device internal UDP port)");
+                tracing::warn!("[Viewer]   2. Use --external-ip and --udp-port on device-cam to advertise correct external address");
+                tracing::info!("[Viewer]   3. Relay circuit will continue to work as fallback");
             }
             SwarmEvent::Behaviour(ViewerBehaviourEvent::Identify(
                 identify::Event::Received { info, .. },
@@ -507,8 +478,35 @@ async fn run_viewer_session(
                 }
                 if info.observed_addr.iter().any(|p| matches!(p, Protocol::QuicV1)) {
                     tracing::info!("[Viewer] Observed address protocol: QUIC - good for DCUtR hole punching");
+                    // NAT 端口映射检测: observed_addr 的 UDP 端口与本地监听端口不一致时，可能是对称型 NAT
+                    if let Some(Protocol::Udp(observed_port)) = info.observed_addr.iter().find(|p| matches!(p, Protocol::Udp(_))) {
+                        let local_port = udp_port;
+                        if local_port != 0 && observed_port != local_port {
+                            tracing::warn!("[Viewer] NAT port mapping detected: local UDP port {} → observed UDP port {}", local_port, observed_port);
+                            tracing::warn!("[Viewer] This may indicate symmetric NAT, which prevents DCUtR hole-punching");
+                            tracing::info!("[Viewer] Consider configuring port forwarding: router maps external UDP {} → internal UDP {}", observed_port, local_port);
+                        } else if local_port != 0 && observed_port == local_port {
+                            tracing::info!("[Viewer] Observed UDP port {} matches local QUIC port - good for DCUtR", observed_port);
+                        }
+                    }
                 } else if info.observed_addr.iter().any(|p| matches!(p, Protocol::Tcp(_))) {
                     tracing::warn!("[Viewer] Observed address protocol: TCP only - DCUtR will produce TCP candidates, hole punching unlikely to succeed");
+                }
+            }
+            SwarmEvent::NewListenAddr { address, .. } => {
+                // 将本地 QUIC 地址注入为 DCUtR 候选地址
+                // 同 NAT 场景下，本地地址可直接路由，解决 NAT hairpin 不支持的问题
+                // 使用黑名单策略：排除回环和未指定地址，其余本地网卡地址均可作为候选
+                // （包括 172.32.x.x 等 is_private() 不覆盖的 VPN/Docker 地址）
+                let is_quic = address.iter().any(|p| matches!(p, Protocol::QuicV1));
+                let is_relayed = address.iter().any(|p| matches!(p, Protocol::P2pCircuit));
+                if is_quic && !is_relayed {
+                    if let Some(Protocol::Ip4(ip)) = address.iter().find(|p| matches!(p, Protocol::Ip4(_))) {
+                        if !ip.is_loopback() && !ip.is_unspecified() {
+                            swarm.add_external_address(address.clone());
+                            tracing::info!("[Viewer] Added local address as DCUtR candidate: {address}");
+                        }
+                    }
                 }
             }
             SwarmEvent::ConnectionClosed { peer_id, num_established, .. } => {
@@ -949,8 +947,4 @@ struct Opt {
     /// QUIC UDP 监听端口（固定以便端口映射）
     #[arg(long)]
     udp_port: Option<u16>,
-
-    /// 手动指定公网 IP（配合 --udp-port 使用）
-    #[arg(long)]
-    external_ip: Option<String>,
 }

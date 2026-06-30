@@ -14,6 +14,7 @@
 mod behaviour;
 
 use std::{
+    collections::HashMap,
     error::Error,
     net::{Ipv4Addr, Ipv6Addr},
     path::PathBuf,
@@ -26,7 +27,7 @@ use libp2p::{
     core::multiaddr::{Multiaddr, Protocol},
     identify, identity, noise,
     swarm::SwarmEvent,
-    tcp, yamux,
+    tcp, yamux, PeerId,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -116,6 +117,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         tracing::warn!("[Relay] No --public-ip specified, relay may advertise private IP via hostname -I");
     }
 
+    // ---- 节点连接地址跟踪 ----
+    // 记录每个 peer 连接到 relay 时使用的实际 IP 和端口
+    let mut peer_conn_addrs: HashMap<PeerId, Multiaddr> = HashMap::new();
+
     // ---- 事件循环 ----
     loop {
         match swarm.select_next_some().await {
@@ -132,6 +137,34 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 tracing::info!("[Relay] Listen addresses ({} total):", listen_addrs.len());
                 for (i, addr) in listen_addrs.iter().enumerate() {
                     tracing::info!("[Relay]   [{}]: {}", i, addr);
+                }
+                
+                // ---- 输出节点连接到 relay 的实际 IP 和端口 ----
+                if let Some(conn_addr) = peer_conn_addrs.get(&client_peer_id) {
+                    let mut conn_ip = String::new();
+                    let mut conn_port = String::new();
+                    let mut conn_protocol = String::new();
+                    for p in conn_addr.iter() {
+                        match p {
+                            Protocol::Ip4(addr) => conn_ip = addr.to_string(),
+                            Protocol::Ip6(addr) => conn_ip = addr.to_string(),
+                            Protocol::Tcp(p) => {
+                                conn_port = p.to_string();
+                                conn_protocol = "TCP".to_string();
+                            }
+                            Protocol::Udp(p) => {
+                                conn_port = p.to_string();
+                                conn_protocol = "UDP".to_string();
+                            }
+                            Protocol::QuicV1 => {
+                                conn_protocol = format!("{} QUIC", conn_protocol);
+                            }
+                            _ => {}
+                        }
+                    }
+                    tracing::info!("[Relay] Connected from: {} (IP={}, Port={}, Protocol={})", conn_addr, conn_ip, conn_port, conn_protocol);
+                } else {
+                    tracing::warn!("[Relay] Connected from: unknown (no connection address recorded for this peer)");
                 }
                 
                 // 提取 observed_addr 的 IP 和端口
@@ -193,6 +226,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 } else {
                     "Other"
                 };
+                // 记录 peer 的连接地址（用于 Identify 事件中输出）
+                peer_conn_addrs.insert(peer_id, addr.clone());
                 tracing::info!("[Relay] ===== Connection established =====");
                 tracing::info!("[Relay] Peer ID: {}", peer_id);
                 tracing::info!("[Relay] Role: {}", role);
@@ -210,6 +245,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
             SwarmEvent::ConnectionClosed { peer_id, endpoint, cause, num_established, .. } => {
                 let addr = endpoint.get_remote_address().clone();
                 let role = if endpoint.is_dialer() { "outgoing" } else { "incoming" };
+                // 如果该 peer 没有剩余连接，清除连接地址记录
+                if num_established == 0 {
+                    peer_conn_addrs.remove(&peer_id);
+                }
                 tracing::warn!("[Relay] ===== Connection closed =====");
                 tracing::warn!("[Relay] Peer ID: {}", peer_id);
                 tracing::warn!("[Relay] Role: {}", role);

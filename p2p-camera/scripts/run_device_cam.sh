@@ -49,7 +49,7 @@ echo "[INFO] Relay:   $RELAY_ADDR"
 echo "[INFO] Video:   $VIDEO_FILE ($VSIZE bytes)"
 echo ""
 
-export RUST_LOG="${RUST_LOG:-info}"
+export RUST_LOG="${RUST_LOG:+$RUST_LOG,}libp2p_dcutr=debug,libp2p_relay=debug"
 
 # 前台运行, Ctrl+C 退出
 exec "$DEVICE_CAM_BIN" \
