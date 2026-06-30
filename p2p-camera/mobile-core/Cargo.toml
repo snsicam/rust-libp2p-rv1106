@@ -5,7 +5,7 @@ edition = "2021"
 publish = false
 
 [lib]
-crate-type = ["cdylib", "staticlib"]  # .so for Android, .a for iOS
+crate-type = ["cdylib", "staticlib", "rlib"]  # .so for Android, .a for iOS, rlib for examples
 
 [features]
 # SDL2 + ffmpeg 实时播放 (viewer_cli --play)

@@ -80,7 +80,7 @@ impl P2pViewer {
             video_receiver,
             audio_sender,
             audio_receiver,
-            nat_diagnostic: NatDiagnostic::new(0),
+            nat_diagnostic: NatDiagnostic::new(0, Vec::new()),
             connection_quality: ConnectionQuality::default(),
             connected: false,
         })
@@ -169,6 +169,8 @@ impl P2pViewer {
                     } else if err_str.contains("IO error") || err_str.contains("connection refused") || err_str.contains("network unreachable") {
                         tracing::warn!("[Viewer] DCUtR failure cause: network unreachable or connection refused");
                     }
+                    let diag = self.nat_diagnostic.diagnose();
+                    tracing::warn!("[Viewer] Suggestion: {}", diag.dcutr_suggestion);
                     self.connection_quality.last_dcutr_result = Some(Err(err_str));
                 }
                 SwarmEvent::Behaviour(ViewerBehaviourEvent::Identify(
@@ -190,6 +192,10 @@ impl P2pViewer {
                     }
                     let diag = self.nat_diagnostic.diagnose();
                     tracing::info!("[Viewer] NAT diagnosis: {}", diag.nat_type.description());
+                    if diag.is_4g {
+                        tracing::info!("[Viewer] 4G/CGNAT network detected");
+                    }
+                    tracing::info!("[Viewer] DCUtR suggestion: {}", diag.dcutr_suggestion);
                 }
                 SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
                     let addr = endpoint.get_remote_address().clone();

@@ -20,6 +20,7 @@
 //!   4. 保存到文件 (可用 ffplay 播放) 或 SDL 实时播放 (--play, 需 --features player)
 //!   5. 打印接收统计
 
+use std::net::Ipv4Addr;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -33,6 +34,7 @@ use libp2p::{
     tcp, PeerId,
 };
 use libp2p_stream;
+use mobile_core::net_diag::{NatDiagnostic, NatType};
 use proto::{media_packet::MediaPacket, stream_protocols};
 use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
@@ -110,6 +112,8 @@ async fn main() -> Result<()> {
     let mut bytes_received: u64 = 0;
     let mut audio_count: u64 = 0;
     let mut direct_upgraded = false;
+    let mut local_nat_type: Option<NatType> = None;
+    let mut remote_nat_hint: Option<String> = None;
     let start = std::time::Instant::now();
 
     // 启动初始 session (后台任务)
@@ -159,6 +163,12 @@ async fn main() -> Result<()> {
                     Some(SessionEvent::DirectUpgraded) => {
                         direct_upgraded = true;
                     }
+                    Some(SessionEvent::NatDiagnosis { local_nat, remote_nat }) => {
+                        local_nat_type = Some(local_nat);
+                        if remote_nat.is_some() {
+                            remote_nat_hint = remote_nat;
+                        }
+                    }
                     None => break, // channel 关闭 → 退出
                 }
             }
@@ -203,6 +213,8 @@ async fn main() -> Result<()> {
     // ---- Summary ----
     let elapsed = start.elapsed().as_secs_f64();
     println!("\n[Viewer] === Summary ===");
+    println!("[Viewer] Local NAT: {}", local_nat_type.map(|t| t.short_name()).unwrap_or("Unknown"));
+    println!("[Viewer] Remote NAT: {}", remote_nat_hint.as_deref().unwrap_or("Unknown"));
     println!("[Viewer] Direct connection (DCUtR): {}", if direct_upgraded { "YES (hole punched, no relay bandwidth)" } else { "NO (relay circuit)" });
     println!("[Viewer] Total frames: {frame_count}");
     println!("[Viewer] Total bytes: {bytes_received}");
@@ -229,6 +241,8 @@ enum SessionEvent {
     Disconnected { reason: String },
     /// DCUtR 直连建立
     DirectUpgraded,
+    /// NAT 类型诊断更新
+    NatDiagnosis { local_nat: NatType, remote_nat: Option<String> },
 }
 
 /// 在后台启动一个 viewer session
@@ -360,6 +374,13 @@ async fn run_viewer_session(
 
     // ---- 外部地址由 identify 协议自动发现（公网 IP）和 NewListenAddr 事件自动注入（本地 IP） ----
 
+    // ---- NAT 诊断状态 ----
+    let mut nat_diagnostic: Option<NatDiagnostic> = None;
+    let mut local_nat_type: Option<NatType> = None;
+    let mut remote_nat_hint: Option<String> = None;
+    let mut local_ips: Vec<Ipv4Addr> = Vec::new();
+    let mut local_quic_port: u16 = 0;
+
     // ---- 1. 连接 Relay ----
     println!("[Viewer] Dialing relay: {relay_addr}");
     swarm.dial(relay_addr.clone())?;
@@ -452,23 +473,69 @@ async fn run_viewer_session(
                 dcutr::Event { result: Err(e), remote_peer_id, .. },
             )) => {
                 let err_str = e.to_string();
-                tracing::warn!("[Viewer] DCUtR hole punch FAILED with {remote_peer_id}: {e} (staying on relay circuit)");
-                if err_str.contains("timeout") {
-                    tracing::warn!("[Viewer] DCUtR failure cause: NAT type incompatibility or firewall blocking UDP");
-                } else if err_str.contains("IO error") || err_str.contains("connection refused") || err_str.contains("network unreachable") {
-                    tracing::warn!("[Viewer] DCUtR failure cause: network unreachable or connection refused");
+                let local_nat = local_nat_type.map(|t| t.short_name()).unwrap_or("Unknown");
+                let remote_nat = remote_nat_hint.as_deref().unwrap_or("Unknown");
+                tracing::warn!("[Viewer] DCUtR hole punch FAILED with {remote_peer_id}: {e}");
+                tracing::warn!("[Viewer] NAT context: local={}, remote={}", local_nat, remote_nat);
+                if let Some(ref diag) = nat_diagnostic {
+                    let result = diag.diagnose();
+                    tracing::warn!("[Viewer] Suggestion: {}", result.dcutr_suggestion);
+                } else {
+                    if err_str.contains("timeout") {
+                        tracing::warn!("[Viewer] DCUtR failure cause: NAT type incompatibility or firewall blocking UDP");
+                    } else if err_str.contains("IO error") || err_str.contains("connection refused") || err_str.contains("network unreachable") {
+                        tracing::warn!("[Viewer] DCUtR failure cause: network unreachable or connection refused");
+                    }
+                    tracing::warn!("[Viewer] If both peers are behind symmetric NAT, DCUtR cannot succeed. Consider:");
+                    tracing::warn!("[Viewer]   1. Configure port forwarding on router (map external UDP port → device internal UDP port)");
+                    tracing::warn!("[Viewer]   2. Use --external-ip and --udp-port on device-cam to advertise correct external address");
+                    tracing::info!("[Viewer]   3. Relay circuit will continue to work as fallback");
                 }
-                tracing::warn!("[Viewer] If both peers are behind symmetric NAT, DCUtR cannot succeed. Consider:");
-                tracing::warn!("[Viewer]   1. Configure port forwarding on router (map external UDP port → device internal UDP port)");
-                tracing::warn!("[Viewer]   2. Use --external-ip and --udp-port on device-cam to advertise correct external address");
-                tracing::info!("[Viewer]   3. Relay circuit will continue to work as fallback");
             }
             SwarmEvent::Behaviour(ViewerBehaviourEvent::Identify(
-                identify::Event::Received { info, .. },
+                identify::Event::Received { info, peer_id: identify_peer_id, .. },
             )) => {
                 tracing::info!("[Viewer] Identify: observed_addr={}, listen_addrs={}",
                     info.observed_addr,
                     info.listen_addrs.len());
+
+                // NAT 诊断：记录观测地址
+                if let Some(ref mut diag) = nat_diagnostic {
+                    diag.record_observed(&info.observed_addr);
+                    let result = diag.diagnose();
+                    tracing::info!("[Viewer] NAT diagnosis: {}", result.nat_type.description());
+                    if result.is_4g {
+                        tracing::info!("[Viewer] 4G/CGNAT network detected");
+                    }
+                    tracing::info!("[Viewer] DCUtR suggestion: {}", result.dcutr_suggestion);
+                    local_nat_type = Some(result.nat_type);
+                    let _ = event_tx.send(SessionEvent::NatDiagnosis {
+                        local_nat: result.nat_type,
+                        remote_nat: remote_nat_hint.clone(),
+                    }).await;
+                }
+
+                // 对端 NAT 类型推断（仅对 device-cam 的 Identify 事件）
+                if identify_peer_id == device_cam {
+                    if let Some(Protocol::Udp(observed_port)) = info.observed_addr.iter().find(|p| matches!(p, Protocol::Udp(_))) {
+                        // 从对端 listen_addrs 中找 QUIC 端口
+                        let remote_quic_port = info.listen_addrs.iter()
+                            .filter(|a| a.iter().any(|p| matches!(p, Protocol::QuicV1)))
+                            .filter_map(|a| a.iter().find(|p| matches!(p, Protocol::Udp(_))))
+                            .find_map(|p| if let Protocol::Udp(port) = p { Some(port) } else { None });
+
+                        if let Some(remote_port) = remote_quic_port {
+                            if observed_port == remote_port {
+                                remote_nat_hint = Some("Cone".to_string());
+                                tracing::info!("[Viewer] Remote peer NAT hint: Cone (observed port {} matches listen port {})", observed_port, remote_port);
+                            } else {
+                                remote_nat_hint = Some("Symmetric?".to_string());
+                                tracing::warn!("[Viewer] Remote peer NAT hint: possibly Symmetric (observed port {} != listen port {})", observed_port, remote_port);
+                            }
+                        }
+                    }
+                }
+
                 if let Some(Protocol::Ip4(ip)) = info.observed_addr.iter().find(|p| matches!(p, Protocol::Ip4(_))) {
                     if ip.is_private() {
                         tracing::warn!("[Viewer] WARNING: Observed address is private IP ({}) - DCUtR may fail!", ip);
@@ -505,6 +572,19 @@ async fn run_viewer_session(
                         if !ip.is_loopback() && !ip.is_unspecified() {
                             swarm.add_external_address(address.clone());
                             tracing::info!("[Viewer] Added local address as DCUtR candidate: {address}");
+
+                            // 收集本地 IP 和端口用于 NAT 诊断
+                            if !local_ips.contains(&ip) {
+                                local_ips.push(ip);
+                            }
+                            if let Some(Protocol::Udp(port)) = address.iter().find(|p| matches!(p, Protocol::Udp(_))) {
+                                local_quic_port = port;
+                            }
+                            // 延迟初始化 NatDiagnostic（需要端口和 IP）
+                            if nat_diagnostic.is_none() && local_quic_port != 0 {
+                                nat_diagnostic = Some(NatDiagnostic::new(local_quic_port, local_ips.clone()));
+                                tracing::info!("[Viewer] NAT diagnostic initialized: port={}, ips={:?}", local_quic_port, local_ips);
+                            }
                         }
                     }
                 }

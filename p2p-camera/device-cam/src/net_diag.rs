@@ -1,4 +1,4 @@
-//! NAT 类型诊断模块
+//! NAT 类型诊断模块 (device-cam 版本)
 //!
 //! 通过分析 Relay Server Identify 观测地址与本地监听端口的映射关系，
 //! 判断 NAT 类型，评估 DCUtR 穿透可行性。
@@ -43,25 +43,6 @@ impl NatType {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConnectionType {
-    RelayCircuit,
-    QuicDirect,
-    TcpDirect,
-    Disconnected,
-}
-
-impl ConnectionType {
-    pub fn description(&self) -> &'static str {
-        match self {
-            Self::RelayCircuit => "Relay Circuit (forwarded via relay server)",
-            Self::QuicDirect => "QUIC Direct (hole punched, no relay)",
-            Self::TcpDirect => "TCP Direct",
-            Self::Disconnected => "Disconnected",
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct NatDiagnosis {
     pub nat_type: NatType,
@@ -71,25 +52,6 @@ pub struct NatDiagnosis {
     pub dcutr_feasible: bool,
     pub is_4g: bool,
     pub dcutr_suggestion: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct ConnectionQuality {
-    pub connection_type: ConnectionType,
-    pub active_connections: usize,
-    pub direct_upgraded: bool,
-    pub last_dcutr_result: Option<Result<(), String>>,
-}
-
-impl Default for ConnectionQuality {
-    fn default() -> Self {
-        Self {
-            connection_type: ConnectionType::Disconnected,
-            active_connections: 0,
-            direct_upgraded: false,
-            last_dcutr_result: None,
-        }
-    }
 }
 
 pub struct NatDiagnostic {
@@ -204,25 +166,18 @@ impl NatDiagnostic {
 }
 
 /// 4G/CGNAT 网络启发式检测
-///
-/// 通过本地 IP 网段判断是否可能为 4G 网络：
-/// - 192.168.174.0/24: Android WiFi 热点/USB 共享网络典型网段
-/// - 100.64.0.0/10: RFC 6598 CGNAT 保留段
-/// - 非 RFC 1918 私有地址且非公网 IP: 可能运营商内网
 fn is_4g_network(ip: Ipv4Addr) -> bool {
     // 192.168.174.0/24 — Android WiFi 热点/USB 共享典型网段
     if ip.octets()[0] == 192 && ip.octets()[1] == 168 && ip.octets()[2] == 174 {
         return true;
     }
 
-    // 100.64.0.0/10 — RFC 6598 CGNAT 保留段 (100.64.0.0 - 100.127.255.255)
+    // 100.64.0.0/10 — RFC 6598 CGNAT 保留段
     if (ip.octets()[0] == 100) && (ip.octets()[1] >= 64 && ip.octets()[1] <= 127) {
         return true;
     }
 
     // 非 RFC 1918 私有地址、非回环、非未指定、非公网 IP
-    // 这类地址通常是运营商内网或 VPN 分配的地址
-    // RFC 1918: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
     if !ip.is_private() && !ip.is_loopback() && !ip.is_unspecified() && !is_public_ip(ip) {
         return true;
     }
@@ -232,47 +187,16 @@ fn is_4g_network(ip: Ipv4Addr) -> bool {
 
 /// 判断 IP 是否为公网可达地址
 fn is_public_ip(ip: Ipv4Addr) -> bool {
-    // 排除所有保留地址段后即为公网 IP
-    // RFC 1918 私有地址
-    if ip.is_private() {
-        return false;
-    }
-    // 回环地址
-    if ip.is_loopback() {
-        return false;
-    }
-    // 链路本地 169.254.0.0/16
-    if ip.is_link_local() {
-        return false;
-    }
-    // RFC 6598 CGNAT 100.64.0.0/10
-    if (ip.octets()[0] == 100) && (ip.octets()[1] >= 64 && ip.octets()[1] <= 127) {
-        return false;
-    }
-    // IETF 协议分配 192.0.0.0/24
-    if ip.octets()[0] == 192 && ip.octets()[1] == 0 && ip.octets()[2] == 0 {
-        return false;
-    }
-    // TEST-NET-1 192.0.2.0/24
-    if ip.octets()[0] == 192 && ip.octets()[1] == 0 && ip.octets()[2] == 2 {
-        return false;
-    }
-    // TEST-NET-2 198.51.100.0/24
-    if ip.octets()[0] == 198 && ip.octets()[1] == 51 && ip.octets()[2] == 100 {
-        return false;
-    }
-    // TEST-NET-3 203.0.113.0/24
-    if ip.octets()[0] == 203 && ip.octets()[1] == 0 && ip.octets()[2] == 113 {
-        return false;
-    }
-    // 组播 224.0.0.0/4
-    if ip.is_multicast() {
-        return false;
-    }
-    // 保留 240.0.0.0/4
-    if ip.octets()[0] >= 240 {
-        return false;
-    }
+    if ip.is_private() { return false; }
+    if ip.is_loopback() { return false; }
+    if ip.is_link_local() { return false; }
+    if (ip.octets()[0] == 100) && (ip.octets()[1] >= 64 && ip.octets()[1] <= 127) { return false; }
+    if ip.octets()[0] == 192 && ip.octets()[1] == 0 && ip.octets()[2] == 0 { return false; }
+    if ip.octets()[0] == 192 && ip.octets()[1] == 0 && ip.octets()[2] == 2 { return false; }
+    if ip.octets()[0] == 198 && ip.octets()[1] == 51 && ip.octets()[2] == 100 { return false; }
+    if ip.octets()[0] == 203 && ip.octets()[1] == 0 && ip.octets()[2] == 113 { return false; }
+    if ip.is_multicast() { return false; }
+    if ip.octets()[0] >= 240 { return false; }
     true
 }
 

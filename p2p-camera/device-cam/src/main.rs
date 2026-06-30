@@ -19,10 +19,12 @@
 
 mod behaviour;
 mod media_source;
+mod net_diag;
 #[cfg(feature = "rv1106")]
 mod rk_video_source;
 
 use std::collections::HashMap;
+use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -39,6 +41,7 @@ use libp2p::{
     tcp,
     PeerId,
 };
+use net_diag::{NatDiagnostic, NatType};
 use proto::{
     media_packet::MediaPacket,
     stream_protocols,
@@ -225,6 +228,12 @@ async fn run_device_cam_session(
 
     let mut connection_times: HashMap<PeerId, Instant> = HashMap::new();
 
+    // ---- NAT 诊断状态 ----
+    let mut nat_diagnostic: Option<NatDiagnostic> = None;
+    let mut local_nat_type: Option<NatType> = None;
+    let mut local_ips: Vec<Ipv4Addr> = Vec::new();
+    let mut local_quic_port: u16 = 0;
+
     // ---- 监听本地 QUIC (固定端口，若指定) ----
     let udp_port = udp_port.unwrap_or(0);
     let udp_addr = format!("/ip4/0.0.0.0/udp/{}/quic-v1", udp_port).parse()
@@ -289,18 +298,24 @@ async fn run_device_cam_session(
                             tracing::info!("[DeviceCam] Direct connection upgrade successful - switching from relay to direct connection");
                         }
                         Err(err) => {
-                            let err_str = err.to_string();
+                            let local_nat = local_nat_type.map(|t| t.short_name()).unwrap_or("Unknown");
                             tracing::warn!("[DeviceCam] DCUtR failed with {remote_peer_id}: {err}");
-                            tracing::warn!("[DeviceCam] Hole punch failed - continuing to use relay connection");
-                            if err_str.contains("timeout") {
-                                tracing::warn!("[DeviceCam] DCUtR failure cause: NAT type incompatibility or firewall blocking UDP");
-                            } else if err_str.contains("IO error") || err_str.contains("connection refused") || err_str.contains("network unreachable") {
-                                tracing::warn!("[DeviceCam] DCUtR failure cause: network unreachable or connection refused");
+                            tracing::warn!("[DeviceCam] NAT context: local={}", local_nat);
+                            if let Some(ref diag) = nat_diagnostic {
+                                let result = diag.diagnose();
+                                tracing::warn!("[DeviceCam] Suggestion: {}", result.dcutr_suggestion);
+                            } else {
+                                let err_str = err.to_string();
+                                if err_str.contains("timeout") {
+                                    tracing::warn!("[DeviceCam] DCUtR failure cause: NAT type incompatibility or firewall blocking UDP");
+                                } else if err_str.contains("IO error") || err_str.contains("connection refused") || err_str.contains("network unreachable") {
+                                    tracing::warn!("[DeviceCam] DCUtR failure cause: network unreachable or connection refused");
+                                }
+                                tracing::warn!("[DeviceCam] If both peers are behind symmetric NAT, DCUtR cannot succeed. Consider:");
+                                tracing::warn!("[DeviceCam]   1. Configure port forwarding on router (map external UDP port → device internal UDP port)");
+                                tracing::warn!("[DeviceCam]   2. Use --external-ip and --udp-port to advertise correct external address");
+                                tracing::info!("[DeviceCam]   3. Relay circuit will continue to work as fallback");
                             }
-                            tracing::warn!("[DeviceCam] If both peers are behind symmetric NAT, DCUtR cannot succeed. Consider:");
-                            tracing::warn!("[DeviceCam]   1. Configure port forwarding on router (map external UDP port → device internal UDP port)");
-                            tracing::warn!("[DeviceCam]   2. Use --external-ip and --udp-port to advertise correct external address");
-                            tracing::info!("[DeviceCam]   3. Relay circuit will continue to work as fallback");
                         }
                     },
 
@@ -313,6 +328,19 @@ async fn run_device_cam_session(
                         for (i, addr) in info.listen_addrs.iter().enumerate() {
                             tracing::info!("    [{}]: {}", i, addr);
                         }
+
+                        // NAT 诊断：记录观测地址
+                        if let Some(ref mut diag) = nat_diagnostic {
+                            diag.record_observed(&info.observed_addr);
+                            let result = diag.diagnose();
+                            tracing::info!("[DeviceCam] NAT diagnosis: {}", result.nat_type.description());
+                            if result.is_4g {
+                                tracing::info!("[DeviceCam] 4G/CGNAT network detected");
+                            }
+                            tracing::info!("[DeviceCam] DCUtR suggestion: {}", result.dcutr_suggestion);
+                            local_nat_type = Some(result.nat_type);
+                        }
+
                         if let Some(Protocol::Ip4(ip)) = info.observed_addr.iter().find(|p| matches!(p, Protocol::Ip4(_))) {
                             if ip.is_private() {
                                 tracing::warn!("[DeviceCam] WARNING: Observed address is private IP ({}) - DCUtR may fail!", ip);
@@ -360,6 +388,19 @@ async fn run_device_cam_session(
                                 if !ip.is_loopback() && !ip.is_unspecified() {
                                     swarm.add_external_address(address.clone());
                                     tracing::info!("[DeviceCam] Added local address as DCUtR candidate: {address}");
+
+                                    // 收集本地 IP 和端口用于 NAT 诊断
+                                    if !local_ips.contains(&ip) {
+                                        local_ips.push(ip);
+                                    }
+                                    if let Some(Protocol::Udp(port)) = address.iter().find(|p| matches!(p, Protocol::Udp(_))) {
+                                        local_quic_port = port;
+                                    }
+                                    // 延迟初始化 NatDiagnostic
+                                    if nat_diagnostic.is_none() && local_quic_port != 0 {
+                                        nat_diagnostic = Some(NatDiagnostic::new(local_quic_port, local_ips.clone()));
+                                        tracing::info!("[DeviceCam] NAT diagnostic initialized: port={}, ips={:?}", local_quic_port, local_ips);
+                                    }
                                 }
                             }
                         }
