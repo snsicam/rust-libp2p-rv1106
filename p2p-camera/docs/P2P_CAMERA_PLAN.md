@@ -65,7 +65,12 @@
   Mobile ──Circuit──▶ Relay ──Circuit──▶ DeviceCam
   (通过 /p2p-circuit 地址拨号)
 
-阶段 3: DCUtR 协商 + Hole Punch
+阶段 2b: 局域网直连检测 (同子网场景)
+  双方通过 Identify 协议交换 listen_addrs
+  Viewer 检测到对端有与本地 IP 同 /24 子网的 QUIC 私有地址
+  → 直接 dial 局域网地址，建立 QUIC 直连 (无需打洞)
+
+阶段 3: DCUtR 协商 + Hole Punch (不同 NAT 场景)
   双方通过 circuit 交换各自的 QUIC 地址
   QUIC Hole Punch (dial_as_listener)
 
@@ -78,6 +83,22 @@
   Mobile ◄══ Relay Circuit ══▶ DeviceCam
   (仍然用 relay, 但比直连带宽贵)
 ```
+
+### 局域网直连检测机制
+
+当 Viewer 和 DeviceCam 位于同一局域网时，DCUtR 打洞会失败（NAT hairpin 问题：NAT 不允许内部设备通过公网 IP 互访）。为此实现了局域网直连检测：
+
+**工作原理**:
+1. Viewer 通过 Circuit 连接 DeviceCam 后，Identify 协议交换双方的 listen_addrs
+2. Viewer 检查 DeviceCam 的 listen_addrs 中是否有与本地 IP 同 /24 子网的 QUIC 私有地址
+3. 如果找到，Viewer 直接 `swarm.dial()` 该局域网地址
+4. 直连建立后，将视频/音频 stream 升级到直连上
+
+**关键实现细节**:
+- `wait_for_event_collecting` 函数在等待连接期间收集 `local_ips` 和缓存 Identify 事件，避免事件被吞掉
+- `ConnectionType` 枚举区分 `QuicDirect`（DCUtR 打洞）和 `LanDirect`（局域网直连）
+- 子网判断使用 /24 掩码：`(a & 0xFFFFFF00) == (b & 0xFFFFFF00)`
+- 只尝试一次局域网拨号（`lan_direct_attempted` 标志防止重复）
 
 ---
 
@@ -844,13 +865,16 @@ p2p-camera/
 
 | 场景 | 方案 | 延迟 | 带宽消耗 |
 |------|------|------|----------|
-| 同一局域网 | 直连 (QUIC) | <5ms | 无额外 |
+| 同一局域网 (同 /24 子网) | LAN 直连检测 + QUIC 直连 | <5ms | 无额外 |
 | Camera 公网 IP | 直连 (QUIC) | <50ms | 无额外 |
 | 双方不同 NAT | QUIC Hole Punch → 直连 | <100ms | 无额外 |
+| 同 NAT 但 DCUtR 失败 (hairpin) | LAN 直连检测 (自动降级) | <5ms | 无额外 |
 | Hole Punch 失败 | Relay Circuit 降级 | +50ms | Relay 服务器带宽 |
 | 企业级对称 NAT | Relay Circuit (唯一方案) | +50ms+ | Relay 带宽 |
 
 **Hole Punch 成功率参考**: 在家庭路由器场景下 ~80-90%, 企业防火墙 ~50-60%。
+
+**局域网直连检测**: 当双方在同一 /24 子网时，自动检测并建立局域网直连，绕过 DCUtR 打洞和 Relay 中继。
 
 ### 为什么不需要 TURN
 

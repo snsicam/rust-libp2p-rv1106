@@ -33,6 +33,8 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    println!("[Relay] p2p-camera relay-server v{} ({})", env!("CARGO_PKG_VERSION"), env!("BUILD_TIME"));
+
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .init();

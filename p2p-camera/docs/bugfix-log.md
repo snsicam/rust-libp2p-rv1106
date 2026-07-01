@@ -14,6 +14,7 @@
 | 7 | 2026-06-25 | Viewer (CLI) | DCUtR 直连升级后立即报 "DeviceCam connection closed" 触发重连，但直连实际还在 | DCUtR 打洞成功后 libp2p 自动关闭冗余的 circuit relay 连接，触发 `ConnectionClosed`；旧代码不看剩余连接数直接判定断开 | `ConnectionClosed` 分支检查 `num_established` 字段：`==0` 才真正断开触发重连；`>0` 说明只是 circuit 关闭、直连仍在，继续运行 | `mobile-core/examples/viewer_cli.rs` | ✅ 已验证 |
 | 8 | 2026-06-26 | 构建 (RV1106) | `build_rv1106.sh` 报 "rockit include dir not found"，SDK 路径 `/home/song/samba/work/rv1106/lubancat` 不存在 | SDK_ROOT 默认值是开发者本地绝对路径，不通用 | 改为 `$PROJECT_ROOT/../../rv1106/RV1106_Linux_SDK`（相对项目根目录） | `scripts/build_rv1106.sh` | ✅ 已验证 |
 | 9 | 2026-06-26 | 部署 (云服务器) | DeviceCam 连接云服务器 Relay 报 "Handshake timed out" (QUIC) 或 "Timeout has been reached" (TCP) | (1) 云服务器安全组未放行 UDP/TCP 4001 入站；(2) start_relay.sh 用 `hostname -I` 取到内网 IP，打印的连接地址错误 | (1) 腾讯云安全组添加 TCP+UDP 4001 入站规则；(2) start_relay.sh 新增 `--public-ip` 参数指定外网 IP | `scripts/start_relay.sh` | ✅ 已验证 |
+| 10 | 2026-07-01 | Viewer/DeviceCam | 同一局域网 (192.168.0.2/0.3) 下 DCUtR 打洞失败，日志显示 "Direct connection (DCUtR): NO (relay circuit)"，但视频流畅低延时 | (1) DCUtR 只尝试公网地址打洞 (183.23.149.209)，NAT hairpin 不允许内部设备通过公网 IP 互访；(2) `wait_for_event` 函数在等待连接期间吞掉了 Identify 和 NewListenAddr 事件，导致局域网检测代码无法执行 | (1) 新增局域网直连检测：Identify 事件中检查对端 listen_addrs 是否有同 /24 子网的 QUIC 私有地址，有则直接 dial；(2) `wait_for_event` 替换为 `wait_for_event_collecting`，在等待期间收集 local_ips 和缓存 Identify 事件；(3) 主循环使用 event_queue 优先处理缓存事件；(4) `ConnectionType` 新增 `LanDirect` 变体区分局域网直连和 DCUtR 打洞 | `mobile-core/examples/viewer_cli.rs`, `device-cam/src/main.rs`, `mobile-core/src/viewer.rs`, `mobile-core/src/net_diag.rs` |
 
 ## 关键设计决策
 
@@ -35,3 +36,11 @@
 - 处理 `SwarmEvent::ConnectionClosed` 时**必须检查 `num_established` 字段**：
   - `== 0`：所有连接已断开，触发重连
   - `> 0`：仍有其他连接（如直连），不要误判为断开
+
+### 局域网直连检测注意事项（2026-07-01 新增）
+- DCUtR 只能通过公网地址打洞，同一 NAT 下的设备因 hairpin 问题无法通过 DCUtR 直连
+- 局域网直连检测通过 Identify 协议交换的 listen_addrs 实现，检查对端是否有同 /24 子网的 QUIC 私有地址
+- `wait_for_event` / `wait_for_event_collecting` 在等待连接期间会消费 swarm 事件，**必须**：
+  - 收集 `NewListenAddr` 事件中的 `local_ips`，否则子网比较无数据
+  - 缓存 `Identify` 事件到 `pending_events`，否则主循环收不到对端地址信息
+- 直连升级逻辑统一在 `ConnectionEstablished` 事件中处理（而非 DCUtR 事件），通过远程地址是否为私有 IP 区分 LAN 直连和 DCUtR 打洞

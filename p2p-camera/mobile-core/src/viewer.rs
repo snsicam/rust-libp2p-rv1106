@@ -7,6 +7,7 @@
 //! 4. 打开视频/音频 stream
 //! 5. 接收 MediaPacket → 送入 Jitter Buffer
 
+use std::net::Ipv4Addr;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -40,6 +41,8 @@ pub struct P2pViewer {
     audio_receiver: mpsc::Receiver<MediaPacket>,
     nat_diagnostic: NatDiagnostic,
     connection_quality: ConnectionQuality,
+    device_cam_peer_id: Option<PeerId>,
+    lan_direct_attempted: bool,
     pub connected: bool,
 }
 
@@ -82,6 +85,8 @@ impl P2pViewer {
             audio_receiver,
             nat_diagnostic: NatDiagnostic::new(0, Vec::new()),
             connection_quality: ConnectionQuality::default(),
+            device_cam_peer_id: None,
+            lan_direct_attempted: false,
             connected: false,
         })
     }
@@ -101,6 +106,7 @@ impl P2pViewer {
 
         // 2. 通过 Circuit 拨号 DeviceCam
         let device_cam: PeerId = device_cam_peer_id.parse()?;
+        self.device_cam_peer_id = Some(device_cam);
         let circuit_addr = relay
             .with(Protocol::P2pCircuit)
             .with(Protocol::P2p(device_cam));
@@ -174,7 +180,7 @@ impl P2pViewer {
                     self.connection_quality.last_dcutr_result = Some(Err(err_str));
                 }
                 SwarmEvent::Behaviour(ViewerBehaviourEvent::Identify(
-                    identify::Event::Received { info, .. },
+                    identify::Event::Received { info, peer_id: identify_peer_id, .. },
                 )) => {
                     tracing::info!("[Viewer] Identify: observed_addr={}", info.observed_addr);
                     self.nat_diagnostic.record_observed(&info.observed_addr);
@@ -196,6 +202,45 @@ impl P2pViewer {
                         tracing::info!("[Viewer] 4G/CGNAT network detected");
                     }
                     tracing::info!("[Viewer] DCUtR suggestion: {}", diag.dcutr_suggestion);
+
+                    // 局域网直连检测：检查对端 listen_addrs 中是否有与本地 IP 同子网的 QUIC 地址
+                    if let Some(device_cam) = self.device_cam_peer_id {
+                        if identify_peer_id == device_cam
+                            && !self.connection_quality.direct_upgraded
+                            && !self.lan_direct_attempted
+                        {
+                            let local_ips = self.nat_diagnostic.local_ips();
+                            let lan_addrs: Vec<Multiaddr> = info.listen_addrs.iter()
+                                .filter(|a| a.iter().any(|p| matches!(p, Protocol::QuicV1)))
+                                .filter(|a| !a.iter().any(|p| matches!(p, Protocol::P2pCircuit)))
+                                .filter(|a| {
+                                    if let Some(Protocol::Ip4(ip)) = a.iter().find(|p| matches!(p, Protocol::Ip4(_))) {
+                                        ip.is_private() && !ip.is_loopback()
+                                    } else {
+                                        false
+                                    }
+                                })
+                                .filter(|a| {
+                                    if let Some(Protocol::Ip4(remote_ip)) = a.iter().find(|p| matches!(p, Protocol::Ip4(_))) {
+                                        local_ips.iter().any(|local_ip| is_same_subnet(*local_ip, remote_ip))
+                                    } else {
+                                        false
+                                    }
+                                })
+                                .cloned()
+                                .collect();
+
+                            if !lan_addrs.is_empty() {
+                                self.lan_direct_attempted = true;
+                                for addr in &lan_addrs {
+                                    tracing::info!("[Viewer] LAN direct: detected same-subnet address {addr}, dialing...");
+                                }
+                                if let Err(e) = self.swarm.dial(lan_addrs[0].clone()) {
+                                    tracing::warn!("[Viewer] LAN direct dial failed: {e}");
+                                }
+                            }
+                        }
+                    }
                 }
                 SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
                     let addr = endpoint.get_remote_address().clone();
@@ -203,7 +248,16 @@ impl P2pViewer {
                     if addr.iter().any(|p| matches!(p, Protocol::P2pCircuit)) {
                         self.connection_quality.connection_type = ConnectionType::RelayCircuit;
                     } else if addr.iter().any(|p| matches!(p, Protocol::QuicV1)) {
-                        self.connection_quality.connection_type = ConnectionType::QuicDirect;
+                        let is_lan = addr.iter().any(|p| {
+                            if let Protocol::Ip4(ip) = p { ip.is_private() } else { false }
+                        });
+                        if is_lan {
+                            self.connection_quality.connection_type = ConnectionType::LanDirect;
+                            self.connection_quality.direct_upgraded = true;
+                            tracing::info!("[Viewer] LAN direct connection established with {peer_id}");
+                        } else {
+                            self.connection_quality.connection_type = ConnectionType::QuicDirect;
+                        }
                     }
                     tracing::debug!("[Viewer] Connection established: {peer_id}, active={}", self.connection_quality.active_connections);
                 }
@@ -313,4 +367,11 @@ impl ViewerBehaviour {
             stream: libp2p_stream::Behaviour::new(),
         }
     }
+}
+
+/// 检查两个 IPv4 地址是否在同一 /24 子网
+fn is_same_subnet(a: Ipv4Addr, b: Ipv4Addr) -> bool {
+    let a = u32::from(a);
+    let b = u32::from(b);
+    (a & 0xFFFFFF00) == (b & 0xFFFFFF00)
 }

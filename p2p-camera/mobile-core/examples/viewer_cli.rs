@@ -46,6 +46,8 @@ const RECONNECT_DELAY: Duration = Duration::from_secs(3);
 #[cfg_attr(feature = "player", tokio::main(flavor = "current_thread"))]
 #[cfg_attr(not(feature = "player"), tokio::main)]
 async fn main() -> Result<()> {
+    println!("[Viewer] p2p-camera viewer-cli v{} ({})", env!("CARGO_PKG_VERSION"), env!("BUILD_TIME"));
+
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .init();
@@ -112,6 +114,7 @@ async fn main() -> Result<()> {
     let mut bytes_received: u64 = 0;
     let mut audio_count: u64 = 0;
     let mut direct_upgraded = false;
+    let mut direct_via_lan = false;
     let mut local_nat_type: Option<NatType> = None;
     let mut remote_nat_hint: Option<String> = None;
     let start = std::time::Instant::now();
@@ -160,8 +163,11 @@ async fn main() -> Result<()> {
                             session_tx.clone(),
                         );
                     }
-                    Some(SessionEvent::DirectUpgraded) => {
+                    Some(SessionEvent::DirectUpgraded { via_lan }) => {
                         direct_upgraded = true;
+                        direct_via_lan = via_lan;
+                        let conn_type = if via_lan { "LAN direct (same subnet)" } else { "DCUtR hole punch" };
+                        println!("[Viewer] *** Direct connection established: {conn_type} ***");
                     }
                     Some(SessionEvent::NatDiagnosis { local_nat, remote_nat }) => {
                         local_nat_type = Some(local_nat);
@@ -215,7 +221,9 @@ async fn main() -> Result<()> {
     println!("\n[Viewer] === Summary ===");
     println!("[Viewer] Local NAT: {}", local_nat_type.map(|t| t.short_name()).unwrap_or("Unknown"));
     println!("[Viewer] Remote NAT: {}", remote_nat_hint.as_deref().unwrap_or("Unknown"));
-    println!("[Viewer] Direct connection (DCUtR): {}", if direct_upgraded { "YES (hole punched, no relay bandwidth)" } else { "NO (relay circuit)" });
+    println!("[Viewer] Direct connection: {}", if direct_upgraded {
+        if direct_via_lan { "YES (LAN direct, same subnet)" } else { "YES (DCUtR hole punched, no relay bandwidth)" }
+    } else { "NO (relay circuit)" });
     println!("[Viewer] Total frames: {frame_count}");
     println!("[Viewer] Total bytes: {bytes_received}");
     if elapsed > 0.0 {
@@ -239,8 +247,8 @@ async fn main() -> Result<()> {
 enum SessionEvent {
     /// 连接断开，需要重连
     Disconnected { reason: String },
-    /// DCUtR 直连建立
-    DirectUpgraded,
+    /// 直连建立 (DCUtR 或局域网)
+    DirectUpgraded { via_lan: bool },
     /// NAT 类型诊断更新
     NatDiagnosis { local_nat: NatType, remote_nat: Option<String> },
 }
@@ -381,13 +389,16 @@ async fn run_viewer_session(
     let mut local_ips: Vec<Ipv4Addr> = Vec::new();
     let mut local_quic_port: u16 = 0;
 
+    // 缓存 wait_for_event 期间被吞掉的事件，供主循环处理
+    let mut pending_events: Vec<SwarmEvent<ViewerBehaviourEvent>> = Vec::new();
+
     // ---- 1. 连接 Relay ----
     println!("[Viewer] Dialing relay: {relay_addr}");
     swarm.dial(relay_addr.clone())?;
-    wait_for_event(&mut swarm, |e| matches!(
+    wait_for_event_collecting(&mut swarm, |e| matches!(
         e,
         SwarmEvent::ConnectionEstablished { .. }
-    ), "relay connection").await?;
+    ), "relay connection", &mut local_ips, &mut local_quic_port, &mut pending_events).await?;
 
     // ---- 2. 通过 Circuit 拨号 DeviceCam ----
     let circuit_addr = relay_addr
@@ -395,10 +406,10 @@ async fn run_viewer_session(
         .with(Protocol::P2p(device_cam));
     println!("[Viewer] Dialing device-cam via circuit: {circuit_addr}");
     swarm.dial(circuit_addr)?;
-    wait_for_event(&mut swarm, |e| matches!(
+    wait_for_event_collecting(&mut swarm, |e| matches!(
         e,
         SwarmEvent::ConnectionEstablished { peer_id, .. } if *peer_id == device_cam
-    ), "device-cam circuit connection").await?;
+    ), "device-cam circuit connection", &mut local_ips, &mut local_quic_port, &mut pending_events).await?;
 
     println!("[Viewer] Connected to device-cam {device_cam}");
 
@@ -431,21 +442,53 @@ async fn run_viewer_session(
         Some(tokio::spawn(receive_frames(device_cam, video_stream, video_tx.clone())).abort_handle());
 
     let mut direct_upgraded = false;
+    let mut lan_direct_attempted = false;
+
+    // 初始化 NAT 诊断（如果 wait_for_event 期间已收集到 local_ips）
+    if nat_diagnostic.is_none() && local_quic_port != 0 && !local_ips.is_empty() {
+        nat_diagnostic = Some(NatDiagnostic::new(local_quic_port, local_ips.clone()));
+        tracing::info!("[Viewer] NAT diagnostic initialized: port={}, ips={:?}", local_quic_port, local_ips);
+    }
+
+    if !local_ips.is_empty() {
+        tracing::info!("[Viewer] Local IPs collected: {:?}", local_ips);
+    }
 
     // ---- 5. Swarm 事件循环 (帧消费在主循环中，不在此处) ----
+    // 将 pending_events (wait_for_event 期间缓存的事件) 放入队列
+    let mut event_queue: std::collections::VecDeque<SwarmEvent<ViewerBehaviourEvent>> =
+        pending_events.into_iter().collect();
+
     loop {
-        match swarm.select_next_some().await {
-            SwarmEvent::Behaviour(ViewerBehaviourEvent::Dcutr(
-                dcutr::Event { result: Ok(_), remote_peer_id, .. },
-            )) if !direct_upgraded => {
-                println!("[Viewer] DCUtR direct connection established with {remote_peer_id}, upgrading streams...");
+        // 优先处理缓存事件，再从 swarm 取新事件
+        let event = if let Some(e) = event_queue.pop_front() {
+            e
+        } else {
+            swarm.select_next_some().await
+        };
+
+        match event {
+            // DCUtR 或局域网直连建立后，升级 stream
+            SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } if peer_id == device_cam && !direct_upgraded => {
+                let addr = endpoint.get_remote_address().clone();
+                let is_relay = addr.iter().any(|p| matches!(p, Protocol::P2pCircuit));
+                if is_relay {
+                    // 初始的 circuit 连接，忽略
+                    continue;
+                }
+                // 判断直连类型：如果远程地址是私有 IP，则为局域网直连
+                let is_lan = addr.iter().any(|p| {
+                    if let Protocol::Ip4(ip) = p { ip.is_private() } else { false }
+                });
+                let via = if is_lan { "LAN direct" } else { "DCUtR hole punch" };
+                println!("[Viewer] Direct connection established with {device_cam} via {via}, upgrading streams...");
                 match stream_control.open_stream(device_cam, stream_protocols::VIDEO_PROTOCOL).await {
                     Ok(new_stream) => {
                         if let Some(h) = video_abort_handle.take() { h.abort(); }
                         let handle = tokio::spawn(receive_frames(device_cam, new_stream, video_tx.clone())).abort_handle();
                         video_abort_handle = Some(handle);
                         direct_upgraded = true;
-                        let _ = event_tx.send(SessionEvent::DirectUpgraded).await;
+                        let _ = event_tx.send(SessionEvent::DirectUpgraded { via_lan: is_lan }).await;
                         println!("[Viewer] Video stream upgraded to direct connection");
                     }
                     Err(e) => {
@@ -466,9 +509,12 @@ async fn run_viewer_session(
                     }
                 }
             }
+            SwarmEvent::ConnectionEstablished { .. } => {}
             SwarmEvent::Behaviour(ViewerBehaviourEvent::Dcutr(
                 dcutr::Event { result: Ok(_), .. },
-            )) => {}
+            )) => {
+                // DCUtR 成功会触发 ConnectionEstablished，在那里处理升级
+            }
             SwarmEvent::Behaviour(ViewerBehaviourEvent::Dcutr(
                 dcutr::Event { result: Err(e), remote_peer_id, .. },
             )) => {
@@ -515,7 +561,7 @@ async fn run_viewer_session(
                     }).await;
                 }
 
-                // 对端 NAT 类型推断（仅对 device-cam 的 Identify 事件）
+                // 对端 NAT 类型推断 + 局域网直连检测（仅对 device-cam 的 Identify 事件）
                 if identify_peer_id == device_cam {
                     if let Some(Protocol::Udp(observed_port)) = info.observed_addr.iter().find(|p| matches!(p, Protocol::Udp(_))) {
                         // 从对端 listen_addrs 中找 QUIC 端口
@@ -531,6 +577,43 @@ async fn run_viewer_session(
                             } else {
                                 remote_nat_hint = Some("Symmetric?".to_string());
                                 tracing::warn!("[Viewer] Remote peer NAT hint: possibly Symmetric (observed port {} != listen port {})", observed_port, remote_port);
+                            }
+                        }
+                    }
+
+                    // 局域网直连检测：检查对端 listen_addrs 中是否有与本地 IP 同子网的 QUIC 地址
+                    if !direct_upgraded && !lan_direct_attempted {
+                        let lan_addrs: Vec<Multiaddr> = info.listen_addrs.iter()
+                            .filter(|a| a.iter().any(|p| matches!(p, Protocol::QuicV1)))
+                            .filter(|a| !a.iter().any(|p| matches!(p, Protocol::P2pCircuit)))
+                            .filter(|a| {
+                                if let Some(Protocol::Ip4(ip)) = a.iter().find(|p| matches!(p, Protocol::Ip4(_))) {
+                                    ip.is_private() && !ip.is_loopback()
+                                } else {
+                                    false
+                                }
+                            })
+                            .filter(|a| {
+                                // 检查是否与本地某个 IP 在同一 /24 子网
+                                if let Some(Protocol::Ip4(remote_ip)) = a.iter().find(|p| matches!(p, Protocol::Ip4(_))) {
+                                    local_ips.iter().any(|local_ip| {
+                                        is_same_subnet(*local_ip, remote_ip)
+                                    })
+                                } else {
+                                    false
+                                }
+                            })
+                            .cloned()
+                            .collect();
+
+                        if !lan_addrs.is_empty() {
+                            lan_direct_attempted = true;
+                            for addr in &lan_addrs {
+                                tracing::info!("[Viewer] LAN direct: detected same-subnet address {addr}, dialing...");
+                            }
+                            // 拨号第一个同子网 QUIC 地址
+                            if let Err(e) = swarm.dial(lan_addrs[0].clone()) {
+                                tracing::warn!("[Viewer] LAN direct dial failed: {e}");
                             }
                         }
                     }
@@ -690,11 +773,22 @@ async fn receive_frames(
     }
 }
 
-/// 等待特定事件 (带超时)
-async fn wait_for_event(
+/// 检查两个 IPv4 地址是否在同一 /24 子网
+fn is_same_subnet(a: Ipv4Addr, b: Ipv4Addr) -> bool {
+    let a = u32::from(a);
+    let b = u32::from(b);
+    // /24 子网掩码: 前 24 位相同
+    (a & 0xFFFFFF00) == (b & 0xFFFFFF00)
+}
+
+/// 等待特定事件 (带超时)，同时收集 local_ips 和缓存 Identify/NewListenAddr 事件
+async fn wait_for_event_collecting(
     swarm: &mut libp2p::Swarm<ViewerBehaviour>,
     predicate: impl Fn(&SwarmEvent<ViewerBehaviourEvent>) -> bool,
     label: &str,
+    local_ips: &mut Vec<Ipv4Addr>,
+    local_quic_port: &mut u16,
+    pending_events: &mut Vec<SwarmEvent<ViewerBehaviourEvent>>,
 ) -> Result<()> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
@@ -713,6 +807,36 @@ async fn wait_for_event(
 
         if let SwarmEvent::OutgoingConnectionError { error, .. } = &event {
             tracing::warn!("[Viewer] Connection error ({label}): {error}");
+        }
+
+        // 收集 NewListenAddr 事件中的本地 IP
+        if let SwarmEvent::NewListenAddr { address, .. } = &event {
+            let is_quic = address.iter().any(|p| matches!(p, Protocol::QuicV1));
+            let is_relayed = address.iter().any(|p| matches!(p, Protocol::P2pCircuit));
+            if is_quic && !is_relayed {
+                if let Some(Protocol::Ip4(ip)) = address.iter().find(|p| matches!(p, Protocol::Ip4(_))) {
+                    if !ip.is_loopback() && !ip.is_unspecified() {
+                        swarm.add_external_address(address.clone());
+                        if !local_ips.contains(&ip) {
+                            local_ips.push(ip);
+                        }
+                        if let Some(Protocol::Udp(port)) = address.iter().find(|p| matches!(p, Protocol::Udp(_))) {
+                            *local_quic_port = port;
+                        }
+                    }
+                }
+            }
+        }
+
+        // 缓存 Identify 和 ConnectionEstablished 事件，供主循环处理
+        match &event {
+            SwarmEvent::Behaviour(ViewerBehaviourEvent::Identify(_)) => {
+                pending_events.push(event);
+            }
+            SwarmEvent::ConnectionEstablished { .. } => {
+                // 不缓存，因为主循环的 ConnectionEstablished 处理依赖 direct_upgraded 等状态
+            }
+            _ => {}
         }
     }
 }

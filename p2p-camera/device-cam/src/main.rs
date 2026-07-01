@@ -57,6 +57,8 @@ const RECONNECT_DELAY: Duration = Duration::from_secs(3);
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    println!("[DeviceCam] p2p-camera device-cam v{} ({})", env!("CARGO_PKG_VERSION"), env!("BUILD_TIME"));
+
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .init();
@@ -341,6 +343,36 @@ async fn run_device_cam_session(
                             local_nat_type = Some(result.nat_type);
                         }
 
+                        // 局域网直连检测：检查对端 listen_addrs 中是否有与本地 IP 同子网的 QUIC 地址
+                        {
+                            let lan_addrs: Vec<Multiaddr> = info.listen_addrs.iter()
+                                .filter(|a| a.iter().any(|p| matches!(p, Protocol::QuicV1)))
+                                .filter(|a| !a.iter().any(|p| matches!(p, Protocol::P2pCircuit)))
+                                .filter(|a| {
+                                    if let Some(Protocol::Ip4(ip)) = a.iter().find(|p| matches!(p, Protocol::Ip4(_))) {
+                                        ip.is_private() && !ip.is_loopback()
+                                    } else {
+                                        false
+                                    }
+                                })
+                                .filter(|a| {
+                                    if let Some(Protocol::Ip4(remote_ip)) = a.iter().find(|p| matches!(p, Protocol::Ip4(_))) {
+                                        local_ips.iter().any(|local_ip| is_same_subnet(*local_ip, remote_ip))
+                                    } else {
+                                        false
+                                    }
+                                })
+                                .cloned()
+                                .collect();
+
+                            if !lan_addrs.is_empty() {
+                                for addr in &lan_addrs {
+                                    tracing::info!("[DeviceCam] LAN direct: detected same-subnet peer address {addr}");
+                                }
+                                tracing::info!("[DeviceCam] LAN direct: peer is on the same subnet, viewer may dial us directly");
+                            }
+                        }
+
                         if let Some(Protocol::Ip4(ip)) = info.observed_addr.iter().find(|p| matches!(p, Protocol::Ip4(_))) {
                             if ip.is_private() {
                                 tracing::warn!("[DeviceCam] WARNING: Observed address is private IP ({}) - DCUtR may fail!", ip);
@@ -417,7 +449,14 @@ async fn run_device_cam_session(
                         if addr.iter().any(|p| matches!(p, Protocol::P2pCircuit)) {
                             tracing::info!("  - Type: Relay Circuit connection");
                         } else if addr.iter().any(|p| matches!(p, Protocol::QuicV1)) {
-                            tracing::info!("  - Type: QUIC direct connection");
+                            let is_lan = addr.iter().any(|p| {
+                                if let Protocol::Ip4(ip) = p { ip.is_private() } else { false }
+                            });
+                            if is_lan {
+                                tracing::info!("  - Type: QUIC LAN direct connection (same subnet)");
+                            } else {
+                                tracing::info!("  - Type: QUIC direct connection (DCUtR)");
+                            }
                         } else {
                             tracing::info!("  - Type: Other connection");
                         }
@@ -710,4 +749,11 @@ fn validate_device_cam_config(opt: &Opt) {
             tracing::warn!("[DeviceCam] WARNING: Using random UDP port - cannot configure port forwarding for DCUtR");
         }
     }
+}
+
+/// 检查两个 IPv4 地址是否在同一 /24 子网
+fn is_same_subnet(a: Ipv4Addr, b: Ipv4Addr) -> bool {
+    let a = u32::from(a);
+    let b = u32::from(b);
+    (a & 0xFFFFFF00) == (b & 0xFFFFFF00)
 }

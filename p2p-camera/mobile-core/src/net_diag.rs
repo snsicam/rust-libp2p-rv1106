@@ -47,6 +47,7 @@ impl NatType {
 pub enum ConnectionType {
     RelayCircuit,
     QuicDirect,
+    LanDirect,
     TcpDirect,
     Disconnected,
 }
@@ -56,6 +57,7 @@ impl ConnectionType {
         match self {
             Self::RelayCircuit => "Relay Circuit (forwarded via relay server)",
             Self::QuicDirect => "QUIC Direct (hole punched, no relay)",
+            Self::LanDirect => "LAN Direct (same subnet, no relay)",
             Self::TcpDirect => "TCP Direct",
             Self::Disconnected => "Disconnected",
         }
@@ -113,6 +115,10 @@ impl NatDiagnostic {
 
     pub fn observed_history_is_empty(&self) -> bool {
         self.observed_history.is_empty()
+    }
+
+    pub fn local_ips(&self) -> &[Ipv4Addr] {
+        &self.local_ips
     }
 
     pub fn diagnose(&self) -> NatDiagnosis {
