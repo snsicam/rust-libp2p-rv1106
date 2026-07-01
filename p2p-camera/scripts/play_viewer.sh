@@ -92,6 +92,7 @@ do_run() {
     export RUST_LOG="${RUST_LOG:-info}"
 
     # 前台运行, Ctrl+C 或关窗退出
+    # viewer_cli 现在支持配置文件，命令行参数覆盖配置文件
     "$VIEWER_BIN" \
         --relay "$relay_addr" \
         --camera "$device_cam_peer" \

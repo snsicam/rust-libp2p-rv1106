@@ -73,7 +73,12 @@ if [ "$DO_RUN" = true ]; then
     trap cleanup EXIT INT TERM
 
     echo "[run] Starting relay-server on port $PORT (key: $KEY_FILE)..."
-    "$RELAY_BIN" --port "$PORT" --key-file "$KEY_FILE" > "$LOG_DIR/relay.log" 2>&1 &
+    # relay-server 现在支持配置文件，命令行参数覆盖配置文件
+    RELAY_ARGS=()
+    [ -n "$PORT" ] && RELAY_ARGS+=(--port "$PORT")
+    [ -n "$KEY_FILE" ] && RELAY_ARGS+=(--key-file "$KEY_FILE")
+    [ -n "$PUBLIC_IP" ] && RELAY_ARGS+=(--public-ip "$PUBLIC_IP")
+    "$RELAY_BIN" "${RELAY_ARGS[@]}" > "$LOG_DIR/relay.log" 2>&1 &
     RELAY_PID=$!
 
     # 等待 relay 就绪, 提取 PeerId
@@ -108,10 +113,16 @@ if [ "$DO_RUN" = true ]; then
     echo "  Relay Addr:   $RELAY_ADDR"
     echo ""
     echo "  ---- RV1106 上运行 (device-cam) ----"
-    echo "  device-cam --relay $RELAY_ADDR --video-file /tmp/test.h265"
+    echo "  # 方式1: 编辑 device-cam.toml 后运行"
+    echo "  device-cam"
+    echo "  # 方式2: 命令行参数覆盖"
+    echo "  device-cam --relay $RELAY_ADDR --enable-audio"
     echo ""
     echo "  ---- PC 上运行 (viewer, SDL 播放) ----"
-    echo "  $SCRIPT_DIR/play_viewer.sh run $RELAY_ADDR <DEVICE_CAM_PEER>"
+    echo "  # 方式1: 编辑 viewer.toml 后运行"
+    echo "  $SCRIPT_DIR/run_viewer.sh"
+    echo "  # 方式2: 命令行参数覆盖"
+    echo "  $SCRIPT_DIR/run_viewer.sh $RELAY_ADDR <DEVICE_CAM_PEER>"
     echo "  (DEVICE_CAM_PEER 从 RV1106 device-cam 启动日志获取)"
     echo ""
     echo "  Log: $LOG_DIR/relay.log"

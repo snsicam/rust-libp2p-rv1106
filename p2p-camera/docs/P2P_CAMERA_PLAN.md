@@ -162,6 +162,29 @@ rustup target add armv7-unknown-linux-gnueabihf
 cargo build --release --target armv7-unknown-linux-gnueabihf
 ```
 
+**配置文件**:
+首次运行自动生成 `device-cam.toml`，编辑后重启即可。命令行参数可覆盖配置文件值。
+
+```toml
+# device-cam.toml (自动生成)
+relay = ""                    # 必填: Relay Server 地址
+mode = "listen"               # 运行模式
+key_file = "device-cam.key"   # 身份密钥文件
+enable_audio = false          # 启用音频
+width = 800                   # 视频宽度
+height = 600                  # 视频高度
+fps = 25                      # 帧率
+bitrate = 1024                # 码率 (kbps)
+```
+
+```bash
+# 方式1: 编辑配置文件后运行
+./device-cam
+
+# 方式2: 命令行参数覆盖
+./device-cam --relay /ip4/134.175.248.113/udp/4001/quic-v1/p2p/12D3KooW... --enable-audio
+```
+
 **数据获取（修正：不走 RTSP，直接 SDK API）**:
 
 ```
@@ -789,36 +812,44 @@ Track: 0x01=Video(H.265 NAL), 0x02=Audio(PCM/AAC)
 p2p-camera/
 ├── relay-server/              # 模块1: 中继服务器
 │   ├── Cargo.toml
+│   ├── build.rs               # 编译时间戳
 │   ├── Dockerfile
 │   ├── src/
 │   │   ├── main.rs            # 服务入口
+│   │   ├── config.rs          # TOML 配置文件支持
 │   │   ├── relay.rs           # Relay config
 │   │   ├── api.rs             # HTTP 信令 API
 │   │   └── behaviour.rs       # NetworkBehaviour 定义
 │
 ├── device-cam/                   # 模块2: RV1106 网关
 │   ├── Cargo.toml
+│   ├── build.rs               # 编译时间戳
 │   ├── cross.toml             # cross 编译配置
 │   ├── build-armv7.sh         # 编译脚本
 │   ├── src/
 │   │   ├── main.rs            # 入口
+│   │   ├── config.rs          # TOML 配置文件支持
 │   │   ├── behaviour.rs       # NetworkBehaviour
 │   │   ├── sdk_bridge.rs      # RV1106 SDK FFI 绑定
 │   │   ├── media_packet.rs    # MediaPacket 协议
 │   │   ├── stream_sender.rs   # 音视频发送任务
 │   │   ├── signalling.rs      # HTTP 信令客户端
 │   │   ├── stream_protocols.rs # 协议常量 (/video/1.0, /audio/1.0)
-│   │   └── config.rs          # 配置
+│   │   └── net_diag.rs        # NAT 诊断
 │
 ├── mobile-core/               # 模块3: 移动端 Rust 核心库
 │   ├── Cargo.toml
+│   ├── build.rs               # 编译时间戳
 │   ├── src/
 │   │   ├── lib.rs             # FFI 导出 (视频+音频接口)
 │   │   ├── viewer.rs          # P2pViewer 核心
 │   │   ├── behaviour.rs       # NetworkBehaviour
 │   │   ├── jitter_buffer.rs   # AvJitterBuffer (音视频分离)
 │   │   ├── media_packet.rs    # MediaPacket 解析
+│   │   ├── net_diag.rs        # NAT 诊断 + ConnectionType
 │   │   └── stream_protocols.rs # 协议常量
+│   └── examples/
+│       └── viewer_cli.rs      # PC 端 Viewer (含 TOML 配置支持)
 │
 ├── mobile-android/            # Android APP
 │   ├── app/
@@ -858,6 +889,7 @@ p2p-camera/
 | NAT 中继 | libp2p Relay Circuit (非 TURN) | 原生配合 QUIC; TURN 是为 WebRTC ICE 设计的, 对 QUIC 无优势 |
 | 移动解码 | 硬件解码 | MediaCodec/VideoToolbox + AudioTrack/AVAudioEngine |
 | 编译 | Rust → ARM cross | RV1106 是 Linux, Rust 可直接交叉编译 |
+| 配置管理 | TOML 配置文件 + 命令行覆盖 | 嵌入式设备友好; 首次运行自动生成默认配置; 命令行参数优先级更高便于调试 |
 
 ---
 
@@ -949,22 +981,27 @@ Response: { "ok": true }
 ```bash
 # Day 1: 本地验证 Relay + DeviceCam 直连音视频传输
 
-# 终端1: Relay Server
+# 终端1: Relay Server (首次运行自动生成 relay-server.toml)
 cd relay-server && cargo run
 # 输出: Relay PeerId = 12D3KooW...
 
-# 终端2: DeviceCam (本地模拟, 用 H.265 + PCM 文件代替 SDK 回调)
+# 终端2: DeviceCam (首次运行自动生成 device-cam.toml)
+# 方式1: 编辑 device-cam.toml 填入 relay 地址后运行
+cd device-cam && cargo run
+# 方式2: 命令行参数覆盖
 cd device-cam && cargo run -- \
     --relay /ip4/127.0.0.1/tcp/4001/p2p/<relay_peer> \
-    --video test.h265 \
-    --audio test.pcm
+    --video-file test.h265 --enable-audio
 # 输出: DeviceCam PeerId = 12D3KooX...
 
-# 终端3: Viewer (本地模拟手机)
-cd viewer-cli && cargo run -- \
+# 终端3: Viewer (首次运行自动生成 viewer.toml)
+# 方式1: 编辑 viewer.toml 填入 relay 和 camera 后运行
+cd mobile-core && cargo run --example viewer_cli --features player
+# 方式2: 命令行参数覆盖
+cd mobile-core && cargo run --example viewer_cli --features player -- \
     --relay /ip4/127.0.0.1/tcp/4001/p2p/<relay_peer> \
-    --camera 12D3KooX...
-# 输出: 保存视频到 output.h265 + audio.pcm, 播放验证
+    --camera 12D3KooX... --play
+# 输出: 保存视频到 output.h265 + SDL 实时播放
 ```
 
 验证通过后:

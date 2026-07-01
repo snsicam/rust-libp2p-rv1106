@@ -15,6 +15,7 @@
 | 8 | 2026-06-26 | 构建 (RV1106) | `build_rv1106.sh` 报 "rockit include dir not found"，SDK 路径 `/home/song/samba/work/rv1106/lubancat` 不存在 | SDK_ROOT 默认值是开发者本地绝对路径，不通用 | 改为 `$PROJECT_ROOT/../../rv1106/RV1106_Linux_SDK`（相对项目根目录） | `scripts/build_rv1106.sh` | ✅ 已验证 |
 | 9 | 2026-06-26 | 部署 (云服务器) | DeviceCam 连接云服务器 Relay 报 "Handshake timed out" (QUIC) 或 "Timeout has been reached" (TCP) | (1) 云服务器安全组未放行 UDP/TCP 4001 入站；(2) start_relay.sh 用 `hostname -I` 取到内网 IP，打印的连接地址错误 | (1) 腾讯云安全组添加 TCP+UDP 4001 入站规则；(2) start_relay.sh 新增 `--public-ip` 参数指定外网 IP | `scripts/start_relay.sh` | ✅ 已验证 |
 | 10 | 2026-07-01 | Viewer/DeviceCam | 同一局域网 (192.168.0.2/0.3) 下 DCUtR 打洞失败，日志显示 "Direct connection (DCUtR): NO (relay circuit)"，但视频流畅低延时 | (1) DCUtR 只尝试公网地址打洞 (183.23.149.209)，NAT hairpin 不允许内部设备通过公网 IP 互访；(2) `wait_for_event` 函数在等待连接期间吞掉了 Identify 和 NewListenAddr 事件，导致局域网检测代码无法执行 | (1) 新增局域网直连检测：Identify 事件中检查对端 listen_addrs 是否有同 /24 子网的 QUIC 私有地址，有则直接 dial；(2) `wait_for_event` 替换为 `wait_for_event_collecting`，在等待期间收集 local_ips 和缓存 Identify 事件；(3) 主循环使用 event_queue 优先处理缓存事件；(4) `ConnectionType` 新增 `LanDirect` 变体区分局域网直连和 DCUtR 打洞 | `mobile-core/examples/viewer_cli.rs`, `device-cam/src/main.rs`, `mobile-core/src/viewer.rs`, `mobile-core/src/net_diag.rs` |
+| 11 | 2026-07-01 | 全部 | 三个软件参数只能通过命令行传入，RV1106 嵌入式设备上不便操作 | 无配置文件支持 | 三个软件均新增 TOML 配置文件支持：首次运行自动生成默认配置文件，编辑后重启即可；命令行参数可覆盖配置文件值；优先级：命令行 > 配置文件 > 默认值 | `device-cam/src/config.rs`, `relay-server/src/config.rs`, `mobile-core/examples/viewer_cli.rs` |
 
 ## 关键设计决策
 
@@ -44,3 +45,11 @@
   - 收集 `NewListenAddr` 事件中的 `local_ips`，否则子网比较无数据
   - 缓存 `Identify` 事件到 `pending_events`，否则主循环收不到对端地址信息
 - 直连升级逻辑统一在 `ConnectionEstablished` 事件中处理（而非 DCUtR 事件），通过远程地址是否为私有 IP 区分 LAN 直连和 DCUtR 打洞
+
+### 配置文件设计原则（2026-07-01 新增）
+- 三个软件均使用 TOML 配置文件，首次运行自动生成默认配置
+- 优先级：命令行参数 > 配置文件 > 默认值
+- 配置文件不存在时不报错退出，而是生成默认配置后返回默认值，允许命令行参数覆盖后继续运行
+- 必填项（如 relay 地址）为空时在 main 中检查并报错退出
+- device-cam.toml / relay-server.toml / viewer.toml 分别对应三个软件
+- `--config` 参数可指定配置文件路径，默认为当前目录

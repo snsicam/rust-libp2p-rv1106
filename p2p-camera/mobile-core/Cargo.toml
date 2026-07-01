@@ -42,3 +42,5 @@ sdl2 = { version = "0.37", optional = true }
 [dev-dependencies]
 clap = { version = "4", features = ["derive"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"

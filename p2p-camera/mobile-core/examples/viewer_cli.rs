@@ -21,6 +21,7 @@
 //!   5. 打印接收统计
 
 use std::net::Ipv4Addr;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -36,6 +37,7 @@ use libp2p::{
 use libp2p_stream;
 use mobile_core::net_diag::{NatDiagnostic, NatType};
 use proto::{media_packet::MediaPacket, stream_protocols};
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
 
@@ -54,16 +56,39 @@ async fn main() -> Result<()> {
 
     let opt = Opt::parse();
 
+    // ---- 加载配置文件 ----
+    let mut cfg = ViewerConfig::load(&opt.config).unwrap_or_else(|e| {
+        eprintln!("[Viewer] {e}");
+        std::process::exit(1);
+    });
+
+    // 命令行参数覆盖配置文件
+    if let Some(ref relay) = opt.relay { cfg.relay = relay.clone(); }
+    if let Some(ref camera) = opt.camera { cfg.camera = camera.clone(); }
+    if let Some(ref output) = opt.output { cfg.output = Some(output.clone()); }
+    if opt.no_audio { cfg.no_audio = true; }
+    #[cfg(feature = "player")]
+    if opt.play { cfg.play = true; }
+    if let Some(udp_port) = opt.udp_port { cfg.udp_port = Some(udp_port); }
+
     // ---- 参数校验 ----
+    if cfg.relay.is_empty() {
+        eprintln!("[Viewer] Error: relay address is empty. Edit {} or use --relay", opt.config.display());
+        std::process::exit(1);
+    }
+    if cfg.camera.is_empty() {
+        eprintln!("[Viewer] Error: camera PeerId is empty. Edit {} or use --camera", opt.config.display());
+        std::process::exit(1);
+    }
     {
-        let relay_str = &opt.relay;
+        let relay_str = &cfg.relay;
         if relay_str.contains("/tcp/") && !relay_str.contains("/quic-v1") {
             tracing::warn!("[Viewer] WARNING: Using TCP relay connection - DCUtR hole punching will NOT work! Use /udp/<port>/quic-v1 instead");
         } else if relay_str.contains("/quic-v1") {
             tracing::info!("[Viewer] Relay connection protocol: QUIC - good for DCUtR hole punching");
         }
 
-        if let Some(port) = opt.udp_port {
+        if let Some(port) = cfg.udp_port {
             if port == 0 {
                 tracing::warn!("[Viewer] WARNING: Using random UDP port - cannot configure port forwarding for DCUtR");
             }
@@ -72,7 +97,7 @@ async fn main() -> Result<()> {
 
     // ---- 初始化播放器/输出 (独立于 P2P 连接，重连期间不中断) ----
     #[cfg(feature = "player")]
-    let mut player = if opt.play {
+    let mut player = if cfg.play {
         println!("[Viewer] Initializing SDL player...");
         Some(player::VideoPlayer::new()?)
     } else {
@@ -80,7 +105,7 @@ async fn main() -> Result<()> {
     };
 
     #[cfg(feature = "player")]
-    let mut audio_player = if opt.play && !opt.no_audio {
+    let mut audio_player = if cfg.play && !cfg.no_audio {
         match player::AudioPlayer::new(16000) {
             Ok(p) => Some(p),
             Err(e) => {
@@ -92,7 +117,7 @@ async fn main() -> Result<()> {
         None
     };
 
-    let mut output_file = if let Some(path) = &opt.output {
+    let mut output_file = if let Some(path) = &cfg.output {
         Some(std::fs::File::create(path).context("Failed to create output file")?)
     } else {
         None
@@ -105,10 +130,10 @@ async fn main() -> Result<()> {
     // 用于与后台 session 通信
     let (session_tx, mut session_rx) = mpsc::channel::<SessionEvent>(1);
 
-    let relay_addr_str = opt.relay.clone();
-    let device_cam_str = opt.camera.clone();
-    let no_audio = opt.no_audio;
-    let udp_port = opt.udp_port;
+    let relay_addr_str = cfg.relay.clone();
+    let device_cam_str = cfg.camera.clone();
+    let no_audio = cfg.no_audio;
+    let udp_port = cfg.udp_port;
 
     let mut frame_count: u64 = 0;
     let mut bytes_received: u64 = 0;
@@ -1127,28 +1152,84 @@ impl ViewerBehaviour {
 #[derive(Debug, Parser)]
 #[command(name = "viewer-cli")]
 struct Opt {
-    /// Relay Server 地址
-    #[arg(long)]
-    relay: String,
+    /// 配置文件路径 (不存在则自动生成默认配置)
+    #[arg(long, default_value = "viewer.toml")]
+    config: PathBuf,
 
-    /// 摄像头 (DeviceCam) PeerId
+    /// Relay Server 地址 (覆盖配置文件)
     #[arg(long)]
-    camera: String,
+    relay: Option<String>,
 
-    /// 输出文件路径 (H.265 裸流, 可选)
+    /// 摄像头 (DeviceCam) PeerId (覆盖配置文件)
     #[arg(long)]
-    output: Option<std::path::PathBuf>,
+    camera: Option<String>,
 
-    /// 禁用音频流接收
+    /// 输出文件路径 (H.265 裸流, 可选, 覆盖配置文件)
+    #[arg(long)]
+    output: Option<PathBuf>,
+
+    /// 禁用音频流接收 (覆盖配置文件)
     #[arg(long, default_value_t = false)]
     no_audio: bool,
 
-    /// SDL 实时播放 (需 --features player 编译)
+    /// SDL 实时播放 (需 --features player 编译, 覆盖配置文件)
     #[cfg(feature = "player")]
     #[arg(long)]
     play: bool,
 
-    /// QUIC UDP 监听端口（固定以便端口映射）
+    /// QUIC UDP 监听端口 (覆盖配置文件)
     #[arg(long)]
     udp_port: Option<u16>,
+}
+
+// ---- 配置文件 ----
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ViewerConfig {
+    relay: String,
+    camera: String,
+    #[serde(default)]
+    output: Option<PathBuf>,
+    #[serde(default)]
+    no_audio: bool,
+    #[serde(default)]
+    play: bool,
+    #[serde(default)]
+    udp_port: Option<u16>,
+}
+
+impl Default for ViewerConfig {
+    fn default() -> Self {
+        Self {
+            relay: String::new(),
+            camera: String::new(),
+            output: None,
+            no_audio: false,
+            play: false,
+            udp_port: None,
+        }
+    }
+}
+
+impl ViewerConfig {
+    fn load(path: &PathBuf) -> anyhow::Result<Self> {
+        if path.exists() {
+            let content = std::fs::read_to_string(path)
+                .map_err(|e| anyhow::anyhow!("Failed to read config file {}: {e}", path.display()))?;
+            let config: ViewerConfig = toml::from_str(&content)
+                .map_err(|e| anyhow::anyhow!("Failed to parse config file {}: {e}", path.display()))?;
+            println!("[Viewer] Loaded config from {}", path.display());
+            Ok(config)
+        } else {
+            let config = ViewerConfig::default();
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let content = toml::to_string_pretty(&config)
+                .map_err(|e| anyhow::anyhow!("Failed to serialize config: {e}"))?;
+            std::fs::write(path, content)?;
+            println!("[Viewer] Generated default config file: {}", path.display());
+            Ok(config)
+        }
+    }
 }

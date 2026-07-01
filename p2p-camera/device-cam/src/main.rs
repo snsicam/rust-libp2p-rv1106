@@ -18,6 +18,7 @@
 //!     --video test.h265       # 可选: 视频文件 (代替 SDK 回调)
 
 mod behaviour;
+mod config;
 mod media_source;
 mod net_diag;
 #[cfg(feature = "rv1106")]
@@ -65,7 +66,39 @@ async fn main() -> Result<()> {
 
     let opt = Opt::parse();
 
-    validate_device_cam_config(&opt);
+    // ---- 加载配置文件 ----
+    let mut cfg = config::Config::load(&opt.config).unwrap_or_else(|e| {
+        eprintln!("[DeviceCam] {e}");
+        std::process::exit(1);
+    });
+
+    // 命令行参数覆盖配置文件
+    let cli_overrides = config::CliOverrides {
+        relay: opt.relay,
+        mode: opt.mode,
+        key_file: opt.key_file,
+        enable_audio: opt.enable_audio,
+        udp_port: opt.udp_port,
+        width: opt.width,
+        height: opt.height,
+        fps: opt.fps,
+        bitrate: opt.bitrate,
+        video_file: None, // handled separately below
+    };
+    cfg.apply_cli_overrides(&cli_overrides);
+
+    // video_file 只在非 rv1106 模式下有效
+    #[cfg(not(feature = "rv1106"))]
+    if let Some(ref vf) = opt.video_file {
+        cfg.video_file = Some(vf.clone());
+    }
+
+    if cfg.relay.is_empty() {
+        eprintln!("[DeviceCam] Error: relay address is empty. Edit {} or use --relay", opt.config.display());
+        std::process::exit(1);
+    }
+
+    validate_device_cam_config(&cfg);
 
     // ---- 初始化媒体源 (文件 or RV1106 SDK) ----
     // 媒体源独立于 P2P 连接，在重连期间持续运行
@@ -78,10 +111,10 @@ async fn main() -> Result<()> {
     #[cfg(feature = "rv1106")]
     {
         // RV1106 真实摄像头
-        let width = opt.width.unwrap_or(1920);
-        let height = opt.height.unwrap_or(1080);
-        let fps = opt.fps.unwrap_or(25);
-        let bitrate = opt.bitrate.unwrap_or(4096);
+        let width = cfg.width;
+        let height = cfg.height;
+        let fps = cfg.fps;
+        let bitrate = cfg.bitrate;
         println!("[DeviceCam] Video source: RV1106 camera {}x{} @{}fps {}kbps", width, height, fps, bitrate);
         let source = rk_video_source::RkVideoSource::new(width, height, fps, bitrate);
         param_sets = Some(source.param_sets_handle());
@@ -91,7 +124,7 @@ async fn main() -> Result<()> {
 
     #[cfg(not(feature = "rv1106"))]
     {
-        if let Some(video_path) = &opt.video_file {
+        if let Some(video_path) = &cfg.video_file {
             let data = std::fs::read(video_path)
                 .context("Failed to read video file")?;
             println!("[DeviceCam] Video file: {:?} ({} bytes)", video_path, data.len());
@@ -111,7 +144,7 @@ async fn main() -> Result<()> {
     // 音频源
     #[cfg(feature = "rv1106")]
     {
-        if opt.enable_audio {
+        if cfg.enable_audio {
             let source = rk_video_source::RkAudioSource::new(16000);
             source.spawn(broadcast_sender_to_crossbeam(audio_tx.clone()));
             println!("[DeviceCam] Audio source: RV1106 AI (16kHz mono)");
@@ -120,7 +153,7 @@ async fn main() -> Result<()> {
 
     #[cfg(not(feature = "rv1106"))]
     {
-        if opt.enable_audio {
+        if cfg.enable_audio {
             let source = media_source::SilenceAudioSource::new(16000, 1);
             source.spawn(broadcast_sender_to_crossbeam(audio_tx.clone()));
             println!("[DeviceCam] Audio source: silence (16kHz mono)");
@@ -128,12 +161,12 @@ async fn main() -> Result<()> {
     }
 
     // ---- 加载/生成固定身份密钥 (保证 PeerId 不变) ----
-    let keypair = load_or_create_keypair(&opt.key_file)?;
+    let keypair = load_or_create_keypair(&cfg.key_file)?;
     let peer_id = keypair.public().to_peer_id();
     println!("[DeviceCam] PeerId: {peer_id}");
 
     // ---- 重连循环: Relay 断开时自动重连 ----
-    let relay_addr: Multiaddr = opt.relay.parse()
+    let relay_addr: Multiaddr = cfg.relay.parse()
         .context("Invalid relay address")?;
 
     let mut reconnect_attempt = 0u64;
@@ -151,7 +184,7 @@ async fn main() -> Result<()> {
             video_tx.clone(),
             audio_tx.clone(),
             param_sets.clone(),
-            opt.udp_port,
+            cfg.udp_port,
         ).await {
             Ok(()) => break, // 正常退出
             Err(e) => {
@@ -689,45 +722,44 @@ fn broadcast_sender_to_crossbeam(tx: broadcast::Sender<MediaPacket>) -> Sender<M
 #[derive(Debug, Parser)]
 #[command(name = "p2p-camera device-cam")]
 struct Opt {
-    /// Relay Server 地址
+    /// 配置文件路径 (不存在则自动生成默认配置)
+    #[arg(long, default_value = "device-cam.toml")]
+    config: PathBuf,
+
+    /// Relay Server 地址 (覆盖配置文件)
     #[arg(long)]
-    relay: String,
+    relay: Option<String>,
 
-    /// 运行模式 (listen = 作为媒体源等待 viewer 连接)
-    #[arg(long, default_value = "listen")]
-    mode: String,
+    /// 运行模式 (覆盖配置文件)
+    #[arg(long)]
+    mode: Option<String>,
 
-    /// 身份密钥文件 (protobuf 格式)
-    /// 首次运行自动生成，后续启动从此文件读取以保证 PeerId 不变
-    #[arg(long, default_value = "device-cam.key")]
-    key_file: PathBuf,
+    /// 身份密钥文件 (覆盖配置文件)
+    #[arg(long)]
+    key_file: Option<PathBuf>,
 
     /// 视频裸流文件 (H.265) — 代替 SDK 回调 (非 rv1106 feature)
     #[cfg(not(feature = "rv1106"))]
     #[arg(long)]
     video_file: Option<std::path::PathBuf>,
 
-    /// 启用模拟音频 (静音)
+    /// 启用模拟音频 (覆盖配置文件)
     #[arg(long, default_value_t = false)]
     enable_audio: bool,
 
-    /// [rv1106] 视频宽度
-    #[cfg(feature = "rv1106")]
+    /// [rv1106] 视频宽度 (覆盖配置文件)
     #[arg(long)]
     width: Option<u32>,
 
-    /// [rv1106] 视频高度
-    #[cfg(feature = "rv1106")]
+    /// [rv1106] 视频高度 (覆盖配置文件)
     #[arg(long)]
     height: Option<u32>,
 
-    /// [rv1106] 帧率
-    #[cfg(feature = "rv1106")]
+    /// [rv1106] 帧率 (覆盖配置文件)
     #[arg(long)]
     fps: Option<u32>,
 
-    /// [rv1106] 码率 (kbps)
-    #[cfg(feature = "rv1106")]
+    /// [rv1106] 码率 (kbps) (覆盖配置文件)
     #[arg(long)]
     bitrate: Option<u32>,
 
@@ -736,15 +768,15 @@ struct Opt {
     udp_port: Option<u16>,
 }
 
-fn validate_device_cam_config(opt: &Opt) {
-    let relay_str = &opt.relay;
+fn validate_device_cam_config(cfg: &config::Config) {
+    let relay_str = &cfg.relay;
     if relay_str.contains("/tcp/") && !relay_str.contains("/quic-v1") {
         tracing::warn!("[DeviceCam] WARNING: Using TCP relay connection - DCUtR will only produce TCP candidates, hole punching unlikely to succeed. Use /udp/<port>/quic-v1 instead");
     } else if relay_str.contains("/quic-v1") {
         tracing::info!("[DeviceCam] Relay connection protocol: QUIC - good for DCUtR hole punching");
     }
 
-    if let Some(port) = opt.udp_port {
+    if let Some(port) = cfg.udp_port {
         if port == 0 {
             tracing::warn!("[DeviceCam] WARNING: Using random UDP port - cannot configure port forwarding for DCUtR");
         }

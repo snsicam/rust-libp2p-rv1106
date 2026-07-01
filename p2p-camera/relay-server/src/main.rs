@@ -12,6 +12,7 @@
 //! 注意: 此节点不包含 stream::Behaviour，它只做连接中继，不参与媒体流。
 
 mod behaviour;
+mod config;
 
 use std::{
     collections::HashMap,
@@ -41,8 +42,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let opt = Opt::parse();
 
+    // ---- 加载配置文件 ----
+    let mut cfg = config::Config::load(&opt.config).unwrap_or_else(|e| {
+        eprintln!("[Relay] {e}");
+        std::process::exit(1);
+    });
+
+    // 命令行参数覆盖配置文件
+    let cli_overrides = config::CliOverrides {
+        use_ipv6: opt.use_ipv6,
+        key_file: opt.key_file,
+        port: opt.port,
+        public_ip: opt.public_ip,
+    };
+    cfg.apply_cli_overrides(&cli_overrides);
+
     // 从文件加载固定身份密钥, 保证 PeerId 不变 (方便配置)
-    let keypair = load_or_create_keypair(&opt.key_file)?;
+    let keypair = load_or_create_keypair(&cfg.key_file)?;
     let peer_id = keypair.public().to_peer_id();
 
     let mut swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
@@ -59,19 +75,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // ---- 监听 ----
     let tcp_addr = Multiaddr::empty()
-        .with(match opt.use_ipv6 {
+        .with(match cfg.use_ipv6 {
             true => Protocol::from(Ipv6Addr::UNSPECIFIED),
             false => Protocol::from(Ipv4Addr::UNSPECIFIED),
         })
-        .with(Protocol::Tcp(opt.port));
+        .with(Protocol::Tcp(cfg.port));
     swarm.listen_on(tcp_addr.clone())?;
 
     let quic_addr = Multiaddr::empty()
-        .with(match opt.use_ipv6 {
+        .with(match cfg.use_ipv6 {
             true => Protocol::from(Ipv6Addr::UNSPECIFIED),
             false => Protocol::from(Ipv4Addr::UNSPECIFIED),
         })
-        .with(Protocol::Udp(opt.port))
+        .with(Protocol::Udp(cfg.port))
         .with(Protocol::QuicV1);
     swarm.listen_on(quic_addr.clone())?;
 
@@ -81,42 +97,42 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!("╠══════════════════════════════════════════╣");
     println!("║ PeerId: {peer_id}");
     println!("║");
-    println!("║ TCP:  /ip4/<PUBLIC_IP>/tcp/{}/p2p/{peer_id}", opt.port);
-    println!("║ QUIC: /ip4/<PUBLIC_IP>/udp/{}/quic-v1/p2p/{peer_id}", opt.port);
+    println!("║ TCP:  /ip4/<PUBLIC_IP>/tcp/{}/p2p/{peer_id}", cfg.port);
+    println!("║ QUIC: /ip4/<PUBLIC_IP>/udp/{}/quic-v1/p2p/{peer_id}", cfg.port);
     println!("║");
     println!("║ Listening TCP:  {tcp_addr}");
     println!("║ Listening QUIC: {quic_addr}");
     println!("╚══════════════════════════════════════════╝");
 
     // ---- 手动添加公网外部地址（若指定） ----
-    if let Some(ref ip_str) = opt.public_ip {
+    if let Some(ref ip_str) = cfg.public_ip {
         let ip: std::net::IpAddr = ip_str.parse()
-            .map_err(|e| format!("Invalid --public-ip '{}': {e}", ip_str))?;
+            .map_err(|e| format!("Invalid public_ip '{}': {e}", ip_str))?;
         if let std::net::IpAddr::V4(v4) = ip {
             if v4.is_private() {
-                tracing::error!("[Relay] ERROR: --public-ip {} is a private IP - must be a public IP", ip_str);
+                tracing::error!("[Relay] ERROR: public_ip {} is a private IP - must be a public IP", ip_str);
                 return Err("Public IP must not be a private address".into());
             }
         }
         if ip.is_ipv4() {
-            let ext_tcp: Multiaddr = format!("/ip4/{}/tcp/{}", ip_str, opt.port).parse()
+            let ext_tcp: Multiaddr = format!("/ip4/{}/tcp/{}", ip_str, cfg.port).parse()
                 .map_err(|e| format!("Invalid external TCP address: {e}"))?;
-            let ext_quic: Multiaddr = format!("/ip4/{}/udp/{}/quic-v1", ip_str, opt.port).parse()
+            let ext_quic: Multiaddr = format!("/ip4/{}/udp/{}/quic-v1", ip_str, cfg.port).parse()
                 .map_err(|e| format!("Invalid external QUIC address: {e}"))?;
             swarm.add_external_address(ext_tcp);
             swarm.add_external_address(ext_quic);
             tracing::info!("[Relay] Added external addresses for public IP: {}", ip_str);
         } else {
-            let ext_tcp: Multiaddr = format!("/ip6/{}/tcp/{}", ip_str, opt.port).parse()
+            let ext_tcp: Multiaddr = format!("/ip6/{}/tcp/{}", ip_str, cfg.port).parse()
                 .map_err(|e| format!("Invalid external TCP address: {e}"))?;
-            let ext_quic: Multiaddr = format!("/ip6/{}/udp/{}/quic-v1", ip_str, opt.port).parse()
+            let ext_quic: Multiaddr = format!("/ip6/{}/udp/{}/quic-v1", ip_str, cfg.port).parse()
                 .map_err(|e| format!("Invalid external QUIC address: {e}"))?;
             swarm.add_external_address(ext_tcp);
             swarm.add_external_address(ext_quic);
             tracing::info!("[Relay] Added external addresses for public IPv6: {}", ip_str);
         }
     } else {
-        tracing::warn!("[Relay] No --public-ip specified, relay may advertise private IP via hostname -I");
+        tracing::warn!("[Relay] No public_ip specified, relay may advertise private IP via hostname -I");
     }
 
     // ---- 节点连接地址跟踪 ----
@@ -279,20 +295,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
 #[derive(Debug, Parser)]
 #[command(name = "p2p-camera relay-server")]
 struct Opt {
-    /// 监听 IPv6 (默认 IPv4)
+    /// 配置文件路径 (不存在则自动生成默认配置)
+    #[arg(long, default_value = "relay-server.toml")]
+    config: PathBuf,
+
+    /// 监听 IPv6 (覆盖配置文件)
     #[arg(long, default_value_t = false)]
     use_ipv6: bool,
 
-    /// 身份密钥文件 (protobuf 格式)
-    #[arg(long, default_value = "relay-server.key")]
-    key_file: PathBuf,
+    /// 身份密钥文件 (覆盖配置文件)
+    #[arg(long)]
+    key_file: Option<PathBuf>,
 
-    /// 监听端口
-    #[arg(long, default_value_t = 4001)]
-    port: u16,
+    /// 监听端口 (覆盖配置文件)
+    #[arg(long)]
+    port: Option<u16>,
 
-    /// 公网 IP 地址（替代 hostname -I 自动检测）
-    /// 在云服务器上 hostname -I 可能返回内网 IP，必须手动指定公网 IP
+    /// 公网 IP 地址 (覆盖配置文件)
     #[arg(long)]
     public_ip: Option<String>,
 }

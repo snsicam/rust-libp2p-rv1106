@@ -1,30 +1,29 @@
 #!/bin/bash
-# run_device_cam_rv1106.sh — 在 RV1106 上启动 device-cam
-#
-# 此脚本运行在 RV1106 设备上 (非交叉编译主机)
-# 前置: device-cam 二进制已通过 build_rv1106.sh deploy 拷到 RV1106
+# run_device_cam.sh — 启动 device-cam
 #
 # 用法:
-#   ./run_device_cam_rv1106.sh <relay_addr> [video_file]
+#   方式1 (配置文件): ./run_device_cam.sh
+#     → 首次运行自动生成 device-cam.toml，编辑后重启
+#
+#   方式2 (命令行覆盖): ./run_device_cam.sh <relay_addr> [video_file]
+#     → 命令行参数覆盖配置文件中的值
 #
 # 示例:
-#   ./run_device_cam_rv1106.sh /ip4/192.168.1.100/tcp/4001/p2p/12D3KooW...
-#   ./run_device_cam_rv1106.sh /ip4/192.168.1.100/tcp/4001/p2p/12D3KooW... /tmp/test.h265
+#   ./run_device_cam.sh
+#   ./run_device_cam.sh /ip4/192.168.1.100/udp/4001/quic-v1/p2p/12D3KooW...
+#   ./run_device_cam.sh /ip4/192.168.1.100/udp/4001/quic-v1/p2p/12D3KooW... /tmp/test.h265
+#
+# 日志: 输出到终端同时写入 scripts/logs/device_cam.log
 
 set -euo pipefail
 
-if [ $# -lt 1 ]; then
-    echo "Usage: $0 <relay_addr> [video_file]"
-    echo "Example: $0 /ip4/192.168.1.100/tcp/4001/p2p/12D3KooW... /tmp/test.h265"
-    exit 1
-fi
-
-RELAY_ADDR="$1"
-VIDEO_FILE="${2:-/tmp/test.h265}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR" && pwd)"
+LOG_DIR="$SCRIPT_DIR/logs"
 
 # device-cam 二进制位置 (按常见路径查找)
 DEVICE_CAM_BIN=""
-for p in /usr/bin/device-cam /usr/local/bin/device-cam ./device-cam; do
+for p in "$PROJECT_ROOT/target/debug/device-cam" ./device-cam; do
     if [ -x "$p" ]; then
         DEVICE_CAM_BIN="$p"
         break
@@ -33,25 +32,55 @@ done
 
 if [ -z "$DEVICE_CAM_BIN" ]; then
     echo "[ERROR] device-cam binary not found"
-    echo "  Searched: /usr/bin/device-cam /usr/local/bin/device-cam ./device-cam"
-    echo "  Deploy with: ./build_rv1106.sh deploy (from cross-compile host)"
+    echo "  Searched: $PROJECT_ROOT/target/debug/device-cam ./device-cam"
     exit 1
 fi
 
-if [ ! -f "$VIDEO_FILE" ]; then
-    echo "[ERROR] Video file not found: $VIDEO_FILE"
-    exit 1
+mkdir -p "$LOG_DIR"
+
+# 构建命令参数
+ARGS=()
+
+if [ $# -ge 1 ]; then
+    # 命令行模式: 传入 relay 地址和可选视频文件
+    RELAY_ADDR="$1"
+    ARGS+=(--relay "$RELAY_ADDR")
+
+    if [ $# -ge 2 ]; then
+        VIDEO_FILE="$2"
+        if [ ! -f "$VIDEO_FILE" ]; then
+            echo "[ERROR] Video file not found: $VIDEO_FILE"
+            exit 1
+        fi
+        ARGS+=(--video-file "$VIDEO_FILE")
+    fi
+
+    echo ""
+    echo "============================================"
+    echo "  P2P Camera DeviceCam"
+    echo "============================================"
+    echo "  Binary:  $DEVICE_CAM_BIN"
+    echo "  Relay:   $RELAY_ADDR"
+    if [ $# -ge 2 ]; then
+    echo "  Video:   $VIDEO_FILE"
+    fi
+else
+    # 配置文件模式: 直接运行，读取 device-cam.toml
+    echo ""
+    echo "============================================"
+    echo "  P2P Camera DeviceCam"
+    echo "============================================"
+    echo "  Binary:  $DEVICE_CAM_BIN"
+    echo "  Config:  device-cam.toml"
 fi
 
-VSIZE=$(stat -c%s "$VIDEO_FILE" 2>/dev/null || stat -f%z "$VIDEO_FILE" 2>/dev/null)
-echo "[INFO] DeviceCam: $DEVICE_CAM_BIN"
-echo "[INFO] Relay:   $RELAY_ADDR"
-echo "[INFO] Video:   $VIDEO_FILE ($VSIZE bytes)"
+echo ""
+echo "  Ctrl+C to stop"
+echo "============================================"
 echo ""
 
 export RUST_LOG="${RUST_LOG:+$RUST_LOG,}libp2p_dcutr=debug,libp2p_relay=debug"
 
-# 前台运行, Ctrl+C 退出
-exec "$DEVICE_CAM_BIN" \
-    --relay "$RELAY_ADDR" \
-    --video-file "$VIDEO_FILE"
+# 前台运行, 输出到终端同时写日志
+"$DEVICE_CAM_BIN" "${ARGS[@]}" \
+    2>&1 | tee "$LOG_DIR/device_cam.log"
