@@ -58,6 +58,29 @@ const BROADCAST_CAPACITY: usize = 100;
 const RECONNECT_DELAY_BASE: Duration = Duration::from_secs(3);
 const RECONNECT_DELAY_MAX: Duration = Duration::from_secs(60);
 
+/// 单个 Relay 的连接和预约状态
+struct RelayState {
+    /// Relay 的完整 Multiaddr
+    addr: Multiaddr,
+    /// Relay 的 PeerId (从 addr 中提取)
+    peer_id: PeerId,
+    /// 当前 Reservation 的 ListenerId (None 表示未预约)
+    reservation_id: Option<libp2p::core::transport::ListenerId>,
+    /// 是否已连接到该 Relay
+    connected: bool,
+    /// 重连尝试次数 (0=首次, >0=重连中)
+    reconnect_attempt: u32,
+}
+
+impl RelayState {
+    /// 计算指数退避延迟
+    fn reconnect_delay(&self) -> Duration {
+        let delay_secs = (RECONNECT_DELAY_BASE.as_secs() as u64)
+            .saturating_mul(1u64 << self.reconnect_attempt.saturating_sub(1).min(4));
+        Duration::from_secs(delay_secs).min(RECONNECT_DELAY_MAX)
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     println!("[DeviceCam] p2p-camera device-cam v{} ({})", env!("CARGO_PKG_VERSION"), env!("BUILD_TIME"));
@@ -76,7 +99,8 @@ async fn main() -> Result<()> {
 
     // 命令行参数覆盖配置文件
     let cli_overrides = config::CliOverrides {
-        relay: opt.relay,
+        relays: opt.relays,
+        enable_mdns: opt.enable_mdns,
         mode: opt.mode,
         key_file: opt.key_file,
         enable_audio: opt.enable_audio,
@@ -95,8 +119,8 @@ async fn main() -> Result<()> {
         cfg.video_file = Some(vf.clone());
     }
 
-    if cfg.relay.is_empty() {
-        eprintln!("[DeviceCam] Error: relay address is empty. Edit {} or use --relay", opt.config.display());
+    if cfg.relays.is_empty() && !cfg.enable_mdns {
+        eprintln!("[DeviceCam] Error: no relay addresses and mDNS is disabled. Edit {} or use --relay / --enable-mdns", opt.config.display());
         std::process::exit(1);
     }
 
@@ -167,15 +191,35 @@ async fn main() -> Result<()> {
     let peer_id = keypair.public().to_peer_id();
     println!("[DeviceCam] PeerId: {peer_id}");
 
-    // ---- 解析 Relay 地址 ----
-    let relay_addr: Multiaddr = cfg.relay.parse()
-        .context("Invalid relay address")?;
-    let relay_peer_id: PeerId = relay_addr.iter()
-        .find_map(|p| match p {
-            Protocol::P2p(peer_id) => Some(peer_id),
-            _ => None,
-        })
-        .ok_or_else(|| anyhow::anyhow!("Relay address must contain PeerId"))?;
+    // ---- 解析 Relay 地址列表 ----
+    let relay_states: Vec<RelayState> = cfg.relays.iter().map(|addr_str| {
+        let addr: Multiaddr = addr_str.parse()
+            .context(format!("Invalid relay address: {addr_str}"))
+            .unwrap(); // 在 validate 阶段已校验
+        let peer_id = addr.iter()
+            .find_map(|p| match p {
+                Protocol::P2p(peer_id) => Some(peer_id),
+                _ => None,
+            })
+            .expect("Relay address must contain PeerId");
+        RelayState {
+            addr,
+            peer_id,
+            reservation_id: None,
+            connected: false,
+            reconnect_attempt: 0,
+        }
+    }).collect();
+
+    if !relay_states.is_empty() {
+        println!("[DeviceCam] Configured {} relay(s)", relay_states.len());
+        for (i, state) in relay_states.iter().enumerate() {
+            println!("[DeviceCam]   Relay #{}: {}", i + 1, state.peer_id);
+        }
+    }
+    if cfg.enable_mdns {
+        println!("[DeviceCam] mDNS enabled - LAN discovery active");
+    }
 
     // ---- 构建 Swarm (只创建一次，重连时复用) ----
     let mut swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
@@ -193,11 +237,11 @@ async fn main() -> Result<()> {
                 key.public().clone(),
             )
             .with_push_listen_addr_updates(true);
-            Ok(Behaviour::new_with_identify_config(
+            Behaviour::new_with_identify_config(
                 key.public().clone(),
                 relay_client,
                 identify_config,
-            ))
+            )
         })?
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(120)))
         .build();
@@ -233,13 +277,15 @@ async fn main() -> Result<()> {
     let mut local_nat_type: Option<NatType> = None;
     let mut local_ips: Vec<Ipv4Addr> = Vec::new();
     let mut local_quic_port: u16 = 0;
-    let mut reservation_id: Option<libp2p::core::transport::ListenerId> = None;
-    let mut relay_connected = false;
-    let mut reconnect_attempt: u32 = 0;
+    let mut relay_states: Vec<RelayState> = relay_states; // 从上面解析的列表
 
-    // ---- 初始连接 Relay ----
-    swarm.dial(relay_addr.clone())?;
-    println!("[DeviceCam] Dialing relay: {relay_addr}");
+    // ---- 初始连接所有 Relay ----
+    for state in &relay_states {
+        println!("[DeviceCam] Dialing relay: {}", state.addr);
+        if let Err(e) = swarm.dial(state.addr.clone()) {
+            tracing::error!("[DeviceCam] Failed to dial relay {}: {e}", state.peer_id);
+        }
+    }
 
     // ---- 事件循环 (含自动重连) ----
     // Swarm 只创建一次，relay 断开时在同一个 Swarm 内重新 dial。
@@ -250,13 +296,20 @@ async fn main() -> Result<()> {
             event = swarm.select_next_some() => {
                 match event {
                     SwarmEvent::Behaviour(behaviour::BehaviourEvent::RelayClient(
-                        relay::client::Event::ReservationReqAccepted { .. },
+                        relay::client::Event::ReservationReqAccepted { relay_peer_id, .. },
                     )) => {
-                        if !relay_connected {
-                            println!("[DeviceCam] Relay reservation confirmed!");
-                            println!("[DeviceCam] External address: /p2p-circuit/p2p/{peer_id}");
-                            relay_connected = true;
-                            reconnect_attempt = 0;
+                        // 找到对应的 RelayState 并标记预约成功
+                        if let Some(state) = relay_states.iter_mut().find(|s| s.peer_id == relay_peer_id) {
+                            if !state.connected {
+                                println!("[DeviceCam] Relay {} reservation confirmed!", relay_peer_id);
+                                state.connected = true;
+                                state.reconnect_attempt = 0;
+                            }
+                        }
+                        // 检查至少一个 Relay 预约成功
+                        let reserved_count = relay_states.iter().filter(|s| s.connected).count();
+                        if reserved_count > 0 {
+                            println!("[DeviceCam] {reserved_count}/{} relay(s) have active reservations", relay_states.len());
                         }
                     }
 
@@ -285,12 +338,12 @@ async fn main() -> Result<()> {
                                 tracing::warn!("[DeviceCam]   1. Configure port forwarding on router (map external UDP port → device internal UDP port)");
                                 tracing::warn!("[DeviceCam]   2. Use --external-ip and --udp-port to advertise correct external address");
                             }
-                            // 快速降级确认：DCUtR 失败后确认 Relay Circuit 仍在工作
-                            let has_relay = swarm.is_connected(&relay_peer_id);
-                            if has_relay {
+                            // 快速降级确认：DCUtR 失败后确认至少一个 Relay Circuit 仍在工作
+                            let has_any_relay = relay_states.iter().any(|s| s.connected);
+                            if has_any_relay {
                                 tracing::info!("[DeviceCam] Fallback: Relay circuit is still active, video/audio will continue via relay");
                             } else {
-                                tracing::warn!("[DeviceCam] Fallback: Relay connection may be lost, reconnection may be needed");
+                                tracing::warn!("[DeviceCam] Fallback: No relay connection available, reconnection may be needed");
                             }
                         }
                     },
@@ -375,26 +428,25 @@ async fn main() -> Result<()> {
                         reason: Err(e),
                         ..
                     } => {
-                        // Relay 预约丢失
-                        if Some(listener_id) == reservation_id {
-                            println!("[DeviceCam] *** Relay reservation lost! ***");
+                        // 查找哪个 Relay 的预约丢失
+                        if let Some(state) = relay_states.iter_mut().find(|s| s.reservation_id == Some(listener_id)) {
+                            println!("[DeviceCam] *** Relay {} reservation lost! ***", state.peer_id);
                             tracing::warn!("[DeviceCam] Relay reservation lost: {e}");
-                            reservation_id = None;
-                            relay_connected = false;
+                            state.reservation_id = None;
+                            state.connected = false;
                             // 如果 relay 连接还在，尝试重新预约
-                            if swarm.is_connected(&relay_peer_id) {
-                                tracing::info!("[DeviceCam] Relay still connected, re-requesting reservation...");
-                                match swarm.listen_on(relay_addr.clone().with(Protocol::P2pCircuit)) {
+                            if swarm.is_connected(&state.peer_id) {
+                                tracing::info!("[DeviceCam] Relay {} still connected, re-requesting reservation...", state.peer_id);
+                                match swarm.listen_on(state.addr.clone().with(Protocol::P2pCircuit)) {
                                     Ok(new_id) => {
-                                        reservation_id = Some(new_id);
-                                        println!("[DeviceCam] Re-requesting relay reservation...");
+                                        state.reservation_id = Some(new_id);
+                                        println!("[DeviceCam] Re-requesting relay {} reservation...", state.peer_id);
                                     }
                                     Err(e) => {
                                         tracing::error!("[DeviceCam] Failed to re-request reservation: {e}");
                                     }
                                 }
                             }
-                            // 如果 relay 连接也断了，等 ConnectionClosed 触发重连
                         }
                     }
 
@@ -446,25 +498,27 @@ async fn main() -> Result<()> {
 
                         peer_conn_type.insert(peer_id, conn_type.clone());
 
-                        // Relay 连接建立
-                        if peer_id == relay_peer_id {
-                            if reconnect_attempt > 0 {
-                                println!("[DeviceCam] *** Relay reconnected! (was attempt #{reconnect_attempt}) ***");
-                            } else {
-                                println!("[DeviceCam] Connected to relay {peer_id}");
-                            }
-                            relay_connected = true;
-                            reconnect_attempt = 0;
+                        // 检查是否为 Relay 连接建立
+                        let is_relay = relay_states.iter().any(|s| s.peer_id == peer_id);
+                        if is_relay {
+                            if let Some(state) = relay_states.iter_mut().find(|s| s.peer_id == peer_id) {
+                                if state.reconnect_attempt > 0 {
+                                    println!("[DeviceCam] *** Relay {} reconnected! (was attempt #{}) ***", peer_id, state.reconnect_attempt);
+                                } else {
+                                    println!("[DeviceCam] Connected to relay {peer_id}");
+                                }
+                                state.reconnect_attempt = 0;
 
-                            // 首次连接或重连后，请求 relay reservation
-                            if reservation_id.is_none() {
-                                match swarm.listen_on(relay_addr.clone().with(Protocol::P2pCircuit)) {
-                                    Ok(new_id) => {
-                                        reservation_id = Some(new_id);
-                                        println!("[DeviceCam] Requesting relay reservation...");
-                                    }
-                                    Err(e) => {
-                                        tracing::error!("[DeviceCam] Failed to request reservation: {e}");
+                                // 首次连接或重连后，请求 relay reservation
+                                if state.reservation_id.is_none() {
+                                    match swarm.listen_on(state.addr.clone().with(Protocol::P2pCircuit)) {
+                                        Ok(new_id) => {
+                                            state.reservation_id = Some(new_id);
+                                            println!("[DeviceCam] Requesting relay {} reservation...", peer_id);
+                                        }
+                                        Err(e) => {
+                                            tracing::error!("[DeviceCam] Failed to request reservation: {e}");
+                                        }
                                     }
                                 }
                             }
@@ -515,39 +569,41 @@ async fn main() -> Result<()> {
                         }
                         tracing::warn!("  - Remaining established connections: {num_established}");
 
-                        // Viewer 连接断开
-                        if peer_id != relay_peer_id && num_established == 0 {
-                            println!("[DeviceCam] *** Viewer disconnected: {peer_id} (was {conn_type}) ***");
+                        // 检查是否为 Relay 连接断开
+                        let is_relay = relay_states.iter().any(|s| s.peer_id == peer_id);
+                        if is_relay && num_established == 0 {
+                            if let Some(state) = relay_states.iter_mut().find(|s| s.peer_id == peer_id) {
+                                state.connected = false;
+                                state.reservation_id = None;
+                                state.reconnect_attempt += 1;
+
+                                let delay = state.reconnect_delay();
+                                println!("[DeviceCam] *** Relay {} connection lost! Reconnecting in {}s (attempt {}) ***",
+                                    peer_id, delay.as_secs(), state.reconnect_attempt);
+                                tracing::warn!("[DeviceCam] Relay disconnected (duration: {}), auto-reconnect in {}s", duration, delay.as_secs());
+                            }
                         }
 
-                        // Relay 连接断开 → 自动重连 (指数退避)
-                        if peer_id == relay_peer_id && num_established == 0 {
-                            relay_connected = false;
-                            reservation_id = None;
-                            reconnect_attempt += 1;
-
-                            // 指数退避: 3s → 6s → 12s → 24s → 48s → 60s (max)
-                            let delay_secs = (RECONNECT_DELAY_BASE.as_secs() as u64)
-                                .saturating_mul(1u64 << (reconnect_attempt - 1).min(4));
-                            let delay = Duration::from_secs(delay_secs).min(RECONNECT_DELAY_MAX);
-
-                            println!("[DeviceCam] *** Relay connection lost! Reconnecting in {}s (attempt {reconnect_attempt}) ***", delay.as_secs());
-                            tracing::warn!("[DeviceCam] Relay disconnected (duration: {}), auto-reconnect in {}s", duration, delay.as_secs());
-                            // 重连在事件循环末尾的 relay 重连检查中执行
+                        // Viewer 连接断开
+                        if !is_relay && num_established == 0 {
+                            println!("[DeviceCam] *** Viewer disconnected: {peer_id} (was {conn_type}) ***");
                         }
                     }
 
-                    SwarmEvent::OutgoingConnectionError { peer_id: Some(peer_id), error, .. }
-                        if peer_id == relay_peer_id =>
-                    {
-                        // Relay 连接失败 (初始连接或重连)
-                        reconnect_attempt += 1;
-                        let delay_secs = (RECONNECT_DELAY_BASE.as_secs() as u64)
-                            .saturating_mul(1u64 << (reconnect_attempt - 1).min(4));
-                        let delay = Duration::from_secs(delay_secs).min(RECONNECT_DELAY_MAX);
-
-                        println!("[DeviceCam] *** Failed to connect to relay! Retrying in {}s (attempt {reconnect_attempt}) ***", delay.as_secs());
-                        tracing::warn!("[DeviceCam] Relay connection error: {error}");
+                    SwarmEvent::OutgoingConnectionError { peer_id: Some(peer_id), error, .. } => {
+                        // 检查是否为 Relay 连接失败
+                        let is_relay = relay_states.iter().any(|s| s.peer_id == peer_id);
+                        if is_relay {
+                            if let Some(state) = relay_states.iter_mut().find(|s| s.peer_id == peer_id) {
+                                state.reconnect_attempt += 1;
+                                let delay = state.reconnect_delay();
+                                println!("[DeviceCam] *** Failed to connect to relay {}! Retrying in {}s (attempt {}) ***",
+                                    peer_id, delay.as_secs(), state.reconnect_attempt);
+                                tracing::warn!("[DeviceCam] Relay connection error: {error}");
+                            }
+                        } else {
+                            tracing::warn!("[DeviceCam] Outgoing connection error: {error}");
+                        }
                     }
 
                     SwarmEvent::OutgoingConnectionError { error, .. } => {
@@ -592,24 +648,27 @@ async fn main() -> Result<()> {
         }
 
         // ---- Relay 重连逻辑 (在事件循环末尾检查) ----
-        // 如果 relay 未连接且没有正在进行的 dial，尝试重新连接
-        if !relay_connected && !swarm.is_connected(&relay_peer_id) && reconnect_attempt > 0 {
-            // 指数退避延迟
-            let delay_secs = (RECONNECT_DELAY_BASE.as_secs() as u64)
-                .saturating_mul(1u64 << (reconnect_attempt - 1).min(4));
-            let delay = Duration::from_secs(delay_secs).min(RECONNECT_DELAY_MAX);
+        // 每个 Relay 独立重连，互不影响
+        // 只重连第一个需要重连的 Relay，避免阻塞事件循环太久
+        for state in &mut relay_states {
+            if !state.connected && !swarm.is_connected(&state.peer_id) && state.reconnect_attempt > 0 {
+                let delay = state.reconnect_delay();
+                tracing::info!("[DeviceCam] Waiting {}s before reconnecting to relay {}...", delay.as_secs(), state.peer_id);
+                tokio::time::sleep(delay).await;
 
-            tracing::info!("[DeviceCam] Waiting {}s before reconnecting to relay...", delay.as_secs());
-            tokio::time::sleep(delay).await;
-
-            match swarm.dial(relay_addr.clone()) {
-                Ok(()) => {
-                    println!("[DeviceCam] Dialing relay (attempt {reconnect_attempt})...");
+                match swarm.dial(state.addr.clone()) {
+                    Ok(()) => {
+                        println!("[DeviceCam] Dialing relay {} (attempt {})...", state.peer_id, state.reconnect_attempt);
+                        // 标记为已发起拨号，避免重复拨号
+                        // 如果连接失败，OutgoingConnectionError 会重新递增 reconnect_attempt
+                        state.reconnect_attempt = 0;
+                    }
+                    Err(e) => {
+                        tracing::error!("[DeviceCam] Failed to dial relay {}: {e}", state.peer_id);
+                        state.reconnect_attempt += 1;
+                    }
                 }
-                Err(e) => {
-                    tracing::error!("[DeviceCam] Failed to dial relay: {e}");
-                    reconnect_attempt += 1;
-                }
+                break; // 每次循环只重连一个 Relay，避免阻塞事件循环太久
             }
         }
     }
@@ -748,9 +807,13 @@ struct Opt {
     #[arg(long, default_value = "device-cam.toml")]
     config: PathBuf,
 
-    /// Relay Server 地址 (覆盖配置文件)
+    /// Relay Server 地址 (可多次使用, 覆盖配置文件)
+    #[arg(long = "relay")]
+    relays: Vec<String>,
+
+    /// 是否启用 mDNS 局域网发现 (覆盖配置文件)
     #[arg(long)]
-    relay: Option<String>,
+    enable_mdns: Option<bool>,
 
     /// 运行模式 (覆盖配置文件)
     #[arg(long)]
@@ -791,17 +854,25 @@ struct Opt {
 }
 
 fn validate_device_cam_config(cfg: &config::Config) {
-    let relay_str = &cfg.relay;
-    if relay_str.contains("/tcp/") && !relay_str.contains("/quic-v1") {
-        tracing::warn!("[DeviceCam] WARNING: Using TCP relay connection - DCUtR will only produce TCP candidates, hole punching unlikely to succeed. Use /udp/<port>/quic-v1 instead");
-    } else if relay_str.contains("/quic-v1") {
-        tracing::info!("[DeviceCam] Relay connection protocol: QUIC - good for DCUtR hole punching");
+    for (i, relay_str) in cfg.relays.iter().enumerate() {
+        let label = if cfg.relays.len() == 1 { "Relay".to_string() } else { format!("Relay #{}", i + 1) };
+        if relay_str.contains("/tcp/") && !relay_str.contains("/quic-v1") {
+            tracing::warn!("[DeviceCam] WARNING: {label} using TCP - DCUtR will only produce TCP candidates, hole punching unlikely to succeed. Use /udp/<port>/quic-v1 instead");
+        } else if relay_str.contains("/quic-v1") {
+            tracing::info!("[DeviceCam] {label} protocol: QUIC - good for DCUtR hole punching");
+        }
     }
 
     if let Some(port) = cfg.udp_port {
         if port == 0 {
             tracing::warn!("[DeviceCam] WARNING: Using random UDP port - cannot configure port forwarding for DCUtR");
         }
+    }
+
+    if cfg.enable_mdns {
+        tracing::info!("[DeviceCam] mDNS enabled - LAN discovery active");
+    } else {
+        tracing::info!("[DeviceCam] mDNS disabled");
     }
 }
 

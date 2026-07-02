@@ -716,26 +716,38 @@ impl NetworkBehaviour for Behaviour {
                     .get(&inbound_circuit_req.dst())
                     .and_then(|cs| cs.iter().next())
                 {
-                    assert_eq!(*status, Reservation::Active);
-
-                    // Accept circuit request if reservation present.
-                    let circuit_id = self.circuits.insert(Circuit {
-                        status: CircuitStatus::Accepting,
-                        src_peer_id: event_source,
-                        src_connection_id: connection,
-                        dst_peer_id: inbound_circuit_req.dst(),
-                        dst_connection_id: *dst_conn,
-                    });
-
-                    ToSwarm::NotifyHandler {
-                        handler: NotifyHandler::One(*dst_conn),
-                        peer_id: event_source,
-                        event: Either::Left(handler::In::NegotiateOutboundConnect {
-                            circuit_id,
-                            inbound_circuit_req,
+                    if *status == Reservation::Active {
+                        // Accept circuit request if reservation present.
+                        let circuit_id = self.circuits.insert(Circuit {
+                            status: CircuitStatus::Accepting,
                             src_peer_id: event_source,
                             src_connection_id: connection,
-                        }),
+                            dst_peer_id: inbound_circuit_req.dst(),
+                            dst_connection_id: *dst_conn,
+                        });
+
+                        ToSwarm::NotifyHandler {
+                            handler: NotifyHandler::One(*dst_conn),
+                            peer_id: event_source,
+                            event: Either::Left(handler::In::NegotiateOutboundConnect {
+                                circuit_id,
+                                inbound_circuit_req,
+                                src_peer_id: event_source,
+                                src_connection_id: connection,
+                            }),
+                        }
+                    } else {
+                        // Destination peer is connected but has no active reservation.
+                        // Deny the circuit request.
+                        ToSwarm::NotifyHandler {
+                            handler: NotifyHandler::One(connection),
+                            peer_id: event_source,
+                            event: Either::Left(handler::In::DenyCircuitReq {
+                                circuit_id: None,
+                                inbound_circuit_req,
+                                status: proto::Status::NoReservation,
+                            }),
+                        }
                     }
                 } else {
                     // Deny circuit request if no reservation present.

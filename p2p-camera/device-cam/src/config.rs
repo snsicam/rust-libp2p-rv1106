@@ -3,6 +3,11 @@
 //! 配置文件格式: TOML
 //! 优先级: 命令行参数 > 配置文件 > 默认值
 //! 如果配置文件不存在，自动生成带默认值的配置文件
+//!
+//! 多 Relay 支持:
+//!   新格式: relays = ["/ip4/.../p2p/PeerId1", "/ip4/.../p2p/PeerId2"]
+//!   旧格式: relay = "/ip4/.../p2p/PeerId" (向后兼容, 解析时合并到 relays)
+//!   同时存在时 relays 优先
 
 use std::path::PathBuf;
 
@@ -10,7 +15,16 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    /// 多 Relay 地址列表 (新格式优先)
+    #[serde(default)]
+    pub relays: Vec<String>,
+    /// 单 Relay 地址 (旧格式, 向后兼容, 解析时合并到 relays)
+    #[serde(default)]
     pub relay: String,
+    /// 是否启用 mDNS 局域网发现 (默认 true)
+    #[serde(default = "default_enable_mdns")]
+    pub enable_mdns: bool,
+
     #[serde(default = "default_mode")]
     pub mode: String,
     #[serde(default = "default_key_file")]
@@ -41,11 +55,14 @@ fn default_width() -> u32 { 800 }
 fn default_height() -> u32 { 600 }
 fn default_fps() -> u32 { 25 }
 fn default_bitrate() -> u32 { 1024 }
+fn default_enable_mdns() -> bool { true }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
+            relays: Vec::new(),
             relay: String::new(),
+            enable_mdns: default_enable_mdns(),
             mode: default_mode(),
             key_file: default_key_file(),
             enable_audio: false,
@@ -65,8 +82,9 @@ impl Config {
         if path.exists() {
             let content = std::fs::read_to_string(path)
                 .map_err(|e| anyhow::anyhow!("Failed to read config file {}: {e}", path.display()))?;
-            let config: Config = toml::from_str(&content)
+            let mut config: Config = toml::from_str(&content)
                 .map_err(|e| anyhow::anyhow!("Failed to parse config file {}: {e}", path.display()))?;
+            config.resolve_relays();
             println!("[DeviceCam] Loaded config from {}", path.display());
             Ok(config)
         } else {
@@ -74,6 +92,17 @@ impl Config {
             config.save(path)?;
             println!("[DeviceCam] Generated default config file: {}", path.display());
             Ok(config)
+        }
+    }
+
+    /// 解析 Relay 地址列表: 处理旧格式 relay 与新格式 relays 的兼容
+    ///
+    /// 规则:
+    /// - 如果 relays 非空, 忽略 relay (新格式优先)
+    /// - 如果 relays 为空且 relay 非空, 将 relay 加入 relays (旧格式兼容)
+    fn resolve_relays(&mut self) {
+        if self.relays.is_empty() && !self.relay.is_empty() {
+            self.relays.push(self.relay.clone());
         }
     }
 
@@ -90,7 +119,12 @@ impl Config {
 
     /// 用命令行参数覆盖配置
     pub fn apply_cli_overrides(&mut self, cli: &CliOverrides) {
-        if let Some(ref relay) = cli.relay { self.relay = relay.clone(); }
+        if !cli.relays.is_empty() {
+            self.relays = cli.relays.clone();
+        }
+        if let Some(enable_mdns) = cli.enable_mdns {
+            self.enable_mdns = enable_mdns;
+        }
         if let Some(ref mode) = cli.mode { self.mode = mode.clone(); }
         if let Some(ref key_file) = cli.key_file { self.key_file = key_file.clone(); }
         if cli.enable_audio { self.enable_audio = true; }
@@ -106,7 +140,8 @@ impl Config {
 /// 命令行覆盖参数 (所有字段都是 Option，仅覆盖配置文件中的值)
 #[derive(Debug, Default)]
 pub struct CliOverrides {
-    pub relay: Option<String>,
+    pub relays: Vec<String>,
+    pub enable_mdns: Option<bool>,
     pub mode: Option<String>,
     pub key_file: Option<PathBuf>,
     pub enable_audio: bool,

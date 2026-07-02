@@ -1,11 +1,12 @@
 //! P2P Viewer 核心逻辑 — 移动端接收侧
 //!
 //! 负责:
-//! 1. 连接 Relay Server
+//! 1. 连接 Relay Server (支持多 Relay 并发拨号)
 //! 2. 通过 Circuit 拨号 DeviceCam
-//! 3. DCUtR 直连协商
-//! 4. 打开视频/音频 stream
-//! 5. 接收 MediaPacket → 送入 Jitter Buffer
+//! 3. mDNS 局域网发现 (优先于 Relay)
+//! 4. DCUtR 直连协商
+//! 5. 打开视频/音频 stream
+//! 6. 接收 MediaPacket → 送入 Jitter Buffer
 
 use std::net::Ipv4Addr;
 use std::time::Duration;
@@ -14,7 +15,7 @@ use anyhow::{Context, Result};
 use futures::{AsyncReadExt, StreamExt};
 use libp2p::{
     core::multiaddr::{Multiaddr, Protocol},
-    dcutr, identify, noise, ping, relay,
+    dcutr, identify, mdns, noise, ping, relay,
     swarm::{NetworkBehaviour, SwarmEvent},
     tcp, Swarm, PeerId,
 };
@@ -29,6 +30,7 @@ use crate::jitter_buffer::AvJitterBuffer;
 use crate::net_diag::{ConnectionQuality, ConnectionType, NatDiagnostic, NatDiagnosis};
 
 const STREAM_READ_BUF: usize = 65536; // 64KB
+const MDNS_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// P2P Viewer — 对外暴露的核心结构
 pub struct P2pViewer {
@@ -61,7 +63,7 @@ impl P2pViewer {
             .with_quic()
             .with_relay_client(noise::Config::new, libp2p::yamux::Config::default)?
             .with_behaviour(|key, relay_client| {
-                Ok(ViewerBehaviour::new(key.public(), relay_client))
+                ViewerBehaviour::new(key.public(), relay_client)
             })?
             // idle timeout 120s: DCUtR handler 在重试期间需要 keep-alive，0 会导致连接被意外关闭
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(120)))
@@ -92,35 +94,142 @@ impl P2pViewer {
     }
 
     /// 连接 Relay 并通过 Circuit 拨号 DeviceCam
+    ///
+    /// 支持多 Relay 并发拨号和 mDNS 局域网发现:
+    /// - 同时拨号所有 Relay，第一个成功即用
+    /// - 如果 enable_mdns，并行监听 mDNS 发现事件
+    /// - mDNS 发现目标 DeviceCam 时，优先使用 LAN 直连
+    /// - mDNS 5 秒超时后回退到 Relay circuit
     pub async fn connect(
         &mut self,
-        relay_addr: &str,
+        relay_addrs: &[String],
         device_cam_peer_id: &str,
+        enable_mdns: bool,
     ) -> Result<()> {
-        // 1. 连接 Relay
-        let relay: Multiaddr = relay_addr.parse()?;
-        self.swarm.dial(relay.clone())?;
-
-        // 等待连接建立
-        self.wait_for_connection().await?;
-
-        // 2. 通过 Circuit 拨号 DeviceCam
         let device_cam: PeerId = device_cam_peer_id.parse()?;
         self.device_cam_peer_id = Some(device_cam);
-        let circuit_addr = relay
-            .with(Protocol::P2pCircuit)
-            .with(Protocol::P2p(device_cam));
 
-        self.swarm.dial(circuit_addr)?;
-        self.wait_for_connection().await?;
+        // 解析所有 Relay 地址
+        let relay_multiaddrs: Vec<Multiaddr> = relay_addrs.iter()
+            .map(|s| s.parse::<Multiaddr>())
+            .collect::<std::result::Result<Vec<_>, _>>()?;
 
-        // 3. 打开视频 stream
+        // 同时拨号所有 Relay
+        for addr in &relay_multiaddrs {
+            if let Err(e) = self.swarm.dial(addr.clone()) {
+                tracing::warn!("[Viewer] Failed to dial relay {addr}: {e}");
+            }
+        }
+
+        // 并行等待: mDNS 发现 或 Relay 连接
+        let mdns_deadline = tokio::time::Instant::now() + MDNS_DISCOVERY_TIMEOUT;
+        let mut connected_relay: Option<(PeerId, Multiaddr)> = None;
+        let mut mdns_discovered_addr: Option<Multiaddr> = None;
+        let mut relay_error_count: usize = 0;
+        let total_relays = relay_multiaddrs.len();
+
+        loop {
+            let now = tokio::time::Instant::now();
+            let mdns_expired = !enable_mdns || now >= mdns_deadline;
+
+            // 如果 mDNS 发现了目标，优先使用
+            if mdns_discovered_addr.is_some() {
+                break;
+            }
+
+            // 如果 mDNS 超时且已有 relay 连接，使用 relay
+            if mdns_expired && connected_relay.is_some() {
+                break;
+            }
+
+            // 如果所有 relay 都失败了且 mDNS 也超时/禁用，退出
+            if relay_error_count >= total_relays && mdns_expired {
+                break;
+            }
+
+            let remaining = if connected_relay.is_none() && mdns_discovered_addr.is_none() {
+                Duration::from_secs(30)
+            } else {
+                Duration::from_millis(100) // 短暂等待后退出
+            };
+
+            match tokio::time::timeout(remaining, self.swarm.select_next_some()).await {
+                Ok(event) => {
+                    match event {
+                        SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+                            let addr = endpoint.get_remote_address().clone();
+                            // 检查是否为 Relay 连接
+                            let is_relay = relay_multiaddrs.iter().any(|r| {
+                                r.iter().any(|p| matches!(p, Protocol::P2p(pid) if pid == peer_id))
+                            });
+                            if is_relay && connected_relay.is_none() {
+                                tracing::info!("[Viewer] Connected to relay {peer_id}");
+                                connected_relay = Some((peer_id, addr));
+                            }
+                        }
+                        SwarmEvent::Behaviour(ViewerBehaviourEvent::Mdns(
+                            mdns::Event::Discovered(peers),
+                        )) => {
+                            for (peer_id, addr) in peers {
+                                tracing::info!("[Viewer] mDNS discovered peer {peer_id} at {addr}");
+                                if peer_id == device_cam && mdns_discovered_addr.is_none() {
+                                    tracing::info!("[Viewer] mDNS found target DeviceCam {peer_id} at {addr}");
+                                    mdns_discovered_addr = Some(addr);
+                                }
+                            }
+                        }
+                        SwarmEvent::OutgoingConnectionError { peer_id: Some(peer_id), error, .. } => {
+                            let is_relay = relay_multiaddrs.iter().any(|r| {
+                                r.iter().any(|p| matches!(p, Protocol::P2p(pid) if pid == peer_id))
+                            });
+                            if is_relay {
+                                tracing::warn!("[Viewer] Failed to connect to relay {peer_id}: {error}");
+                                relay_error_count += 1;
+                            } else {
+                                tracing::warn!("[Viewer] Connection error: {error}");
+                            }
+                        }
+                        SwarmEvent::OutgoingConnectionError { error, .. } => {
+                            tracing::warn!("[Viewer] Connection error: {error}");
+                        }
+                        _ => {
+                            tracing::debug!("Viewer event: {:?}", event);
+                        }
+                    }
+                }
+                Err(_) => {
+                    // timeout, check if we should break
+                    if mdns_discovered_addr.is_some() || connected_relay.is_some() {
+                        break;
+                    }
+                }
+            }
+        }
+
+        // 优先使用 mDNS 发现的 LAN 直连
+        if let Some(lan_addr) = mdns_discovered_addr {
+            tracing::info!("[Viewer] Using mDNS-discovered LAN address: {lan_addr}");
+            self.swarm.dial(lan_addr)?;
+            self.wait_for_connection().await?;
+        } else if let Some((_relay_peer_id, relay_addr)) = connected_relay {
+            // 通过 Relay circuit 拨号 DeviceCam
+            let circuit_addr = relay_addr
+                .with(Protocol::P2pCircuit)
+                .with(Protocol::P2p(device_cam));
+            tracing::info!("[Viewer] Dialing DeviceCam via circuit: {circuit_addr}");
+            self.swarm.dial(circuit_addr)?;
+            self.wait_for_connection().await?;
+        } else {
+            anyhow::bail!("Failed to connect: no relay connection and no mDNS discovery");
+        }
+
+        // 打开视频 stream
         let video_stream = self.stream_control
             .open_stream(device_cam, stream_protocols::VIDEO_PROTOCOL)
             .await
             .context("Failed to open video stream")?;
 
-        // 4. 打开音频 stream
+        // 打开音频 stream
         let audio_stream = self.stream_control
             .open_stream(device_cam, stream_protocols::AUDIO_PROTOCOL)
             .await
@@ -128,7 +237,7 @@ impl P2pViewer {
 
         println!("[Viewer] Video + Audio streams opened");
 
-        // 5. 启动接收任务
+        // 启动接收任务
         let video_sender = self.video_sender.clone();
         let audio_sender = self.audio_sender.clone();
 
@@ -156,6 +265,13 @@ impl P2pViewer {
     pub async fn poll_swarm(&mut self) {
         if let Some(event) = self.swarm.next().await {
             match event {
+                SwarmEvent::Behaviour(ViewerBehaviourEvent::Mdns(
+                    mdns::Event::Discovered(peers),
+                )) => {
+                    for (peer_id, addr) in peers {
+                        tracing::info!("[Viewer] mDNS discovered peer {peer_id} at {addr}");
+                    }
+                }
                 SwarmEvent::Behaviour(ViewerBehaviourEvent::Dcutr(
                     dcutr::Event { result: Ok(_), remote_peer_id, .. },
                 )) => {
@@ -363,6 +479,7 @@ pub struct ViewerBehaviour {
     pub identify: identify::Behaviour,
     pub ping: ping::Behaviour,
     pub stream: libp2p_stream::Behaviour,
+    pub mdns: mdns::tokio::Behaviour,
 }
 
 impl ViewerBehaviour {
@@ -386,6 +503,34 @@ impl ViewerBehaviour {
                     .with_interval(Duration::from_secs(5)),
             ),
             stream: libp2p_stream::Behaviour::new(),
+            mdns: mdns::tokio::Behaviour::new(
+                mdns::Config::default(),
+                peer_id,
+            )
+            .expect("Failed to initialize mDNS"),
+        }
+    }
+
+    pub fn new_with_identify_config(
+        local_public_key: libp2p::identity::PublicKey,
+        relay_client: relay::client::Behaviour,
+        identify_config: identify::Config,
+    ) -> Self {
+        let peer_id = local_public_key.to_peer_id();
+        Self {
+            relay_client,
+            dcutr: dcutr::Behaviour::new(peer_id),
+            identify: identify::Behaviour::new(identify_config),
+            ping: ping::Behaviour::new(
+                ping::Config::new()
+                    .with_interval(Duration::from_secs(5)),
+            ),
+            stream: libp2p_stream::Behaviour::new(),
+            mdns: mdns::tokio::Behaviour::new(
+                mdns::Config::default(),
+                peer_id,
+            )
+            .expect("Failed to initialize mDNS"),
         }
     }
 }

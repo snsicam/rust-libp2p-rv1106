@@ -1,9 +1,9 @@
 //! DeviceCam NetworkBehaviour
 //!
-//! 组合 relay client + DCUtR + identify + stream 四个行为。
+//! 组合 relay client + DCUtR + identify + stream + mDNS 五个行为。
 
 use libp2p::{
-    dcutr, identify, ping, relay,
+    dcutr, identify, mdns, ping, relay,
     swarm::NetworkBehaviour,
 };
 use tracing::info;
@@ -15,6 +15,7 @@ pub struct Behaviour {
     pub identify: identify::Behaviour,
     pub stream: libp2p_stream::Behaviour,
     pub ping: ping::Behaviour,
+    pub mdns: mdns::tokio::Behaviour,
 }
 
 impl Behaviour {
@@ -41,6 +42,7 @@ impl Behaviour {
         info!("[DeviceCam] Creating new Behaviour for peer_id: {}", peer_id);
         info!("[DeviceCam] DCUtR enabled for direct connection upgrade");
         info!("[DeviceCam] Relay client enabled for circuit fallback");
+        info!("[DeviceCam] mDNS enabled for LAN discovery");
         Self {
             relay_client,  // 使用 builder 传入的，不能自己构造
             dcutr: dcutr::Behaviour::new(peer_id),
@@ -50,6 +52,10 @@ impl Behaviour {
                 ping::Config::default()
                     .with_interval(std::time::Duration::from_secs(5)),
             ),
+            mdns: mdns::tokio::Behaviour::new(
+                mdns::Config::default(),
+                peer_id,
+            ).expect("Failed to initialize mDNS"),
         }
     }
 

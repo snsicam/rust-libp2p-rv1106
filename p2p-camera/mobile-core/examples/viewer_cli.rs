@@ -13,12 +13,18 @@
 //! 自动重连: 连接断开时自动重新连接 Relay + DeviceCam + 打开 stream，
 //!           播放器和输出文件持续运行不中断。
 //!
+//! 多 Relay + mDNS 支持:
+//!   --relay 可多次使用: --relay /ip4/.../p2p/A --relay /ip4/.../p2p/B
+//!   --enable-mdns (默认 true): 启用 mDNS 局域网发现，优先于 Relay
+//!
 //! 验证流程:
-//!   1. 连接 Relay Server
-//!   2. 通过 Circuit 拨号 DeviceCam
-//!   3. 打开视频 stream 接收帧
-//!   4. 保存到文件 (可用 ffplay 播放) 或 SDL 实时播放 (--play, 需 --features player)
-//!   5. 打印接收统计
+//!   1. 同时拨号所有 Relay Server
+//!   2. 如果启用 mDNS，并行监听局域网发现事件 (5 秒超时)
+//!   3. mDNS 发现目标 DeviceCam 时，优先使用 LAN 直连
+//!   4. 否则通过第一个成功连接的 Relay circuit 拨号 DeviceCam
+//!   5. 打开视频 stream 接收帧
+//!   6. 保存到文件 (可用 ffplay 播放) 或 SDL 实时播放 (--play, 需 --features player)
+//!   7. 打印接收统计
 
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
@@ -30,12 +36,12 @@ use clap::Parser;
 use futures::{AsyncReadExt, StreamExt};
 use libp2p::{
     core::multiaddr::{Multiaddr, Protocol},
-    dcutr, identify, noise, ping, relay,
+    dcutr, identify, mdns, noise, ping, relay,
     swarm::{NetworkBehaviour, SwarmEvent},
     tcp, PeerId,
 };
 use libp2p_stream;
-use mobile_core::net_diag::{DcutrPrediction, NatDiagnostic, NatType};
+use mobile_core::net_diag::{NatDiagnostic, NatType};
 use proto::{media_packet::MediaPacket, stream_protocols};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -43,6 +49,7 @@ use tracing_subscriber::EnvFilter;
 
 const STREAM_READ_BUF: usize = 65536;
 const RECONNECT_DELAY: Duration = Duration::from_secs(3);
+const MDNS_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
 
 // SDL2 要求事件循环在主线程, 使用 current_thread runtime
 #[cfg_attr(feature = "player", tokio::main(flavor = "current_thread"))]
@@ -63,17 +70,21 @@ async fn main() -> Result<()> {
     });
 
     // 命令行参数覆盖配置文件
-    if let Some(ref relay) = opt.relay { cfg.relay = relay.clone(); }
+    if !opt.relays.is_empty() { cfg.relays = opt.relays.clone(); }
     if let Some(ref camera) = opt.camera { cfg.camera = camera.clone(); }
     if let Some(ref output) = opt.output { cfg.output = Some(output.clone()); }
     if opt.no_audio { cfg.no_audio = true; }
     #[cfg(feature = "player")]
     if opt.play { cfg.play = true; }
     if let Some(udp_port) = opt.udp_port { cfg.udp_port = Some(udp_port); }
+    if let Some(enable_mdns) = opt.enable_mdns { cfg.enable_mdns = enable_mdns; }
+
+    // 解析 relays (兼容旧格式 relay 字段)
+    cfg.resolve_relays();
 
     // ---- 参数校验 ----
-    if cfg.relay.is_empty() {
-        eprintln!("[Viewer] Error: relay address is empty. Edit {} or use --relay", opt.config.display());
+    if cfg.relays.is_empty() && !cfg.enable_mdns {
+        eprintln!("[Viewer] Error: no relay addresses and mDNS is disabled. Edit {} or use --relay / --enable-mdns", opt.config.display());
         std::process::exit(1);
     }
     if cfg.camera.is_empty() {
@@ -81,11 +92,13 @@ async fn main() -> Result<()> {
         std::process::exit(1);
     }
     {
-        let relay_str = &cfg.relay;
-        if relay_str.contains("/tcp/") && !relay_str.contains("/quic-v1") {
-            tracing::warn!("[Viewer] WARNING: Using TCP relay connection - DCUtR hole punching will NOT work! Use /udp/<port>/quic-v1 instead");
-        } else if relay_str.contains("/quic-v1") {
-            tracing::info!("[Viewer] Relay connection protocol: QUIC - good for DCUtR hole punching");
+        for (i, relay_str) in cfg.relays.iter().enumerate() {
+            let label = if cfg.relays.len() == 1 { "Relay".to_string() } else { format!("Relay #{}", i + 1) };
+            if relay_str.contains("/tcp/") && !relay_str.contains("/quic-v1") {
+                tracing::warn!("[Viewer] WARNING: {label} using TCP - DCUtR will only produce TCP candidates, hole punching unlikely to succeed. Use /udp/<port>/quic-v1 instead");
+            } else if relay_str.contains("/quic-v1") {
+                tracing::info!("[Viewer] {label} protocol: QUIC - good for DCUtR hole punching");
+            }
         }
 
         if let Some(port) = cfg.udp_port {
@@ -93,6 +106,12 @@ async fn main() -> Result<()> {
                 tracing::warn!("[Viewer] WARNING: Using random UDP port - cannot configure port forwarding for DCUtR");
             }
         }
+    }
+
+    if cfg.enable_mdns {
+        tracing::info!("[Viewer] mDNS enabled - LAN discovery active");
+    } else {
+        tracing::info!("[Viewer] mDNS disabled");
     }
 
     // ---- 初始化播放器/输出 (独立于 P2P 连接，重连期间不中断) ----
@@ -130,10 +149,11 @@ async fn main() -> Result<()> {
     // 用于与后台 session 通信
     let (session_tx, mut session_rx) = mpsc::channel::<SessionEvent>(1);
 
-    let relay_addr_str = cfg.relay.clone();
+    let relay_addrs = cfg.relays.clone();
     let device_cam_str = cfg.camera.clone();
     let no_audio = cfg.no_audio;
     let udp_port = cfg.udp_port;
+    let enable_mdns = cfg.enable_mdns;
 
     let mut frame_count: u64 = 0;
     let mut bytes_received: u64 = 0;
@@ -146,10 +166,11 @@ async fn main() -> Result<()> {
 
     // 启动初始 session (后台任务)
     spawn_session(
-        relay_addr_str.clone(),
+        relay_addrs.clone(),
         device_cam_str.clone(),
         no_audio,
         udp_port,
+        enable_mdns,
         tx.clone(),
         audio_tx.clone(),
         session_tx.clone(),
@@ -179,10 +200,11 @@ async fn main() -> Result<()> {
 
                         // 重新启动 session
                         spawn_session(
-                            relay_addr_str.clone(),
+                            relay_addrs.clone(),
                             device_cam_str.clone(),
                             no_audio,
                             udp_port,
+                            enable_mdns,
                             tx.clone(),
                             audio_tx.clone(),
                             session_tx.clone(),
@@ -280,20 +302,22 @@ enum SessionEvent {
 
 /// 在后台启动一个 viewer session
 fn spawn_session(
-    relay_addr_str: String,
+    relay_addrs: Vec<String>,
     device_cam_str: String,
     no_audio: bool,
     udp_port: Option<u16>,
+    enable_mdns: bool,
     video_tx: mpsc::Sender<MediaPacket>,
     audio_tx: mpsc::Sender<MediaPacket>,
     event_tx: mpsc::Sender<SessionEvent>,
 ) {
     tokio::spawn(async move {
         let result = run_viewer_session(
-            &relay_addr_str,
+            relay_addrs,
             &device_cam_str,
             no_audio,
             udp_port,
+            enable_mdns,
             video_tx,
             audio_tx,
             event_tx.clone(),
@@ -350,19 +374,30 @@ fn drain_audio_channel(
 ///
 /// 帧接收通过 spawn 的 receive_frames task → channel → 主循环消费。
 /// 本函数只负责 swarm 事件循环，连接断开时返回 Err 通知主循环重连。
+///
+/// 支持多 Relay 并发拨号和 mDNS 局域网发现:
+/// - 同时拨号所有 Relay，第一个成功即用
+/// - 如果 enable_mdns，并行监听 mDNS 发现事件 (5 秒超时)
+/// - mDNS 发现目标 DeviceCam 时，优先使用 LAN 直连
+/// - 否则通过第一个成功连接的 Relay circuit 拨号 DeviceCam
 async fn run_viewer_session(
-    relay_addr_str: &str,
+    relay_addrs: Vec<String>,
     device_cam_str: &str,
     no_audio: bool,
     udp_port: Option<u16>,
+    enable_mdns: bool,
     video_tx: mpsc::Sender<MediaPacket>,
     audio_tx: mpsc::Sender<MediaPacket>,
     event_tx: mpsc::Sender<SessionEvent>,
 ) -> Result<()> {
-    let relay_addr: Multiaddr = relay_addr_str.parse()
-        .context("Invalid relay address")?;
     let device_cam: PeerId = device_cam_str.parse()
         .context("Invalid camera PeerId")?;
+
+    // 解析所有 Relay 地址
+    let relay_multiaddrs: Vec<Multiaddr> = relay_addrs.iter()
+        .map(|s| s.parse::<Multiaddr>())
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("Invalid relay address")?;
 
     let keypair = libp2p::identity::Keypair::generate_ed25519();
     let local_peer_id = keypair.public().to_peer_id();
@@ -385,11 +420,11 @@ async fn run_viewer_session(
                 key.public().clone(),
             )
             .with_push_listen_addr_updates(true);
-            Ok(ViewerBehaviour::new_with_identify_config(
+            ViewerBehaviour::new_with_identify_config(
                 key.public().clone(),
                 relay_client,
                 identify_config,
-            ))
+            )
         })?
         // idle timeout 120s: DCUtR handler 在重试期间需要 keep-alive，0 会导致连接被意外关闭
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(120)))
@@ -417,26 +452,146 @@ async fn run_viewer_session(
     // 缓存 wait_for_event 期间被吞掉的事件，供主循环处理
     let mut pending_events: Vec<SwarmEvent<ViewerBehaviourEvent>> = Vec::new();
 
-    // ---- 1. 连接 Relay ----
-    println!("[Viewer] Dialing relay: {relay_addr}");
-    swarm.dial(relay_addr.clone())?;
-    wait_for_event_collecting(&mut swarm, |e| matches!(
-        e,
-        SwarmEvent::ConnectionEstablished { .. }
-    ), "relay connection", &mut local_ips, &mut local_quic_port, &mut pending_events).await?;
+    // ---- 1. 多 Relay 并发拨号 + mDNS 发现 ----
+    // 同时拨号所有 Relay
+    for addr in &relay_multiaddrs {
+        println!("[Viewer] Dialing relay: {addr}");
+        if let Err(e) = swarm.dial(addr.clone()) {
+            tracing::warn!("[Viewer] Failed to dial relay {addr}: {e}");
+        }
+    }
 
-    // ---- 2. 通过 Circuit 拨号 DeviceCam ----
-    let circuit_addr = relay_addr
-        .with(Protocol::P2pCircuit)
-        .with(Protocol::P2p(device_cam));
-    println!("[Viewer] Dialing device-cam via circuit: {circuit_addr}");
-    swarm.dial(circuit_addr)?;
-    wait_for_event_collecting(&mut swarm, |e| matches!(
-        e,
-        SwarmEvent::ConnectionEstablished { peer_id, .. } if *peer_id == device_cam
-    ), "device-cam circuit connection", &mut local_ips, &mut local_quic_port, &mut pending_events).await?;
+    // 并行等待: mDNS 发现 或 Relay 连接
+    let mdns_deadline = tokio::time::Instant::now() + MDNS_DISCOVERY_TIMEOUT;
+    let mut connected_relay: Option<(PeerId, Multiaddr)> = None;
+    let mut mdns_discovered_addr: Option<Multiaddr> = None;
+    let mut relay_error_count: usize = 0;
+    let total_relays = relay_multiaddrs.len();
 
-    println!("[Viewer] Connected to device-cam {device_cam}");
+    // 提取 relay PeerIds 用于判断连接类型
+    let relay_peer_ids: Vec<PeerId> = relay_multiaddrs.iter()
+        .filter_map(|a| a.iter().find_map(|p| match p {
+            Protocol::P2p(pid) => Some(pid),
+            _ => None,
+        }))
+        .collect();
+
+    loop {
+        let now = tokio::time::Instant::now();
+        let mdns_expired = !enable_mdns || now >= mdns_deadline;
+
+        // 如果 mDNS 发现了目标，优先使用
+        if mdns_discovered_addr.is_some() {
+            break;
+        }
+
+        // 如果 mDNS 超时且已有 relay 连接，使用 relay
+        if mdns_expired && connected_relay.is_some() {
+            break;
+        }
+
+        // 如果所有 relay 都失败了且 mDNS 也超时/禁用，退出
+        if relay_error_count >= total_relays && mdns_expired {
+            break;
+        }
+
+        let remaining = Duration::from_secs(30);
+
+        let event_result = tokio::time::timeout(remaining, swarm.select_next_some()).await;
+
+        match event_result {
+            Ok(event) => {
+                // 收集 NewListenAddr 事件中的本地 IP (在 match 之前用引用读取)
+                if let SwarmEvent::NewListenAddr { address, .. } = &event {
+                    let is_quic = address.iter().any(|p| matches!(p, Protocol::QuicV1));
+                    let is_relayed = address.iter().any(|p| matches!(p, Protocol::P2pCircuit));
+                    if is_quic && !is_relayed {
+                        if let Some(Protocol::Ip4(ip)) = address.iter().find(|p| matches!(p, Protocol::Ip4(_))) {
+                            if !ip.is_loopback() && !ip.is_unspecified() {
+                                swarm.add_external_address(address.clone());
+                                if !local_ips.contains(&ip) {
+                                    local_ips.push(ip);
+                                }
+                                if let Some(Protocol::Udp(port)) = address.iter().find(|p| matches!(p, Protocol::Udp(_))) {
+                                    local_quic_port = port;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // match 移动 event，Identify 事件缓存到 pending_events
+                match event {
+                    SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+                        let addr = endpoint.get_remote_address().clone();
+                        // 检查是否为 Relay 连接
+                        if relay_peer_ids.contains(&peer_id) && connected_relay.is_none() {
+                            println!("[Viewer] Connected to relay {peer_id}");
+                            connected_relay = Some((peer_id, addr));
+                        }
+                    }
+                    SwarmEvent::Behaviour(ViewerBehaviourEvent::Identify(_)) => {
+                        // 缓存 Identify 事件供主循环处理
+                        pending_events.push(event);
+                    }
+                    SwarmEvent::Behaviour(ViewerBehaviourEvent::Mdns(
+                        mdns::Event::Discovered(peers),
+                    )) => {
+                        for (peer_id, addr) in peers {
+                            tracing::info!("[Viewer] mDNS discovered peer {peer_id} at {addr}");
+                            if peer_id == device_cam && mdns_discovered_addr.is_none() {
+                                tracing::info!("[Viewer] mDNS found target DeviceCam {peer_id} at {addr}");
+                                mdns_discovered_addr = Some(addr);
+                            }
+                        }
+                    }
+                    SwarmEvent::OutgoingConnectionError { peer_id: Some(peer_id), error, .. } => {
+                        if relay_peer_ids.contains(&peer_id) {
+                            tracing::warn!("[Viewer] Failed to connect to relay {peer_id}: {error}");
+                            relay_error_count += 1;
+                        } else {
+                            tracing::warn!("[Viewer] Connection error: {error}");
+                        }
+                    }
+                    SwarmEvent::OutgoingConnectionError { error, .. } => {
+                        tracing::warn!("[Viewer] Connection error: {error}");
+                    }
+                    _ => {
+                        tracing::debug!("[Viewer] Event during connection phase");
+                    }
+                }
+            }
+            Err(_) => {
+                // timeout
+            }
+        }
+    }
+
+    // ---- 2. 使用 mDNS LAN 直连 或 Relay circuit 拨号 DeviceCam ----
+    if let Some(lan_addr) = mdns_discovered_addr {
+        // mDNS 发现了目标 DeviceCam，优先使用 LAN 直连
+        tracing::info!("[Viewer] Using mDNS-discovered LAN address: {lan_addr}");
+        swarm.dial(lan_addr)?;
+        wait_for_event_collecting(&mut swarm, |e| matches!(
+            e,
+            SwarmEvent::ConnectionEstablished { peer_id, .. } if *peer_id == device_cam
+        ), "device-cam LAN direct connection", &mut local_ips, &mut local_quic_port, &mut pending_events).await?;
+        println!("[Viewer] Connected to device-cam {device_cam} via LAN direct (mDNS)");
+    } else if let Some((_relay_peer_id, relay_addr)) = connected_relay {
+        // 通过 Relay circuit 拨号 DeviceCam
+        let circuit_addr = relay_addr
+            .with(Protocol::P2pCircuit)
+            .with(Protocol::P2p(device_cam));
+        println!("[Viewer] Dialing device-cam via circuit: {circuit_addr}");
+        swarm.dial(circuit_addr)?;
+        wait_for_event_collecting(&mut swarm, |e| matches!(
+            e,
+            SwarmEvent::ConnectionEstablished { peer_id, .. } if *peer_id == device_cam
+        ), "device-cam circuit connection", &mut local_ips, &mut local_quic_port, &mut pending_events).await?;
+        println!("[Viewer] Connected to device-cam {device_cam} via relay circuit");
+    } else {
+        anyhow::bail!("Failed to connect: no relay connection established and no mDNS discovery");
+    }
 
     // DCUtR 尝试前预测：在 circuit 连接建立后立即输出 NAT 上下文
     if let Some(ref diag) = nat_diagnostic {
@@ -547,6 +702,20 @@ async fn run_viewer_session(
                 }
             }
             SwarmEvent::ConnectionEstablished { .. } => {}
+            SwarmEvent::Behaviour(ViewerBehaviourEvent::Mdns(
+                mdns::Event::Discovered(peers),
+            )) => {
+                for (peer_id, addr) in peers {
+                    tracing::info!("[Viewer] mDNS discovered peer {peer_id} at {addr}");
+                }
+            }
+            SwarmEvent::Behaviour(ViewerBehaviourEvent::Mdns(
+                mdns::Event::Expired(peers),
+            )) => {
+                for (peer_id, addr) in peers {
+                    tracing::debug!("[Viewer] mDNS peer expired: {peer_id} at {addr}");
+                }
+            }
             SwarmEvent::Behaviour(ViewerBehaviourEvent::Dcutr(
                 dcutr::Event { result: Ok(_), .. },
             )) => {
@@ -871,13 +1040,26 @@ async fn wait_for_event_collecting(
             }
         }
 
-        // 缓存 Identify 和 ConnectionEstablished 事件，供主循环处理
-        match &event {
+        // 缓存 Identify 事件，供主循环处理
+        // 注意: SwarmEvent 不实现 Clone，只能 move，不能 clone
+        match event {
             SwarmEvent::Behaviour(ViewerBehaviourEvent::Identify(_)) => {
                 pending_events.push(event);
             }
-            SwarmEvent::ConnectionEstablished { .. } => {
-                // 不缓存，因为主循环的 ConnectionEstablished 处理依赖 direct_upgraded 等状态
+            SwarmEvent::Behaviour(ViewerBehaviourEvent::Mdns(
+                mdns::Event::Discovered(peers),
+            )) => {
+                // mDNS 发现事件在连接阶段已处理，主循环中仅记录日志
+                for (peer_id, addr) in peers {
+                    tracing::info!("[Viewer] mDNS discovered peer {peer_id} at {addr}");
+                }
+            }
+            SwarmEvent::Behaviour(ViewerBehaviourEvent::Mdns(
+                mdns::Event::Expired(peers),
+            )) => {
+                for (peer_id, addr) in peers {
+                    tracing::debug!("[Viewer] mDNS peer expired: {peer_id} at {addr}");
+                }
             }
             _ => {}
         }
@@ -1137,6 +1319,7 @@ struct ViewerBehaviour {
     identify: identify::Behaviour,
     ping: ping::Behaviour,
     stream: libp2p_stream::Behaviour,
+    mdns: mdns::tokio::Behaviour,
 }
 
 impl ViewerBehaviour {
@@ -1166,6 +1349,11 @@ impl ViewerBehaviour {
                     .with_interval(Duration::from_secs(5)),
             ),
             stream: libp2p_stream::Behaviour::new(),
+            mdns: mdns::tokio::Behaviour::new(
+                mdns::Config::default(),
+                peer_id,
+            )
+            .expect("Failed to initialize mDNS"),
         }
     }
 }
@@ -1179,9 +1367,9 @@ struct Opt {
     #[arg(long, default_value = "viewer.toml")]
     config: PathBuf,
 
-    /// Relay Server 地址 (覆盖配置文件)
-    #[arg(long)]
-    relay: Option<String>,
+    /// Relay Server 地址 (可多次使用, 覆盖配置文件)
+    #[arg(long = "relay")]
+    relays: Vec<String>,
 
     /// 摄像头 (DeviceCam) PeerId (覆盖配置文件)
     #[arg(long)]
@@ -1203,13 +1391,27 @@ struct Opt {
     /// QUIC UDP 监听端口 (覆盖配置文件)
     #[arg(long)]
     udp_port: Option<u16>,
+
+    /// 是否启用 mDNS 局域网发现 (覆盖配置文件)
+    #[arg(long)]
+    enable_mdns: Option<bool>,
 }
 
 // ---- 配置文件 ----
 
+fn default_enable_mdns() -> bool { true }
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ViewerConfig {
+    /// 多 Relay 地址列表 (新格式优先)
+    #[serde(default)]
+    relays: Vec<String>,
+    /// 单 Relay 地址 (旧格式, 向后兼容, 解析时合并到 relays)
+    #[serde(default)]
     relay: String,
+    /// 是否启用 mDNS 局域网发现 (默认 true)
+    #[serde(default = "default_enable_mdns")]
+    enable_mdns: bool,
     camera: String,
     #[serde(default)]
     output: Option<PathBuf>,
@@ -1224,7 +1426,9 @@ struct ViewerConfig {
 impl Default for ViewerConfig {
     fn default() -> Self {
         Self {
+            relays: Vec::new(),
             relay: String::new(),
+            enable_mdns: default_enable_mdns(),
             camera: String::new(),
             output: None,
             no_audio: false,
@@ -1239,8 +1443,9 @@ impl ViewerConfig {
         if path.exists() {
             let content = std::fs::read_to_string(path)
                 .map_err(|e| anyhow::anyhow!("Failed to read config file {}: {e}", path.display()))?;
-            let config: ViewerConfig = toml::from_str(&content)
+            let mut config: ViewerConfig = toml::from_str(&content)
                 .map_err(|e| anyhow::anyhow!("Failed to parse config file {}: {e}", path.display()))?;
+            config.resolve_relays();
             println!("[Viewer] Loaded config from {}", path.display());
             Ok(config)
         } else {
@@ -1253,6 +1458,17 @@ impl ViewerConfig {
             std::fs::write(path, content)?;
             println!("[Viewer] Generated default config file: {}", path.display());
             Ok(config)
+        }
+    }
+
+    /// 解析 Relay 地址列表: 处理旧格式 relay 与新格式 relays 的兼容
+    ///
+    /// 规则:
+    /// - 如果 relays 非空, 忽略 relay (新格式优先)
+    /// - 如果 relays 为空且 relay 非空, 将 relay 加入 relays (旧格式兼容)
+    fn resolve_relays(&mut self) {
+        if self.relays.is_empty() && !self.relay.is_empty() {
+            self.relays.push(self.relay.clone());
         }
     }
 }

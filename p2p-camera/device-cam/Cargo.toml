@@ -12,7 +12,7 @@ rv1106 = []
 [dependencies]
 libp2p = { workspace = true, features = [
     "tokio", "tcp", "quic", "noise", "yamux",
-    "relay", "dcutr", "identify", "ping", "macros",
+    "relay", "dcutr", "identify", "ping", "macros", "mdns",
 ] }
 libp2p-stream = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
