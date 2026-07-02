@@ -16,16 +16,16 @@
 | 9 | 2026-06-26 | 部署 (云服务器) | DeviceCam 连接云服务器 Relay 报 "Handshake timed out" (QUIC) 或 "Timeout has been reached" (TCP) | (1) 云服务器安全组未放行 UDP/TCP 4001 入站；(2) start_relay.sh 用 `hostname -I` 取到内网 IP，打印的连接地址错误 | (1) 腾讯云安全组添加 TCP+UDP 4001 入站规则；(2) start_relay.sh 新增 `--public-ip` 参数指定外网 IP | `scripts/start_relay.sh` | ✅ 已验证 |
 | 10 | 2026-07-01 | Viewer/DeviceCam | 同一局域网 (192.168.0.2/0.3) 下 DCUtR 打洞失败，日志显示 "Direct connection (DCUtR): NO (relay circuit)"，但视频流畅低延时 | (1) DCUtR 只尝试公网地址打洞 (183.23.149.209)，NAT hairpin 不允许内部设备通过公网 IP 互访；(2) `wait_for_event` 函数在等待连接期间吞掉了 Identify 和 NewListenAddr 事件，导致局域网检测代码无法执行 | (1) 新增局域网直连检测：Identify 事件中检查对端 listen_addrs 是否有同 /24 子网的 QUIC 私有地址，有则直接 dial；(2) `wait_for_event` 替换为 `wait_for_event_collecting`，在等待期间收集 local_ips 和缓存 Identify 事件；(3) 主循环使用 event_queue 优先处理缓存事件；(4) `ConnectionType` 新增 `LanDirect` 变体区分局域网直连和 DCUtR 打洞 | `mobile-core/examples/viewer_cli.rs`, `device-cam/src/main.rs`, `mobile-core/src/viewer.rs`, `mobile-core/src/net_diag.rs` |
 | 11 | 2026-07-01 | 全部 | 三个软件参数只能通过命令行传入，RV1106 嵌入式设备上不便操作 | 无配置文件支持 | 三个软件均新增 TOML 配置文件支持：首次运行自动生成默认配置文件，编辑后重启即可；命令行参数可覆盖配置文件值；优先级：命令行 > 配置文件 > 默认值 | `device-cam/src/config.rs`, `relay-server/src/config.rs`, `mobile-core/examples/viewer_cli.rs` |
+| 12 | 2026-07-01 | Viewer/DeviceCam | 4G CGNAT + 宽带 NAT 场景下 DCUtR 打洞必然失败，但用户无法提前知道原因 | (1) DCUtR 在 circuit 连接建立后自动触发，无法跳过；(2) 4G CGNAT 不允许外部入站 UDP，打洞必然失败；(3) Viewer 端无 ping，DCUtR 尝试期间 Relay 连接可能因空闲断开 | (1) 新增 `DcutrPrediction` 和 `dcutr_prediction()` 方法，在 circuit 连接建立后立即输出 DCUtR 预测（likely SUCCESS/FAIL + 原因）；(2) 4G 检测新增 192.168.133.0/24（iOS/Android 个人热点）、192.168.43.0/24（Android 旧版热点）网段；(3) DCUtR 失败后输出 Relay Circuit 降级确认（"Fallback: Relay circuit is still active"）；(4) Viewer 端 `ViewerBehaviour` 新增 `ping` behaviour（5秒间隔），确保 Relay 连接在 DCUtR 尝试期间和空闲时不会断开 | `mobile-core/src/net_diag.rs`, `device-cam/src/net_diag.rs`, `mobile-core/src/viewer.rs`, `mobile-core/examples/viewer_cli.rs`, `device-cam/src/main.rs` |
 
 ## 关键设计决策
 
-### 心跳设计原则（2026-06-25 确定）
-- **只有 DeviceCam 需要 ping**：5s 间隔，与 Relay Server 维持心跳，`idle_connection_timeout=120s` 作为保底
-- **Viewer 不需要 ping 和 idle_connection_timeout**：
-  - 视频流持续传输天然保持连接活跃
-  - 设为 0 禁用 swarm 层超时，避免画面静止（编码器不产帧）时误触发断开
-  - 断开由 stream 层 `read` 返回 0/error 检测
-- **不要给 Viewer 加 ping 或 idle_connection_timeout**，否则空闲时会误触发重连
+### 心跳设计原则（2026-06-25 确定，2026-07-01 修订）
+- **DeviceCam 需要 ping**：5s 间隔，与 Relay Server 维持心跳，`idle_connection_timeout=120s` 作为保底
+- **Viewer 需要 ping**（2026-07-01 修订）：5s 间隔，确保 Relay 连接在 DCUtR 尝试期间和视频流空闲时不会断开
+  - 之前认为 Viewer 不需要 ping（视频流本身维持连接活跃），但实际场景中 DCUtR 尝试期间可能无视频流传输
+  - ping 的 `connection_keep_alive()` 返回 true，与 relay client 的 keep_alive 叠加，确保连接不被 idle timeout 关闭
+- **Relay Server 需要 ping**：15s 间隔，检测客户端连接存活
 
 ### yamux Config API 注意事项（libp2p 0.54 / yamux 0.14）
 - `libp2p_yamux::Config` 是 `yamux::Config` 的薄封装，仅暴露 `set_max_num_streams`

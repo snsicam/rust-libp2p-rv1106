@@ -30,12 +30,12 @@ use clap::Parser;
 use futures::{AsyncReadExt, StreamExt};
 use libp2p::{
     core::multiaddr::{Multiaddr, Protocol},
-    dcutr, identify, noise, relay,
+    dcutr, identify, noise, ping, relay,
     swarm::{NetworkBehaviour, SwarmEvent},
     tcp, PeerId,
 };
 use libp2p_stream;
-use mobile_core::net_diag::{NatDiagnostic, NatType};
+use mobile_core::net_diag::{DcutrPrediction, NatDiagnostic, NatType};
 use proto::{media_packet::MediaPacket, stream_protocols};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -438,6 +438,18 @@ async fn run_viewer_session(
 
     println!("[Viewer] Connected to device-cam {device_cam}");
 
+    // DCUtR 尝试前预测：在 circuit 连接建立后立即输出 NAT 上下文
+    if let Some(ref diag) = nat_diagnostic {
+        let prediction = diag.dcutr_prediction();
+        if prediction.likely_success {
+            tracing::info!("[Viewer] DCUtR prediction: likely SUCCESS - {}", prediction.reason);
+        } else {
+            tracing::warn!("[Viewer] DCUtR prediction: likely FAIL - {}", prediction.reason);
+        }
+    } else {
+        tracing::info!("[Viewer] DCUtR will be attempted (NAT diagnostic not yet available)");
+    }
+
     // ---- 3. 打开 video stream ----
     let mut stream_control = swarm.behaviour().stream.new_control();
     let video_stream = stream_control
@@ -560,7 +572,13 @@ async fn run_viewer_session(
                     tracing::warn!("[Viewer] If both peers are behind symmetric NAT, DCUtR cannot succeed. Consider:");
                     tracing::warn!("[Viewer]   1. Configure port forwarding on router (map external UDP port → device internal UDP port)");
                     tracing::warn!("[Viewer]   2. Use --external-ip and --udp-port on device-cam to advertise correct external address");
-                    tracing::info!("[Viewer]   3. Relay circuit will continue to work as fallback");
+                }
+                // 快速降级确认：DCUtR 失败后确认 Relay Circuit 仍在工作
+                let has_circuit = swarm.is_connected(&device_cam);
+                if has_circuit {
+                    tracing::info!("[Viewer] Fallback: Relay circuit is still active, video/audio will continue via relay");
+                } else {
+                    tracing::warn!("[Viewer] Fallback: Relay circuit may be lost, connection may drop soon");
                 }
             }
             SwarmEvent::Behaviour(ViewerBehaviourEvent::Identify(
@@ -1117,6 +1135,7 @@ struct ViewerBehaviour {
     relay_client: relay::client::Behaviour,
     dcutr: dcutr::Behaviour,
     identify: identify::Behaviour,
+    ping: ping::Behaviour,
     stream: libp2p_stream::Behaviour,
 }
 
@@ -1142,6 +1161,10 @@ impl ViewerBehaviour {
             relay_client,
             dcutr: dcutr::Behaviour::new(peer_id),
             identify: identify::Behaviour::new(identify_config),
+            ping: ping::Behaviour::new(
+                ping::Config::new()
+                    .with_interval(Duration::from_secs(5)),
+            ),
             stream: libp2p_stream::Behaviour::new(),
         }
     }

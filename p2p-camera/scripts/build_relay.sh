@@ -19,7 +19,7 @@ mkdir -p log
 
 if [ "$MODE" = "release" ]; then
     echo "[INFO] Compiling release version... (Detailed log: $LOG_FILE)"
-    if cargo build -p relay-server --release > "$LOG_FILE" 2>&1; then
+    if cargo build -p relay-server --release 2>&1 | tee "$LOG_FILE"; then
         echo "✅ [$(date '+%H:%M:%S')] Build complete. Binary: target/release/relay-server"
     else
         echo "❌ [$(date '+%H:%M:%S')] Build failed! See log for details:"
@@ -28,7 +28,7 @@ if [ "$MODE" = "release" ]; then
     fi
 else
     echo "[INFO] Compiling debug version... (Detailed log: $LOG_FILE)"
-    if cargo build -p relay-server > "$LOG_FILE" 2>&1; then
+    if cargo build -p relay-server 2>&1 | tee "$LOG_FILE"; then
         echo "✅ [$(date '+%H:%M:%S')] Build complete. Binary: target/debug/relay-server"
     else
         echo "❌ [$(date '+%H:%M:%S')] Build failed! See log for details:"

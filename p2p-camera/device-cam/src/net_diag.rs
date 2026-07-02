@@ -54,6 +54,15 @@ pub struct NatDiagnosis {
     pub dcutr_suggestion: String,
 }
 
+/// DCUtR 尝试前的预测结果
+#[derive(Debug, Clone)]
+pub struct DcutrPrediction {
+    pub likely_success: bool,
+    pub is_4g: bool,
+    pub nat_type: NatType,
+    pub reason: String,
+}
+
 pub struct NatDiagnostic {
     observed_history: Vec<Multiaddr>,
     local_quic_port: u16,
@@ -75,6 +84,49 @@ impl NatDiagnostic {
 
     pub fn observed_history_is_empty(&self) -> bool {
         self.observed_history.is_empty()
+    }
+
+    /// 在 DCUtR 尝试前输出 NAT 上下文预测
+    pub fn dcutr_prediction(&self) -> DcutrPrediction {
+        let is_4g = self.local_ips.iter().any(|ip| is_4g_network(*ip));
+        let diag = self.diagnose();
+
+        let (likely_success, reason) = if is_4g && !diag.nat_type.dcutr_feasible() {
+            (false, format!(
+                "4G/CGNAT + {} NAT: DCUtR hole-punching will likely fail. \
+                 CGNAT does not allow inbound UDP from external addresses. \
+                 Relay circuit will be used.",
+                 diag.nat_type.short_name()
+            ))
+        } else if is_4g {
+            (false, format!(
+                "4G/CGNAT detected ({}): DCUtR may fail because CGNAT typically blocks inbound UDP. \
+                 Success depends on remote peer's NAT type (Cone NAT on broadband may work). \
+                 Relay circuit will be used as fallback.",
+                 diag.nat_type.short_name()
+            ))
+        } else if !diag.nat_type.dcutr_feasible() {
+            (false, format!(
+                "{} NAT: DCUtR hole-punching will not succeed. \
+                 Relay circuit will be used.",
+                 diag.nat_type.short_name()
+            ))
+        } else if diag.nat_type == NatType::Unknown {
+            (true, "NAT type unknown: DCUtR will be attempted, success depends on NAT compatibility of both peers.".to_string())
+        } else {
+            (true, format!(
+                "{} NAT: DCUtR hole-punching should succeed. \
+                 If it fails, check firewall settings or port forwarding.",
+                 diag.nat_type.short_name()
+            ))
+        };
+
+        DcutrPrediction {
+            likely_success,
+            is_4g,
+            nat_type: diag.nat_type,
+            reason,
+        }
     }
 
     pub fn diagnose(&self) -> NatDiagnosis {
@@ -166,18 +218,37 @@ impl NatDiagnostic {
 }
 
 /// 4G/CGNAT 网络启发式检测
-fn is_4g_network(ip: Ipv4Addr) -> bool {
+///
+/// 通过本地 IP 网段判断是否可能为 4G 网络：
+/// - 192.168.174.0/24: Android WiFi 热点/USB 共享网络典型网段
+/// - 192.168.133.0/24: iOS/Android 个人热点典型网段
+/// - 192.168.43.0/24: Android WiFi 热点 (旧版) 典型网段
+/// - 100.64.0.0/10: RFC 6598 CGNAT 保留段
+/// - 非 RFC 1918 且非公网 IP: 运营商内网
+pub fn is_4g_network(ip: Ipv4Addr) -> bool {
     // 192.168.174.0/24 — Android WiFi 热点/USB 共享典型网段
     if ip.octets()[0] == 192 && ip.octets()[1] == 168 && ip.octets()[2] == 174 {
         return true;
     }
 
-    // 100.64.0.0/10 — RFC 6598 CGNAT 保留段
+    // 192.168.133.0/24 — iOS/Android 个人热点典型网段
+    if ip.octets()[0] == 192 && ip.octets()[1] == 168 && ip.octets()[2] == 133 {
+        return true;
+    }
+
+    // 192.168.43.0/24 — Android WiFi 热点 (旧版) 典型网段
+    if ip.octets()[0] == 192 && ip.octets()[1] == 168 && ip.octets()[2] == 43 {
+        return true;
+    }
+
+    // 100.64.0.0/10 — RFC 6598 CGNAT 保留段 (100.64.0.0 - 100.127.255.255)
     if (ip.octets()[0] == 100) && (ip.octets()[1] >= 64 && ip.octets()[1] <= 127) {
         return true;
     }
 
     // 非 RFC 1918 私有地址、非回环、非未指定、非公网 IP
+    // 这类地址通常是运营商内网或 VPN 分配的地址
+    // RFC 1918: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
     if !ip.is_private() && !ip.is_loopback() && !ip.is_unspecified() && !is_public_ip(ip) {
         return true;
     }

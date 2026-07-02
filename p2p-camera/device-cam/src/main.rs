@@ -42,7 +42,7 @@ use libp2p::{
     tcp,
     PeerId,
 };
-use net_diag::{NatDiagnostic, NatType};
+use net_diag::{DcutrPrediction, NatDiagnostic, NatType};
 use proto::{
     media_packet::MediaPacket,
     stream_protocols,
@@ -262,6 +262,8 @@ async fn run_device_cam_session(
     tracing::info!("[DeviceCam] push_listen_addr_updates enabled for DCUtR");
 
     let mut connection_times: HashMap<PeerId, Instant> = HashMap::new();
+    // 记录每个 peer 的连接类型 (用于 stream accept 时输出)
+    let mut peer_conn_type: HashMap<PeerId, String> = HashMap::new();
 
     // ---- NAT 诊断状态 ----
     let mut nat_diagnostic: Option<NatDiagnostic> = None;
@@ -282,6 +284,14 @@ async fn run_device_cam_session(
     // ---- 外部地址由 identify 协议自动发现（公网 IP）和 NewListenAddr 事件自动注入（本地 IP） ----
 
     // ---- 连接 Relay Server ----
+    // 从 relay 地址中提取 PeerId，用于区分 relay 连接和 viewer 连接
+    let relay_peer_id: PeerId = relay_addr.iter()
+        .find_map(|p| match p {
+            Protocol::P2p(peer_id) => Some(peer_id),
+            _ => None,
+        })
+        .ok_or_else(|| anyhow::anyhow!("Relay address must contain PeerId"))?;
+
     swarm.dial(relay_addr.clone())?;
     println!("[DeviceCam] Dialing relay: {relay_addr}");
 
@@ -349,7 +359,13 @@ async fn run_device_cam_session(
                                 tracing::warn!("[DeviceCam] If both peers are behind symmetric NAT, DCUtR cannot succeed. Consider:");
                                 tracing::warn!("[DeviceCam]   1. Configure port forwarding on router (map external UDP port → device internal UDP port)");
                                 tracing::warn!("[DeviceCam]   2. Use --external-ip and --udp-port to advertise correct external address");
-                                tracing::info!("[DeviceCam]   3. Relay circuit will continue to work as fallback");
+                            }
+                            // 快速降级确认：DCUtR 失败后确认 Relay Circuit 仍在工作
+                            let has_relay = swarm.is_connected(&relay_peer_id);
+                            if has_relay {
+                                tracing::info!("[DeviceCam] Fallback: Relay circuit is still active, video/audio will continue via relay");
+                            } else {
+                                tracing::warn!("[DeviceCam] Fallback: Relay connection may be lost, reconnection may be needed");
                             }
                         }
                     },
@@ -475,24 +491,50 @@ async fn run_device_cam_session(
                         let role = if endpoint.is_dialer() { "outgoing" } else { "incoming" };
                         let addr = endpoint.get_remote_address().clone();
                         connection_times.insert(peer_id, Instant::now());
-                        tracing::info!("[DeviceCam] Connection established:");
-                        tracing::info!("  - Peer ID: {peer_id}");
-                        tracing::info!("  - Role: {role}");
-                        tracing::info!("  - Remote address: {addr}");
-                        if addr.iter().any(|p| matches!(p, Protocol::P2pCircuit)) {
-                            tracing::info!("  - Type: Relay Circuit connection");
+
+                        // 判断连接类型
+                        let conn_type = if addr.iter().any(|p| matches!(p, Protocol::P2pCircuit)) {
+                            "Relay Circuit (转发)".to_string()
                         } else if addr.iter().any(|p| matches!(p, Protocol::QuicV1)) {
                             let is_lan = addr.iter().any(|p| {
                                 if let Protocol::Ip4(ip) = p { ip.is_private() } else { false }
                             });
                             if is_lan {
-                                tracing::info!("  - Type: QUIC LAN direct connection (same subnet)");
+                                "LAN Direct (局域网直连)".to_string()
                             } else {
-                                tracing::info!("  - Type: QUIC direct connection (DCUtR)");
+                                "DCUtR Hole Punch (打洞直连)".to_string()
                             }
                         } else {
-                            tracing::info!("  - Type: Other connection");
+                            "Other".to_string()
+                        };
+
+                        // 记录连接类型，供 stream accept 时使用
+                        peer_conn_type.insert(peer_id, conn_type.clone());
+
+                        // 非 Relay Server 的连接才输出醒目信息
+                        if peer_id != relay_peer_id {
+                            println!("[DeviceCam] *** Viewer connected: {peer_id} via {conn_type} ***");
+
+                            // DCUtR 尝试前预测：在 circuit 连接建立后立即输出 NAT 上下文
+                            if addr.iter().any(|p| matches!(p, Protocol::P2pCircuit)) {
+                                if let Some(ref diag) = nat_diagnostic {
+                                    let prediction = diag.dcutr_prediction();
+                                    if prediction.likely_success {
+                                        tracing::info!("[DeviceCam] DCUtR prediction: likely SUCCESS - {}", prediction.reason);
+                                    } else {
+                                        tracing::warn!("[DeviceCam] DCUtR prediction: likely FAIL - {}", prediction.reason);
+                                    }
+                                } else {
+                                    tracing::info!("[DeviceCam] DCUtR will be attempted (NAT diagnostic not yet available)");
+                                }
+                            }
                         }
+
+                        tracing::info!("[DeviceCam] Connection established:");
+                        tracing::info!("  - Peer ID: {peer_id}");
+                        tracing::info!("  - Role: {role}");
+                        tracing::info!("  - Remote address: {addr}");
+                        tracing::info!("  - Type: {conn_type}");
                     }
 
                     SwarmEvent::ConnectionClosed { peer_id, endpoint, cause, num_established, .. } => {
@@ -502,19 +544,24 @@ async fn run_device_cam_session(
                             .map(|t| t.elapsed())
                             .map(|d| format!("{:.1}s", d.as_secs_f64()))
                             .unwrap_or_else(|| "unknown".to_string());
+                        let conn_type = peer_conn_type.get(&peer_id).cloned().unwrap_or_else(|| "Unknown".to_string());
+                        if num_established == 0 {
+                            peer_conn_type.remove(&peer_id);
+                        }
                         tracing::warn!("[DeviceCam] Connection closed:");
                         tracing::warn!("  - Peer ID: {peer_id}");
                         tracing::warn!("  - Role: {role}");
                         tracing::warn!("  - Remote address: {addr}");
                         tracing::warn!("  - Connection duration: {duration}");
+                        tracing::warn!("  - Type: {conn_type}");
                         if let Some(cause) = cause {
                             tracing::warn!("  - Cause: {cause}");
                         }
                         tracing::warn!("  - Remaining established connections: {num_established}");
-                        if addr.iter().any(|p| matches!(p, Protocol::P2pCircuit)) {
-                            tracing::warn!("  - Type: Relay Circuit connection - may trigger reconnect");
-                        } else if addr.iter().any(|p| matches!(p, Protocol::QuicV1)) {
-                            tracing::warn!("  - Type: QUIC direct connection - falling back to relay");
+
+                        // 非 relay 连接断开时输出醒目信息
+                        if peer_id != relay_peer_id && num_established == 0 {
+                            println!("[DeviceCam] *** Viewer disconnected: {peer_id} (was {conn_type}) ***");
                         }
                     }
 
@@ -528,7 +575,8 @@ async fn run_device_cam_session(
             video = incoming_video.next() => {
                 if let Some((peer_id, stream)) = video {
                     let rx = video_tx.subscribe();
-                    println!("[DeviceCam] New video viewer: {peer_id}");
+                    let conn_type = peer_conn_type.get(&peer_id).map(|s| s.as_str()).unwrap_or("Unknown");
+                    println!("[DeviceCam] New video viewer: {peer_id} via {conn_type}");
                     #[cfg(feature = "rv1106")]
                     let init_nals = rk_video_source::get_param_sets();
                     #[cfg(not(feature = "rv1106"))]
@@ -546,7 +594,8 @@ async fn run_device_cam_session(
             audio = incoming_audio.next() => {
                 if let Some((peer_id, stream)) = audio {
                     let rx = audio_tx.subscribe();
-                    println!("[DeviceCam] New audio viewer: {peer_id}");
+                    let conn_type = peer_conn_type.get(&peer_id).map(|s| s.as_str()).unwrap_or("Unknown");
+                    println!("[DeviceCam] New audio viewer: {peer_id} via {conn_type}");
                     tokio::spawn(stream_audio_to_viewer(peer_id, stream, rx));
                 } else {
                     return Err(anyhow::anyhow!("Audio stream accept channel closed"));

@@ -14,7 +14,7 @@ use anyhow::{Context, Result};
 use futures::{AsyncReadExt, StreamExt};
 use libp2p::{
     core::multiaddr::{Multiaddr, Protocol},
-    dcutr, identify, noise, relay,
+    dcutr, identify, noise, ping, relay,
     swarm::{NetworkBehaviour, SwarmEvent},
     tcp, Swarm, PeerId,
 };
@@ -178,6 +178,14 @@ impl P2pViewer {
                     let diag = self.nat_diagnostic.diagnose();
                     tracing::warn!("[Viewer] Suggestion: {}", diag.dcutr_suggestion);
                     self.connection_quality.last_dcutr_result = Some(Err(err_str));
+                    // 快速降级确认：DCUtR 失败后确认 Relay Circuit 仍在工作
+                    if let Some(device_cam) = self.device_cam_peer_id {
+                        if self.swarm.is_connected(&device_cam) {
+                            tracing::info!("[Viewer] Fallback: Relay circuit is still active, video/audio will continue via relay");
+                        } else {
+                            tracing::warn!("[Viewer] Fallback: Relay circuit may be lost, connection may drop soon");
+                        }
+                    }
                 }
                 SwarmEvent::Behaviour(ViewerBehaviourEvent::Identify(
                     identify::Event::Received { info, peer_id: identify_peer_id, .. },
@@ -247,6 +255,14 @@ impl P2pViewer {
                     self.connection_quality.active_connections += 1;
                     if addr.iter().any(|p| matches!(p, Protocol::P2pCircuit)) {
                         self.connection_quality.connection_type = ConnectionType::RelayCircuit;
+
+                        // DCUtR 尝试前预测：在 circuit 连接建立后立即输出 NAT 上下文
+                        let prediction = self.nat_diagnostic.dcutr_prediction();
+                        if prediction.likely_success {
+                            tracing::info!("[Viewer] DCUtR prediction: likely SUCCESS - {}", prediction.reason);
+                        } else {
+                            tracing::warn!("[Viewer] DCUtR prediction: likely FAIL - {}", prediction.reason);
+                        }
                     } else if addr.iter().any(|p| matches!(p, Protocol::QuicV1)) {
                         let is_lan = addr.iter().any(|p| {
                             if let Protocol::Ip4(ip) = p { ip.is_private() } else { false }
@@ -345,6 +361,7 @@ pub struct ViewerBehaviour {
     pub relay_client: relay::client::Behaviour,
     pub dcutr: dcutr::Behaviour,
     pub identify: identify::Behaviour,
+    pub ping: ping::Behaviour,
     pub stream: libp2p_stream::Behaviour,
 }
 
@@ -363,6 +380,10 @@ impl ViewerBehaviour {
                     local_public_key,
                 )
                 .with_push_listen_addr_updates(true),
+            ),
+            ping: ping::Behaviour::new(
+                ping::Config::new()
+                    .with_interval(Duration::from_secs(5)),
             ),
             stream: libp2p_stream::Behaviour::new(),
         }
