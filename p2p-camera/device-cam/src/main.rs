@@ -70,13 +70,15 @@ struct RelayState {
     connected: bool,
     /// 重连尝试次数 (0=首次, >0=重连中)
     reconnect_attempt: u32,
+    /// 是否已发起拨号等待结果（避免重复拨号）
+    dial_pending: bool,
 }
 
 impl RelayState {
     /// 计算指数退避延迟
     fn reconnect_delay(&self) -> Duration {
         let delay_secs = (RECONNECT_DELAY_BASE.as_secs() as u64)
-            .saturating_mul(1u64 << self.reconnect_attempt.saturating_sub(1).min(4));
+            .saturating_mul(1u64 << self.reconnect_attempt.saturating_sub(1).min(5));
         Duration::from_secs(delay_secs).min(RECONNECT_DELAY_MAX)
     }
 }
@@ -208,6 +210,7 @@ async fn main() -> Result<()> {
             reservation_id: None,
             connected: false,
             reconnect_attempt: 0,
+            dial_pending: false,
         }
     }).collect();
 
@@ -304,6 +307,7 @@ async fn main() -> Result<()> {
                                 println!("[DeviceCam] Relay {} reservation confirmed!", relay_peer_id);
                                 state.connected = true;
                                 state.reconnect_attempt = 0;
+                                state.dial_pending = false;
                             }
                         }
                         // 检查至少一个 Relay 预约成功
@@ -434,6 +438,7 @@ async fn main() -> Result<()> {
                             tracing::warn!("[DeviceCam] Relay reservation lost: {e}");
                             state.reservation_id = None;
                             state.connected = false;
+                            state.dial_pending = false;
                             // 如果 relay 连接还在，尝试重新预约
                             if swarm.is_connected(&state.peer_id) {
                                 tracing::info!("[DeviceCam] Relay {} still connected, re-requesting reservation...", state.peer_id);
@@ -508,6 +513,7 @@ async fn main() -> Result<()> {
                                     println!("[DeviceCam] Connected to relay {peer_id}");
                                 }
                                 state.reconnect_attempt = 0;
+                                state.dial_pending = false;
 
                                 // 首次连接或重连后，请求 relay reservation
                                 if state.reservation_id.is_none() {
@@ -575,6 +581,7 @@ async fn main() -> Result<()> {
                             if let Some(state) = relay_states.iter_mut().find(|s| s.peer_id == peer_id) {
                                 state.connected = false;
                                 state.reservation_id = None;
+                                state.dial_pending = false;
                                 state.reconnect_attempt += 1;
 
                                 let delay = state.reconnect_delay();
@@ -595,6 +602,7 @@ async fn main() -> Result<()> {
                         let is_relay = relay_states.iter().any(|s| s.peer_id == peer_id);
                         if is_relay {
                             if let Some(state) = relay_states.iter_mut().find(|s| s.peer_id == peer_id) {
+                                state.dial_pending = false;
                                 state.reconnect_attempt += 1;
                                 let delay = state.reconnect_delay();
                                 println!("[DeviceCam] *** Failed to connect to relay {}! Retrying in {}s (attempt {}) ***",
@@ -651,7 +659,7 @@ async fn main() -> Result<()> {
         // 每个 Relay 独立重连，互不影响
         // 只重连第一个需要重连的 Relay，避免阻塞事件循环太久
         for state in &mut relay_states {
-            if !state.connected && !swarm.is_connected(&state.peer_id) && state.reconnect_attempt > 0 {
+            if !state.connected && !state.dial_pending && !swarm.is_connected(&state.peer_id) && state.reconnect_attempt > 0 {
                 let delay = state.reconnect_delay();
                 tracing::info!("[DeviceCam] Waiting {}s before reconnecting to relay {}...", delay.as_secs(), state.peer_id);
                 tokio::time::sleep(delay).await;
@@ -660,8 +668,8 @@ async fn main() -> Result<()> {
                     Ok(()) => {
                         println!("[DeviceCam] Dialing relay {} (attempt {})...", state.peer_id, state.reconnect_attempt);
                         // 标记为已发起拨号，避免重复拨号
-                        // 如果连接失败，OutgoingConnectionError 会重新递增 reconnect_attempt
-                        state.reconnect_attempt = 0;
+                        // 如果连接失败，OutgoingConnectionError 会清除 dial_pending 并递增 reconnect_attempt
+                        state.dial_pending = true;
                     }
                     Err(e) => {
                         tracing::error!("[DeviceCam] Failed to dial relay {}: {e}", state.peer_id);
