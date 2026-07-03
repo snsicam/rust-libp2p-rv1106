@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: MIT
-// RV1106 Camera SDK C shim — 封装 VI + VENC 初始化为简单接口
-// 编译: armv7l-linux-gnueabihf-gcc -shared -fPIC -o librk_camera.so rk_camera.c \
-//       -I<rockit_sdk_include_dir> -lrockit_full -lrkaiq
+// RV1106 Camera SDK C shim — 封装 VI + VPSS + VENC (三码流) 初始化为简单接口
 //
-// 这个 shim 封装了复杂的 VI/VENC 初始化逻辑, Rust 侧只需调用:
-//   rk_camera_init(width, height, fps, bitrate)
-//   rk_camera_get_frame(buf, max_len) → actual_len
-//   rk_camera_deinit()
+// 管线:
+//   VI(dev=0, chn=0) → VPSS(grp=0) ┬→ VENC(chn=0) 主码流
+//                                    ├→ VENC(chn=1) 子码流
+//                                    └→ VENC(chn=2) 第三码流
+//
+// 编译: 由 build.rs 自动编译为 librk_camera.a
+// 链接: librockit_full.so + librkaiq.so
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,33 +19,85 @@
 #include "rk_mpi_sys.h"
 #include "rk_mpi_vi.h"
 #include "rk_mpi_venc.h"
+#include "rk_mpi_vpss.h"
 #include "rk_mpi_mb.h"
 #include "rk_mpi_ai.h"
 #include "rk_common.h"
 #include "rk_comm_video.h"
 #include "rk_comm_venc.h"
 #include "rk_comm_vi.h"
+#include "rk_comm_vpss.h"
 #include "rk_comm_aio.h"
 
 // ISP (rkaiq) 头文件
 #include "rk_aiq_user_api2_sysctl.h"
 
-#define VENC_CHN_ID 0
-#define VI_DEV_ID   0
-#define VI_CHN_ID   0  // 0: rkisp_mainpath (与 simple_vi_bind_venc 一致)
-#define CAM_ID      0
-#define IQ_FILE_DIR "/etc/iqfiles"  // ISP IQ 参数文件目录
+// ---- 常量定义 ----
 
-static pthread_t g_get_stream_thread;
+#define VI_DEV_ID           0
+#define VI_CHN_ID           0   // rkisp_mainpath
+#define VPSS_GRP_ID         0
+#define CAM_ID              0
+#define IQ_FILE_DIR         "/etc/iqfiles"
+
+// 三路 VENC 通道
+#define VENC_CHN_MAIN       0
+#define VENC_CHN_SUB        1
+#define VENC_CHN_THIRD      2
+#define VENC_MAX_CHN        3
+
+// VPSS 三路输出通道
+#define VPSS_CHN_MAIN       VPSS_CHN0
+#define VPSS_CHN_SUB        VPSS_CHN1
+#define VPSS_CHN_THIRD      VPSS_CHN2
+
+// ---- 全局状态 ----
+
 static volatile int g_quit = 0;
 static volatile int g_initialized = 0;
-static rk_aiq_sys_ctx_t *g_aiq_ctx = NULL;  // ISP AIQ 上下文
+static rk_aiq_sys_ctx_t *g_aiq_ctx = NULL;
 
-// RK_MPI_SYS_Init/Exit 引用计数 — camera 和 audio 各自 init 时 +1, deinit 时 -1
-// 当计数归零时才真正调用 RK_MPI_SYS_Exit
-// 解决: 当 audio 先于 camera 初始化时 (例如 device-cam 启动后还没有 viewer 连接,
-//       视频 spawn 等待 start_trigger, 但音频立即 spawn), MPP 系统未初始化导致段错误
+// MPP 系统引用计数 (与 audio 共享)
 static volatile int g_sys_init_count = 0;
+
+// 每个 encoder channel 的取流线程
+static pthread_t g_stream_threads[VENC_MAX_CHN];
+static volatile int g_chn_enabled[VENC_MAX_CHN] = {0, 0, 0};
+
+// 每通道的 encoder 参数配置
+typedef struct {
+    int width;              // 输出分辨率
+    int height;
+    int src_fps_num;        // 源帧率
+    int src_fps_den;
+    int dst_fps_num;        // 目标帧率 (实际编码帧率)
+    int dst_fps_den;
+    int bitrate_kbps;       // 码率
+    int gop;                // GOP 帧数
+    int codec;              // RK_VIDEO_ID_HEVC 或 RK_VIDEO_ID_AVC
+    int rc_mode;            // VENC_RC_MODE_H265CBR 等
+    int rc_quality;         // 0=lowest..6=highest (-1=不设置)
+    int gop_mode;           // VENC_GOP_MODE_NORMALP 或 VENC_GOP_MODE_SMARTP
+    int profile;            // 0=main, 100=high
+    int mirror;             // MIRROR_NONE / HORIZONTAL / VERTICAL / BOTH
+    int smartp_viridrlen;
+    int stream_buf_cnt;
+} ChnEncAttr;
+
+static ChnEncAttr g_chn_attr[VENC_MAX_CHN];
+
+// 帧回调: fn(chn_id, data, len, pts, is_keyframe)
+typedef void (*frame_callback_t)(int chn_id, const uint8_t *data, uint32_t len,
+                                  uint64_t pts, int is_keyframe);
+static frame_callback_t g_callback = NULL;
+
+// ---- 辅助函数 ----
+
+static uint64_t get_now_us() {
+    struct timespec ts = {0, 0};
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000 + (uint64_t)ts.tv_nsec / 1000;
+}
 
 static int ensure_sys_init() {
     if (g_sys_init_count == 0) {
@@ -67,95 +120,31 @@ static void maybe_sys_exit() {
     }
 }
 
-// 帧回调: Rust 侧通过 rk_camera_set_callback 设置
-typedef void (*frame_callback_t)(const uint8_t *data, uint32_t len, uint64_t pts, int is_keyframe);
-static frame_callback_t g_callback = NULL;
-
-// 获取当前时间 (微秒)
-static uint64_t get_now_us() {
-    struct timespec ts = {0, 0};
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000 + (uint64_t)ts.tv_nsec / 1000;
-}
-
-// VENC 取流线程
-static void *get_stream_thread(void *arg) {
-    (void)arg;
-    VENC_STREAM_S stFrame;
-    stFrame.pstPack = (VENC_PACK_S *)malloc(sizeof(VENC_PACK_S));
-    int loopCount = 0;
-
-    printf("[rk_camera] get_stream_thread started\n");
-
-    while (!g_quit) {
-        int ret = RK_MPI_VENC_GetStream(VENC_CHN_ID, &stFrame, -1);
-        if (ret == RK_SUCCESS) {
-            void *pData = RK_MPI_MB_Handle2VirAddr(stFrame.pstPack->pMbBlk);
-            uint32_t u32Len = stFrame.pstPack->u32Len;
-            uint64_t u64PTS = stFrame.pstPack->u64PTS;
-
-            // 判断是否关键帧 (H265E_NALU_IDRSLICE = 19)
-            int is_keyframe = 0;
-            if (stFrame.pstPack->DataType.enH265EType == 19 ||
-                stFrame.pstPack->DataType.enH265EType == 20) {
-                is_keyframe = 1;
-            }
-
-            if (g_callback && pData && u32Len > 0) {
-                g_callback((const uint8_t *)pData, u32Len, u64PTS, is_keyframe);
-            }
-
-            if (loopCount == 0) {
-                printf("[rk_camera] first frame: len=%u pts=%llu keyframe=%d\n",
-                       u32Len, (unsigned long long)u64PTS, is_keyframe);
-            }
-            loopCount++;
-
-            RK_MPI_VENC_ReleaseStream(VENC_CHN_ID, &stFrame);
-        } else {
-            usleep(10 * 1000);  // 10ms
-        }
-    }
-
-    printf("[rk_camera] get_stream_thread exit, total frames=%d\n", loopCount);
-    free(stFrame.pstPack);
-    return NULL;
-}
-
 // ---- ISP 初始化 ----
-// 参考 rkipc/common/isp/rv1106/isp.c 的 sample_comm_isp_init
-// 流程: enumStaticMetas → preInit_devBufCnt → preInit_scene → init → prepare → start
+
 static int isp_init() {
     int ret;
     rk_aiq_working_mode_t wdr_mode = RK_AIQ_WORKING_MODE_NORMAL;
 
-    // 设置 HDR_MODE 环境变量 (AIQ 需要)
     char hdr_str[16];
     snprintf(hdr_str, sizeof(hdr_str), "%d", (int)wdr_mode);
     setenv("HDR_MODE", hdr_str, 1);
 
-    // 1. 枚举传感器信息
     rk_aiq_static_info_t aiq_static_info;
     ret = rk_aiq_uapi2_sysctl_enumStaticMetasByPhyId(CAM_ID, &aiq_static_info);
     if (ret < 0 || aiq_static_info.sensor_info.phyId == -1) {
-        printf("[rk_camera] WARN: sensor not found (phyId=%d), ISP disabled\n",
-               aiq_static_info.sensor_info.phyId);
-        return 0;  // 不算错误, 继续不使用 ISP
+        printf("[rk_camera] WARN: sensor not found, ISP disabled\n");
+        return 0;
     }
     printf("[rk_camera] sensor: %s\n", aiq_static_info.sensor_info.sensor_name);
 
-    // 2. 预初始化 buf 数量
     rk_aiq_uapi2_sysctl_preInit_devBufCnt(
         aiq_static_info.sensor_info.sensor_name, "rkraw_rx", 2);
 
-    // 3. 预设场景 (normal = 非 HDR)
     ret = rk_aiq_uapi2_sysctl_preInit_scene(
         aiq_static_info.sensor_info.sensor_name, "normal", NULL);
-    if (ret < 0) {
-        printf("[rk_camera] WARN: preInit_scene failed\n");
-    }
+    if (ret < 0) printf("[rk_camera] WARN: preInit_scene failed\n");
 
-    // 4. 初始化 AIQ (加载 IQ 文件)
     g_aiq_ctx = rk_aiq_uapi2_sysctl_init(
         aiq_static_info.sensor_info.sensor_name, IQ_FILE_DIR, NULL, NULL);
     if (!g_aiq_ctx) {
@@ -163,7 +152,6 @@ static int isp_init() {
         return 0;
     }
 
-    // 5. 准备 + 启动
     if (rk_aiq_uapi2_sysctl_prepare(g_aiq_ctx, 0, 0, wdr_mode)) {
         printf("[rk_camera] WARN: sysctl_prepare failed\n");
         g_aiq_ctx = NULL;
@@ -188,7 +176,8 @@ static void isp_deinit() {
     }
 }
 
-// VI 设备初始化
+// ---- VI 初始化 (捕获主码流分辨率) ----
+
 static int vi_dev_init() {
     int devId = VI_DEV_ID;
     int pipeId = devId;
@@ -219,7 +208,6 @@ static int vi_dev_init() {
     return 0;
 }
 
-// VI 通道初始化
 static int vi_chn_init(int width, int height) {
     VI_CHN_ATTR_S vi_chn_attr;
     memset(&vi_chn_attr, 0, sizeof(vi_chn_attr));
@@ -236,107 +224,422 @@ static int vi_chn_init(int width, int height) {
     return ret;
 }
 
-// VENC 初始化
-static int venc_init(int width, int height, int fps, int bitrate_kbps) {
+// ---- VPSS 初始化 (3 路缩放输出) ----
+
+static int vpss_init(int main_w, int main_h,
+                     int sub_w, int sub_h,
+                     int third_w, int third_h,
+                     int fps_num, int fps_den) {
+    int ret;
+    VPSS_GRP_ATTR_S stGrpAttr;
+    VPSS_CHN_ATTR_S stChnAttr;
+    VPSS_CHN vpss_chns[] = {VPSS_CHN_MAIN, VPSS_CHN_SUB, VPSS_CHN_THIRD};
+    int widths[] = {main_w, sub_w, third_w};
+    int heights[] = {main_h, sub_h, third_h};
+
+    memset(&stGrpAttr, 0, sizeof(stGrpAttr));
+    stGrpAttr.u32MaxW = 4096;
+    stGrpAttr.u32MaxH = 4096;
+    stGrpAttr.enPixelFormat = RK_FMT_YUV420SP;
+    stGrpAttr.stFrameRate.s32SrcFrameRate = -1;
+    stGrpAttr.stFrameRate.s32DstFrameRate = -1;
+    stGrpAttr.enCompressMode = COMPRESS_MODE_NONE;
+
+    ret = RK_MPI_VPSS_CreateGrp(VPSS_GRP_ID, &stGrpAttr);
+    if (ret != RK_SUCCESS) {
+        printf("[rk_camera] RK_MPI_VPSS_CreateGrp failed: %x\n", ret);
+        return ret;
+    }
+
+    // 设置 VProc 设备 (使用 RGA 做缩放)
+    ret = RK_MPI_VPSS_SetVProcDev(VPSS_GRP_ID, VIDEO_PROC_DEV_RGA);
+    if (ret != RK_SUCCESS) {
+        printf("[rk_camera] RK_MPI_VPSS_SetVProcDev failed: %x\n", ret);
+        return ret;
+    }
+
+    // 创建 3 个 VPSS channel
+    for (int i = 0; i < 3; i++) {
+        memset(&stChnAttr, 0, sizeof(stChnAttr));
+        stChnAttr.enChnMode = VPSS_CHN_MODE_USER;
+        stChnAttr.enDynamicRange = DYNAMIC_RANGE_SDR8;
+        stChnAttr.enPixelFormat = RK_FMT_YUV420SP;
+        stChnAttr.stFrameRate.s32SrcFrameRate = -1;
+        stChnAttr.stFrameRate.s32DstFrameRate = -1;
+        stChnAttr.u32Width = widths[i];
+        stChnAttr.u32Height = heights[i];
+        stChnAttr.enCompressMode = COMPRESS_MODE_NONE;
+
+        ret = RK_MPI_VPSS_SetChnAttr(VPSS_GRP_ID, vpss_chns[i], &stChnAttr);
+        if (ret != RK_SUCCESS) {
+            printf("[rk_camera] VPSS SetChnAttr[%d] failed: %x\n", i, ret);
+            return ret;
+        }
+
+        ret = RK_MPI_VPSS_EnableChn(VPSS_GRP_ID, vpss_chns[i]);
+        if (ret != RK_SUCCESS) {
+            printf("[rk_camera] VPSS EnableChn[%d] failed: %x\n", i, ret);
+            return ret;
+        }
+    }
+
+    // 启动 VPSS Group
+    ret = RK_MPI_VPSS_StartGrp(VPSS_GRP_ID);
+    if (ret != RK_SUCCESS) {
+        printf("[rk_camera] RK_MPI_VPSS_StartGrp failed: %x\n", ret);
+        return ret;
+    }
+
+    printf("[rk_camera] VPSS init: group=%d, outputs: %dx%d / %dx%d / %dx%d\n",
+           VPSS_GRP_ID, main_w, main_h, sub_w, sub_h, third_w, third_h);
+    return 0;
+}
+
+// ---- VENC 单通道初始化 ----
+
+static int get_codec_type(const char *codec_str) {
+    if (strcmp(codec_str, "H264") == 0 || strcmp(codec_str, "h264") == 0)
+        return RK_VIDEO_ID_AVC;
+    return RK_VIDEO_ID_HEVC;  // default H.265
+}
+
+static int get_rc_mode(const char *rc_str, int codec) {
+    if (codec == RK_VIDEO_ID_AVC) {
+        if (strcmp(rc_str, "VBR") == 0) return VENC_RC_MODE_H264VBR;
+        return VENC_RC_MODE_H264CBR;
+    } else {
+        if (strcmp(rc_str, "VBR") == 0) return VENC_RC_MODE_H265VBR;
+        return VENC_RC_MODE_H265CBR;
+    }
+}
+
+static int get_rc_quality(const char *q_str) {
+    if (strcmp(q_str, "highest") == 0) return 6;
+    if (strcmp(q_str, "higher") == 0) return 5;
+    if (strcmp(q_str, "high") == 0) return 4;
+    if (strcmp(q_str, "medium") == 0) return 3;
+    if (strcmp(q_str, "low") == 0) return 2;
+    if (strcmp(q_str, "lower") == 0) return 1;
+    if (strcmp(q_str, "lowest") == 0) return 0;
+    return -1;  // 不设置
+}
+
+static int get_profile(const char *p_str) {
+    if (strcmp(p_str, "high") == 0) return 100;
+    if (strcmp(p_str, "main") == 0) return 77;
+    if (strcmp(p_str, "baseline") == 0) return 66;
+    return 0;  // default main
+}
+
+static int get_gop_mode(const char *g_str) {
+    if (strcmp(g_str, "smartP") == 0) return VENC_GOPMODE_SMARTP;
+    return VENC_GOPMODE_NORMALP;
+}
+
+static int get_mirror(const char *m_str) {
+    if (strcmp(m_str, "horizontal") == 0) return MIRROR_HORIZONTAL;
+    if (strcmp(m_str, "vertical") == 0) return MIRROR_VERTICAL;
+    if (strcmp(m_str, "both") == 0) return MIRROR_HORIZONTAL | MIRROR_VERTICAL;
+    return MIRROR_NONE;
+}
+
+static int venc_init_single(int chn_id, int width, int height,
+                             int fps, int bitrate_kbps, int gop,
+                             int codec, int rc_mode, int rc_quality,
+                             int profile, int gop_mode, int mirror,
+                             int smartp_viridrlen, int stream_buf_cnt) {
     VENC_CHN_ATTR_S stAttr;
-    memset(&stAttr, 0, sizeof(VENC_CHN_ATTR_S));
+    VENC_RC_ATTR_S *pRcAttr;
+    memset(&stAttr, 0, sizeof(stAttr));
 
-    // H.265 CBR
-    stAttr.stRcAttr.enRcMode = VENC_RC_MODE_H265CBR;
-    stAttr.stRcAttr.stH265Cbr.u32BitRate = bitrate_kbps;
-    stAttr.stRcAttr.stH265Cbr.u32Gop = fps * 2;  // 2秒一个GOP
-
-    stAttr.stVencAttr.enType = RK_VIDEO_ID_HEVC;
+    // 编码器类型
+    stAttr.stVencAttr.enType = codec;
     stAttr.stVencAttr.enPixelFormat = RK_FMT_YUV420SP;
-    stAttr.stVencAttr.u32Profile = 0;  // Main Profile
     stAttr.stVencAttr.u32PicWidth = width;
     stAttr.stVencAttr.u32PicHeight = height;
     stAttr.stVencAttr.u32VirWidth = width;
     stAttr.stVencAttr.u32VirHeight = height;
-    stAttr.stVencAttr.u32StreamBufCnt = 2;
+    stAttr.stVencAttr.u32Profile = profile;
+    stAttr.stVencAttr.u32StreamBufCnt = stream_buf_cnt;
     stAttr.stVencAttr.u32BufSize = width * height * 3 / 2;
-    stAttr.stVencAttr.enMirror = MIRROR_NONE;
+    stAttr.stVencAttr.enMirror = mirror;
 
-    int ret = RK_MPI_VENC_CreateChn(VENC_CHN_ID, &stAttr);
+    // 码率控制
+    pRcAttr = &stAttr.stRcAttr;
+    pRcAttr->enRcMode = rc_mode;
+
+    // 设置码率和 GOP (根据编码类型设置对应 union 字段)
+    if (codec == RK_VIDEO_ID_AVC) {
+        pRcAttr->stH264Cbr.u32BitRate = bitrate_kbps;
+        pRcAttr->stH264Cbr.u32Gop = gop;
+    } else {
+        pRcAttr->stH265Cbr.u32BitRate = bitrate_kbps;
+        pRcAttr->stH265Cbr.u32Gop = gop;
+    }
+
+    // GOP 属性
+    stAttr.stGopAttr.enGopMode = gop_mode;
+    stAttr.stGopAttr.s32VirIdrLen = smartp_viridrlen;
+
+    int ret = RK_MPI_VENC_CreateChn(chn_id, &stAttr);
     if (ret != RK_SUCCESS) return ret;
 
     VENC_RECV_PIC_PARAM_S stRecvParam;
     memset(&stRecvParam, 0, sizeof(stRecvParam));
     stRecvParam.s32RecvPicNum = -1;
-    ret = RK_MPI_VENC_StartRecvFrame(VENC_CHN_ID, &stRecvParam);
+    ret = RK_MPI_VENC_StartRecvFrame(chn_id, &stRecvParam);
     return ret;
 }
 
-// ---- 公开 API (Rust FFI 调用) ----
+// ---- VENC 取流线程 (每个通道一个) ----
 
-// 初始化摄像头 (VI + VENC + 绑定 + 取流线程)
-// 返回 0 成功, 非0 失败
-int rk_camera_init(int width, int height, int fps, int bitrate_kbps) {
-    if (g_initialized) return 0;
-    int ret;
+static int is_keyframe_h265(int nal_type) {
+    // H265E_NALU_IDRSLICE = 19, H265E_NALU_IDRSLICE_RADL = 20
+    return (nal_type == 19 || nal_type == 20);
+}
 
-    printf("[rk_camera] init %dx%d @%dfps, bitrate=%dkbps\n",
-           width, height, fps, bitrate_kbps);
+static int is_keyframe_h264(int nal_type) {
+    // H264E_NALU_IDRSLICE = 5
+    return (nal_type == 5);
+}
 
-    // 确保 MPP 系统已初始化 (与 rk_audio_init 共享, 引用计数)
-    if (ensure_sys_init() != 0) {
-        return -1;
+static void *get_stream_thread(void *arg) {
+    int chn_id = (int)(intptr_t)arg;
+    VENC_STREAM_S stFrame;
+    stFrame.pstPack = (VENC_PACK_S *)malloc(sizeof(VENC_PACK_S));
+    int loopCount = 0;
+
+    printf("[rk_camera] stream thread[%d] started\n", chn_id);
+
+    while (!g_quit) {
+        int ret = RK_MPI_VENC_GetStream(chn_id, &stFrame, -1);
+        if (ret == RK_SUCCESS) {
+            void *pData = RK_MPI_MB_Handle2VirAddr(stFrame.pstPack->pMbBlk);
+            uint32_t u32Len = stFrame.pstPack->u32Len;
+            uint64_t u64PTS = stFrame.pstPack->u64PTS;
+
+            int is_kf = 0;
+            if (g_chn_attr[chn_id].codec == RK_VIDEO_ID_HEVC) {
+                is_kf = is_keyframe_h265(stFrame.pstPack->DataType.enH265EType);
+            } else {
+                is_kf = is_keyframe_h264(stFrame.pstPack->DataType.enH264EType);
+            }
+
+            if (g_callback && pData && u32Len > 0) {
+                g_callback(chn_id, (const uint8_t *)pData, u32Len, u64PTS, is_kf);
+            }
+
+            if (loopCount == 0) {
+                printf("[rk_camera] first frame[%d]: len=%u pts=%llu keyframe=%d\n",
+                       chn_id, u32Len, (unsigned long long)u64PTS, is_kf);
+            }
+            loopCount++;
+
+            RK_MPI_VENC_ReleaseStream(chn_id, &stFrame);
+        } else {
+            usleep(10 * 1000);
+        }
     }
 
-    // ISP 初始化 (必须在 VI 之前, 否则传感器无数据)
-    isp_init();
+    printf("[rk_camera] stream thread[%d] exit, total frames=%d\n", chn_id, loopCount);
+    free(stFrame.pstPack);
+    return NULL;
+}
 
-    ret = vi_dev_init();
-    if (ret != 0) {
-        printf("[rk_camera] vi_dev_init failed: %d\n", ret);
-        return -1;
-    }
+// ---- 绑定管线: VI → VPSS → 3× VENC ----
 
-    ret = vi_chn_init(width, height);
-    if (ret != 0) {
-        printf("[rk_camera] vi_chn_init failed: %d\n", ret);
-        return -1;
-    }
-
-    ret = venc_init(width, height, fps, bitrate_kbps);
-    if (ret != 0) {
-        printf("[rk_camera] venc_init failed: %x\n", ret);
-        return -1;
-    }
-
-    // 绑定 VI → VENC
+static int bind_vi_to_vpss() {
     MPP_CHN_S stSrcChn, stDestChn;
     stSrcChn.enModId = RK_ID_VI;
     stSrcChn.s32DevId = VI_DEV_ID;
     stSrcChn.s32ChnId = VI_CHN_ID;
+    stDestChn.enModId = RK_ID_VPSS;
+    stDestChn.s32DevId = VPSS_GRP_ID;
+    stDestChn.s32ChnId = 0;  // VPSS group 绑定用 devId=grp, chnId=0
+    return RK_MPI_SYS_Bind(&stSrcChn, &stDestChn);
+}
+
+static int bind_vpss_to_venc(int vpss_chn, int venc_chn) {
+    MPP_CHN_S stSrcChn, stDestChn;
+    stSrcChn.enModId = RK_ID_VPSS;
+    stSrcChn.s32DevId = VPSS_GRP_ID;
+    stSrcChn.s32ChnId = vpss_chn;
     stDestChn.enModId = RK_ID_VENC;
     stDestChn.s32DevId = 0;
-    stDestChn.s32ChnId = VENC_CHN_ID;
+    stDestChn.s32ChnId = venc_chn;
+    return RK_MPI_SYS_Bind(&stSrcChn, &stDestChn);
+}
 
-    ret = RK_MPI_SYS_Bind(&stSrcChn, &stDestChn);
+// ---- 公开 API ----
+
+// rk_camera_init: 三码流模式初始化
+// 参数 main_w/h 仅用于 VI 捕获分辨率 (必须 >= 所有码流的最大分辨率)
+// 每个码流的具体参数通过 rk_camera_set_chn_config 提前设置
+int rk_camera_init(int main_w, int main_h, int fps, int bitrate) {
+    if (g_initialized) return 0;
+
+    printf("[rk_camera] init: VI=%dx%d @%dfps\n", main_w, main_h, fps);
+
+    if (ensure_sys_init() != 0) return -1;
+
+    isp_init();
+
+    // 1. VI 初始化 (捕获主码流分辨率)
+    int ret = vi_dev_init();
+    if (ret != 0) { printf("[rk_camera] vi_dev_init failed\n"); return -1; }
+    ret = vi_chn_init(main_w, main_h);
+    if (ret != 0) { printf("[rk_camera] vi_chn_init failed\n"); return -1; }
+
+    // 2. VPSS 初始化 — 从 g_chn_attr 读取每通道的分辨率
+    {
+        int sub_w = g_chn_enabled[VENC_CHN_SUB] ? g_chn_attr[VENC_CHN_SUB].width : 704;
+        int sub_h = g_chn_enabled[VENC_CHN_SUB] ? g_chn_attr[VENC_CHN_SUB].height : 576;
+        int third_w = g_chn_enabled[VENC_CHN_THIRD] ? g_chn_attr[VENC_CHN_THIRD].width : 960;
+        int third_h = g_chn_enabled[VENC_CHN_THIRD] ? g_chn_attr[VENC_CHN_THIRD].height : 540;
+
+        printf("[rk_camera] VPSS: main=%dx%d sub=%dx%d third=%dx%d\n",
+               main_w, main_h, sub_w, sub_h, third_w, third_h);
+
+        ret = vpss_init(main_w, main_h, sub_w, sub_h, third_w, third_h, 25, 1);
+        if (ret != 0) { printf("[rk_camera] vpss_init failed\n"); return -1; }
+    }
+
+    // 3. 绑定 VI → VPSS
+    ret = bind_vi_to_vpss();
     if (ret != RK_SUCCESS) {
-        printf("[rk_camera] RK_MPI_SYS_Bind failed: %x\n", ret);
+        printf("[rk_camera] bind VI->VPSS failed: %x\n", ret);
         return -1;
     }
 
-    // 启动取流线程
-    g_quit = 0;
-    ret = pthread_create(&g_get_stream_thread, NULL, get_stream_thread, NULL);
-    if (ret != 0) return -1;
+    // 4. 初始化已启用的 VENC 通道并绑定 (从 g_chn_attr 读取全部参数)
+    int venc_chns[] = {VENC_CHN_MAIN, VENC_CHN_SUB, VENC_CHN_THIRD};
+    int vpss_chns[] = {VPSS_CHN_MAIN, VPSS_CHN_SUB, VPSS_CHN_THIRD};
+    const char *names[] = {"main", "sub", "third"};
+
+    for (int i = 0; i < VENC_MAX_CHN; i++) {
+        if (!g_chn_enabled[i]) {
+            printf("[rk_camera] %s stream disabled\n", names[i]);
+            continue;
+        }
+
+        ChnEncAttr *a = &g_chn_attr[i];
+        int ch_fps  = a->dst_fps_den > 0 ? a->dst_fps_num / a->dst_fps_den : 25;
+        int ch_gop  = a->gop > 0 ? a->gop : ch_fps * 2;
+        int ch_br   = a->bitrate_kbps > 0 ? a->bitrate_kbps : bitrate;
+
+        printf("[rk_camera] %s stream: VENC_chn=%d %dx%d @%dfps %dkbps gop=%d\n",
+               names[i], venc_chns[i], a->width, a->height,
+               ch_fps, ch_br, ch_gop);
+
+        ret = venc_init_single(
+            venc_chns[i],
+            a->width, a->height,
+            ch_fps, ch_br, ch_gop,
+            a->codec ? a->codec : RK_VIDEO_ID_HEVC,
+            a->rc_mode,
+            a->rc_quality,
+            a->profile,
+            a->gop_mode,
+            a->mirror,
+            a->smartp_viridrlen,
+            a->stream_buf_cnt > 0 ? a->stream_buf_cnt : 2
+        );
+        if (ret != RK_SUCCESS) {
+            printf("[rk_camera] venc_init[%s] failed: %x\n", names[i], ret);
+            return -1;
+        }
+
+        // 绑定 VPSS channel → VENC channel
+        ret = bind_vpss_to_venc(vpss_chns[i], venc_chns[i]);
+        if (ret != RK_SUCCESS) {
+            printf("[rk_camera] bind VPSS->VENC[%s] failed: %x\n", names[i], ret);
+            return -1;
+        }
+
+        // 启动取流线程
+        g_quit = 0;
+        ret = pthread_create(&g_stream_threads[i], NULL, get_stream_thread,
+                            (void *)(intptr_t)venc_chns[i]);
+        if (ret != 0) return -1;
+    }
 
     g_initialized = 1;
-    printf("[rk_camera] initialized, stream thread started\n");
+    printf("[rk_camera] initialized, %d stream threads started\n",
+           (g_chn_enabled[0]?1:0) + (g_chn_enabled[1]?1:0) + (g_chn_enabled[2]?1:0));
     return 0;
 }
 
-// 设置帧回调 (在取流线程中调用, 非阻塞)
+// 设置单个编码通道的扩展参数 (在 rk_camera_init 之前调用)
+// chn_id: 0=main, 1=sub, 2=third
+void rk_camera_set_chn_config(int chn_id,
+                               const char *codec,      // "H265" or "H264"
+                               int width, int height,
+                               int src_fps_num, int src_fps_den,
+                               int dst_fps_num, int dst_fps_den,
+                               int bitrate_kbps,
+                               const char *rc_mode,     // "CBR" or "VBR"
+                               const char *rc_quality,  // "highest"..."lowest"
+                               int gop,
+                               const char *gop_mode,    // "normalP" or "smartP"
+                               const char *h264_profile, // "baseline"/"main"/"high"
+                               int smartp_viridrlen,
+                               int stream_buf_cnt,
+                               const char *mirror       // "none"/"horizontal"/"vertical"/"both"
+) {
+    if (chn_id < 0 || chn_id >= VENC_MAX_CHN) return;
+
+    int codec_type = get_codec_type(codec);
+
+    // 存储分辨率/帧率/码率基本参数
+    g_chn_attr[chn_id].width = width;
+    g_chn_attr[chn_id].height = height;
+    g_chn_attr[chn_id].src_fps_num = src_fps_num;
+    g_chn_attr[chn_id].src_fps_den = src_fps_den;
+    g_chn_attr[chn_id].dst_fps_num = dst_fps_num;
+    g_chn_attr[chn_id].dst_fps_den = dst_fps_den;
+    g_chn_attr[chn_id].bitrate_kbps = bitrate_kbps;
+    g_chn_attr[chn_id].gop = gop;
+    // 编码扩展参数
+    g_chn_attr[chn_id].codec = codec_type;
+    g_chn_attr[chn_id].rc_mode = get_rc_mode(rc_mode, codec_type);
+    g_chn_attr[chn_id].rc_quality = get_rc_quality(rc_quality);
+    g_chn_attr[chn_id].profile = (codec_type == RK_VIDEO_ID_AVC)
+                                  ? get_profile(h264_profile) : 0;
+    g_chn_attr[chn_id].gop_mode = get_gop_mode(gop_mode);
+    g_chn_attr[chn_id].mirror = get_mirror(mirror);
+    g_chn_attr[chn_id].smartp_viridrlen = smartp_viridrlen;
+    g_chn_attr[chn_id].stream_buf_cnt = stream_buf_cnt;
+
+    g_chn_enabled[chn_id] = 1;
+
+    printf("[rk_camera] chn[%d] config: %s %dx%d %d/%dfps %dkbps rc=%s q=%s gop=%d gop_mode=%s\n",
+           chn_id, codec, width, height, dst_fps_num, dst_fps_den,
+           bitrate_kbps, rc_mode, rc_quality, gop, gop_mode);
+    if (codec_type == RK_VIDEO_ID_AVC) {
+        printf("[rk_camera] chn[%d] h264_profile=%s\n", chn_id, h264_profile);
+    }
+}
+
+// 设置帧回调
 void rk_camera_set_callback(frame_callback_t cb) {
     g_callback = cb;
 }
 
-// 请求 IDR 关键帧
-int rk_camera_request_idr() {
-    return RK_MPI_VENC_RequestIDR(VENC_CHN_ID, RK_TRUE);
+// 请求特定通道的 IDR 关键帧
+int rk_camera_request_idr(int chn_id) {
+    if (chn_id < 0 || chn_id >= VENC_MAX_CHN) return -1;
+    return RK_MPI_VENC_RequestIDR(chn_id, RK_TRUE);
+}
+
+// 请求所有通道的 IDR (向后兼容)
+int rk_camera_request_idr_all() {
+    int ret = 0;
+    for (int i = 0; i < VENC_MAX_CHN; i++) {
+        if (g_chn_enabled[i]) {
+            ret |= RK_MPI_VENC_RequestIDR(i, RK_TRUE);
+        }
+    }
+    return ret;
 }
 
 // 反初始化
@@ -344,34 +647,72 @@ void rk_camera_deinit() {
     if (!g_initialized) return;
 
     g_quit = 1;
-    pthread_join(g_get_stream_thread, NULL);
+    for (int i = 0; i < VENC_MAX_CHN; i++) {
+        if (g_chn_enabled[i]) {
+            pthread_join(g_stream_threads[i], NULL);
+        }
+    }
 
-    // 解绑
-    MPP_CHN_S stSrcChn, stDestChn;
-    stSrcChn.enModId = RK_ID_VI;
-    stSrcChn.s32DevId = VI_DEV_ID;
-    stSrcChn.s32ChnId = VI_CHN_ID;
-    stDestChn.enModId = RK_ID_VENC;
-    stDestChn.s32DevId = 0;
-    stDestChn.s32ChnId = VENC_CHN_ID;
-    RK_MPI_SYS_UnBind(&stSrcChn, &stDestChn);
+    // 解绑: VENC ← VPSS ← VI
+    for (int i = 0; i < VENC_MAX_CHN; i++) {
+        if (g_chn_enabled[i]) {
+            MPP_CHN_S src, dest;
+            src.enModId = RK_ID_VPSS;
+            src.s32DevId = VPSS_GRP_ID;
+            src.s32ChnId = (i == 0) ? VPSS_CHN_MAIN :
+                           (i == 1) ? VPSS_CHN_SUB : VPSS_CHN_THIRD;
+            dest.enModId = RK_ID_VENC;
+            dest.s32DevId = 0;
+            dest.s32ChnId = i;
+            RK_MPI_SYS_UnBind(&src, &dest);
+        }
+    }
+
+    {
+        MPP_CHN_S src, dest;
+        src.enModId = RK_ID_VI;
+        src.s32DevId = VI_DEV_ID;
+        src.s32ChnId = VI_CHN_ID;
+        dest.enModId = RK_ID_VPSS;
+        dest.s32DevId = VPSS_GRP_ID;
+        dest.s32ChnId = 0;
+        RK_MPI_SYS_UnBind(&src, &dest);
+    }
+
+    for (int i = 0; i < VENC_MAX_CHN; i++) {
+        if (g_chn_enabled[i]) {
+            RK_MPI_VENC_StopRecvFrame(i);
+            RK_MPI_VENC_DestroyChn(i);
+        }
+    }
+
+    // 停止 VPSS
+    for (int i = 0; i < VENC_MAX_CHN; i++) {
+        if (g_chn_enabled[i]) {
+            RK_MPI_VPSS_DisableChn(VPSS_GRP_ID,
+                (i == 0) ? VPSS_CHN_MAIN : (i == 1) ? VPSS_CHN_SUB : VPSS_CHN_THIRD);
+        }
+    }
+    RK_MPI_VPSS_StopGrp(VPSS_GRP_ID);
+    RK_MPI_VPSS_DestroyGrp(VPSS_GRP_ID);
 
     RK_MPI_VI_DisableChn(VI_DEV_ID, VI_CHN_ID);
-    RK_MPI_VENC_StopRecvFrame(VENC_CHN_ID);
-    RK_MPI_VENC_DestroyChn(VENC_CHN_ID);
     RK_MPI_VI_DisableDev(VI_DEV_ID);
 
-    // ISP 反初始化 (在 VI 销毁之后)
     isp_deinit();
-
-    // 释放 MPP 系统引用 (与 rk_audio_deinit 共享, 引用计数归零时才真正 Exit)
     maybe_sys_exit();
+
+    // 重置状态
+    for (int i = 0; i < VENC_MAX_CHN; i++) {
+        g_chn_enabled[i] = 0;
+        memset(&g_chn_attr[i], 0, sizeof(ChnEncAttr));
+    }
 
     g_initialized = 0;
     printf("[rk_camera] deinitialized\n");
 }
 
-// ============== 音频采集 (AI) ==============
+// ============== 音频采集 (AI) — 与 v1 相同 ==============
 
 #define AI_DEV_ID   0
 #define AI_CHN_ID   0
@@ -380,11 +721,9 @@ static pthread_t g_audio_thread;
 static volatile int g_audio_quit = 0;
 static volatile int g_audio_initialized = 0;
 
-// 音频帧回调: fn(data, len, pts_us)
 typedef void (*audio_callback_t)(const uint8_t *data, uint32_t len, uint64_t pts_us);
 static audio_callback_t g_audio_callback = NULL;
 
-// 音频取流线程
 static void *audio_get_stream_thread(void *arg) {
     (void)arg;
     AUDIO_FRAME_S frame;
@@ -417,20 +756,12 @@ static void *audio_get_stream_thread(void *arg) {
     return NULL;
 }
 
-// 初始化音频采集 (AI)
-// sample_rate: 8000/16000/48000
-// 返回 0 成功
 int rk_audio_init(int sample_rate) {
     if (g_audio_initialized) return 0;
 
     printf("[rk_camera] audio init: %dHz\n", sample_rate);
 
-    // 确保 MPP 系统已初始化 (与 rk_camera_init 共享, 引用计数)
-    // 修复: 视频源 spawn 是延迟的 (等第一个 viewer 连接), 但音频 spawn 立即执行,
-    //       如果不调用 ensure_sys_init, RK_MPI_AI_* 会因 MPP 系统未初始化而段错误
-    if (ensure_sys_init() != 0) {
-        return -1;
-    }
+    if (ensure_sys_init() != 0) return -1;
 
     AIO_ATTR_S aiAttr;
     AI_CHN_PARAM_S pstParams;
@@ -444,7 +775,7 @@ int rk_audio_init(int sample_rate) {
     aiAttr.enBitwidth = AUDIO_BIT_WIDTH_16;
     aiAttr.enSamplerate = (AUDIO_SAMPLE_RATE_E)sample_rate;
     aiAttr.enSoundmode = AUDIO_SOUND_MODE_MONO;
-    aiAttr.u32PtNumPerFrm = 1024;  // 每帧采样点数 (约 64ms @16kHz)
+    aiAttr.u32PtNumPerFrm = 1024;
     aiAttr.u32FrmNum = 4;
     aiAttr.u32EXFlag = 0;
     aiAttr.u32ChnCnt = 2;
@@ -475,7 +806,6 @@ int rk_audio_init(int sample_rate) {
         return -1;
     }
 
-    // 启动音频取流线程
     g_audio_quit = 0;
     ret = pthread_create(&g_audio_thread, NULL, audio_get_stream_thread, NULL);
     if (ret != 0) return -1;
@@ -485,12 +815,10 @@ int rk_audio_init(int sample_rate) {
     return 0;
 }
 
-// 设置音频回调
 void rk_audio_set_callback(audio_callback_t cb) {
     g_audio_callback = cb;
 }
 
-// 音频反初始化
 void rk_audio_deinit() {
     if (!g_audio_initialized) return;
 
@@ -500,7 +828,6 @@ void rk_audio_deinit() {
     RK_MPI_AI_DisableChn(AI_DEV_ID, AI_CHN_ID);
     RK_MPI_AI_Disable(AI_DEV_ID);
 
-    // 释放 MPP 系统引用 (与 rk_camera_deinit 共享, 引用计数归零时才真正 Exit)
     maybe_sys_exit();
 
     g_audio_initialized = 0;
@@ -508,8 +835,6 @@ void rk_audio_deinit() {
 }
 
 // ---- Stubs for glibc functions missing in uclibc ----
-// getauxval: 读取 ELF auxiliary vector, Rust std + ring crate 用于 CPU 特性检测
-// uclibc 没有此函数, 返回 0 表示未知 (ring 会回退到软件实现)
 unsigned long getauxval(unsigned long type) {
     (void)type;
     return 0;

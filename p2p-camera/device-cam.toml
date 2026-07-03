@@ -1,0 +1,103 @@
+# P2P-Camera DeviceCam 配置文件
+# 修改后重启 device-cam 生效
+# 优先级: 命令行参数 > 配置文件 > 默认值
+
+# ============ 网络连接 ============
+
+# Relay Server 地址列表 (支持多个 Relay，并发拨号)
+# 格式: /ip4/<ip>/tcp/<port>/p2p/<PeerId> 或 /ip4/<ip>/udp/<port>/quic-v1/p2p/<PeerId>
+relays = []
+# 旧格式 (向后兼容，和 relays 同时存在时 relays 优先)
+relay = ""
+
+# mDNS 局域网发现 (默认开启，同局域网 viewer 优先直连)
+enable_mdns = true
+
+# 运行模式 (listen: 等待 viewer 连接)
+mode = "listen"
+
+# 身份密钥文件 (持久化 PeerId，首次运行自动生成)
+key_file = "device-cam.key"
+
+# QUIC UDP 监听端口 (0=随机, 非0=固定端口便于端口映射)
+# udp_port = 9090
+
+# 是否启用音频采集
+enable_audio = false
+
+# ============ 视频源 (文件模式，非 rv1106) ============
+
+# video_file = "test.h265"
+
+# ============ 视频编码: 三码流配置 (rv1106 模式) ============
+# 管线: VI(sensor) -> VPSS(缩放) -> VENC0(主码流) + VENC1(子码流) + VENC2(第三码流)
+# 码流类型: main = 主码流(高清), sub = 子码流(标清), third = 第三码流(中清)
+
+[video.main]
+enabled = true
+# 编码格式: "H265" 或 "H264"
+codec = "H265"
+# 分辨率 (宽 x 高)
+width = 2304
+height = 1296
+# 帧率: fps = src_frame_rate_num / src_frame_rate_den
+src_frame_rate_num = 25
+src_frame_rate_den = 1
+dst_frame_rate_num = 25
+dst_frame_rate_den = 1
+# 码率控制: "CBR" 或 "VBR"
+rc_mode = "CBR"
+# RC 质量等级: "highest" | "higher" | "high" | "medium" | "low" | "lower" | "lowest"
+rc_quality = "high"
+# 最大码率 (kbps)
+bitrate_kbps = 2048
+# GOP (I帧间隔，秒数×帧率)
+gop = 50
+# GOP 模式: "normalP" 或 "smartP"
+gop_mode = "normalP"
+# SmartP 虚拟 I 帧间隔
+smartp_viridrlen = 25
+# H.264 Profile (仅 H264 时生效): "baseline" | "main" | "high"
+h264_profile = "high"
+# 码流缓冲 (帧数)
+stream_buf_cnt = 2
+# 画面镜像: "none" | "horizontal" | "vertical" | "both"
+mirror = "none"
+
+[video.sub]
+enabled = true
+codec = "H265"
+width = 704
+height = 576
+src_frame_rate_num = 30
+src_frame_rate_den = 1
+dst_frame_rate_num = 30
+dst_frame_rate_den = 1
+rc_mode = "CBR"
+rc_quality = "high"
+bitrate_kbps = 512
+gop = 50
+gop_mode = "normalP"
+smartp_viridrlen = 25
+h264_profile = "high"
+stream_buf_cnt = 2
+mirror = "none"
+
+[video.third]
+enabled = true
+codec = "H265"
+width = 960
+height = 540
+src_frame_rate_num = 25
+src_frame_rate_den = 1
+dst_frame_rate_num = 25
+dst_frame_rate_den = 1
+rc_mode = "CBR"
+rc_quality = "high"
+bitrate_kbps = 1024
+gop = 50
+gop_mode = "normalP"
+smartp_viridrlen = 25
+h264_profile = "high"
+stream_buf_cnt = 2
+mirror = "none"

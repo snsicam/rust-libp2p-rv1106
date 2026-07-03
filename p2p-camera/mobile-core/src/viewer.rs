@@ -17,7 +17,7 @@ use libp2p::{
     core::multiaddr::{Multiaddr, Protocol},
     dcutr, identify, mdns, noise, ping, relay,
     swarm::{NetworkBehaviour, SwarmEvent},
-    tcp, Swarm, PeerId,
+    tcp, StreamProtocol, Swarm, PeerId,
 };
 use libp2p_stream::{self, Control};
 use proto::{
@@ -31,6 +31,15 @@ use crate::net_diag::{ConnectionQuality, ConnectionType, NatDiagnostic, NatDiagn
 
 const STREAM_READ_BUF: usize = 65536; // 64KB
 const MDNS_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 将 stream 名称映射到对应的协议
+fn get_video_protocol(stream_type: &str) -> StreamProtocol {
+    match stream_type {
+        "sub" => stream_protocols::VIDEO_SUB_PROTOCOL,
+        "third" => stream_protocols::VIDEO_THIRD_PROTOCOL,
+        _ => stream_protocols::VIDEO_MAIN_PROTOCOL,
+    }
+}
 
 /// P2P Viewer — 对外暴露的核心结构
 pub struct P2pViewer {
@@ -100,11 +109,13 @@ impl P2pViewer {
     /// - 如果 enable_mdns，并行监听 mDNS 发现事件
     /// - mDNS 发现目标 DeviceCam 时，优先使用 LAN 直连
     /// - mDNS 5 秒超时后回退到 Relay circuit
+    /// - stream_type: "main" | "sub" | "third" 选择请求哪个码流
     pub async fn connect(
         &mut self,
         relay_addrs: &[String],
         device_cam_peer_id: &str,
         enable_mdns: bool,
+        stream_type: &str,
     ) -> Result<()> {
         let device_cam: PeerId = device_cam_peer_id.parse()?;
         self.device_cam_peer_id = Some(device_cam);
@@ -223,9 +234,10 @@ impl P2pViewer {
             anyhow::bail!("Failed to connect: no relay connection and no mDNS discovery");
         }
 
-        // 打开视频 stream
+        // 打开视频 stream (选择码流类型)
+        let video_protocol = get_video_protocol(stream_type);
         let video_stream = self.stream_control
-            .open_stream(device_cam, stream_protocols::VIDEO_PROTOCOL)
+            .open_stream(device_cam, video_protocol)
             .await
             .context("Failed to open video stream")?;
 

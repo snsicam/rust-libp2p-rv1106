@@ -38,7 +38,7 @@ use libp2p::{
     core::multiaddr::{Multiaddr, Protocol},
     dcutr, identify, mdns, noise, ping, relay,
     swarm::{NetworkBehaviour, SwarmEvent},
-    tcp, PeerId,
+    tcp, StreamProtocol, PeerId,
 };
 use libp2p_stream;
 use mobile_core::net_diag::{NatDiagnostic, NatType};
@@ -50,6 +50,16 @@ use tracing_subscriber::EnvFilter;
 const STREAM_READ_BUF: usize = 65536;
 const RECONNECT_DELAY: Duration = Duration::from_secs(3);
 const MDNS_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 将 stream 名称映射到对应的协议
+fn get_video_protocol(stream_type: &str) -> StreamProtocol {
+    match stream_type {
+        "sub" => stream_protocols::VIDEO_SUB_PROTOCOL,
+        "third" => stream_protocols::VIDEO_THIRD_PROTOCOL,
+        // "main" or anything else defaults to main (also backward compat with legacy)
+        _ => stream_protocols::VIDEO_MAIN_PROTOCOL,
+    }
+}
 
 // SDL2 要求事件循环在主线程, 使用 current_thread runtime
 #[cfg_attr(feature = "player", tokio::main(flavor = "current_thread"))]
@@ -78,6 +88,8 @@ async fn main() -> Result<()> {
     if opt.play { cfg.play = true; }
     if let Some(udp_port) = opt.udp_port { cfg.udp_port = Some(udp_port); }
     if let Some(enable_mdns) = opt.enable_mdns { cfg.enable_mdns = enable_mdns; }
+    // stream CLI arg always overrides config
+    if opt.stream != "main" { cfg.stream = opt.stream.clone(); }
 
     // 解析 relays (兼容旧格式 relay 字段)
     cfg.resolve_relays();
@@ -154,6 +166,7 @@ async fn main() -> Result<()> {
     let no_audio = cfg.no_audio;
     let udp_port = cfg.udp_port;
     let enable_mdns = cfg.enable_mdns;
+    let stream_type = cfg.stream.clone();
 
     let mut frame_count: u64 = 0;
     let mut bytes_received: u64 = 0;
@@ -171,6 +184,7 @@ async fn main() -> Result<()> {
         no_audio,
         udp_port,
         enable_mdns,
+        stream_type.clone(),
         tx.clone(),
         audio_tx.clone(),
         session_tx.clone(),
@@ -205,6 +219,7 @@ async fn main() -> Result<()> {
                             no_audio,
                             udp_port,
                             enable_mdns,
+                            stream_type.clone(),
                             tx.clone(),
                             audio_tx.clone(),
                             session_tx.clone(),
@@ -307,6 +322,7 @@ fn spawn_session(
     no_audio: bool,
     udp_port: Option<u16>,
     enable_mdns: bool,
+    stream_type: String,
     video_tx: mpsc::Sender<MediaPacket>,
     audio_tx: mpsc::Sender<MediaPacket>,
     event_tx: mpsc::Sender<SessionEvent>,
@@ -318,6 +334,7 @@ fn spawn_session(
             no_audio,
             udp_port,
             enable_mdns,
+            stream_type,
             video_tx,
             audio_tx,
             event_tx.clone(),
@@ -386,6 +403,7 @@ async fn run_viewer_session(
     no_audio: bool,
     udp_port: Option<u16>,
     enable_mdns: bool,
+    stream_type: String,
     video_tx: mpsc::Sender<MediaPacket>,
     audio_tx: mpsc::Sender<MediaPacket>,
     event_tx: mpsc::Sender<SessionEvent>,
@@ -607,11 +625,12 @@ async fn run_viewer_session(
 
     // ---- 3. 打开 video stream ----
     let mut stream_control = swarm.behaviour().stream.new_control();
+    let video_protocol = get_video_protocol(&stream_type);
     let video_stream = stream_control
-        .open_stream(device_cam, stream_protocols::VIDEO_PROTOCOL)
+        .open_stream(device_cam, video_protocol)
         .await
         .context("Failed to open video stream")?;
-    println!("[Viewer] Video stream opened");
+    println!("[Viewer] Video stream opened (stream={})", stream_type);
 
     // ---- 3b. 打开 audio stream (可选) ----
     let mut audio_abort_handle: Option<tokio::task::AbortHandle> = None;
@@ -674,7 +693,8 @@ async fn run_viewer_session(
                 });
                 let via = if is_lan { "LAN direct" } else { "DCUtR hole punch" };
                 println!("[Viewer] Direct connection established with {device_cam} via {via}, upgrading streams...");
-                match stream_control.open_stream(device_cam, stream_protocols::VIDEO_PROTOCOL).await {
+                let video_protocol2 = get_video_protocol(&stream_type);
+                match stream_control.open_stream(device_cam, video_protocol2).await {
                     Ok(new_stream) => {
                         if let Some(h) = video_abort_handle.take() { h.abort(); }
                         let handle = tokio::spawn(receive_frames(device_cam, new_stream, video_tx.clone())).abort_handle();
@@ -1367,6 +1387,10 @@ struct Opt {
     #[arg(long, default_value = "viewer.toml")]
     config: PathBuf,
 
+    /// 视频流类型 (覆盖配置文件): main, sub, third (默认 main)
+    #[arg(long, default_value = "main")]
+    stream: String,
+
     /// Relay Server 地址 (可多次使用, 覆盖配置文件)
     #[arg(long = "relay")]
     relays: Vec<String>,
@@ -1413,6 +1437,9 @@ struct ViewerConfig {
     #[serde(default = "default_enable_mdns")]
     enable_mdns: bool,
     camera: String,
+    /// 视频流类型: "main" | "sub" | "third" (默认 main)
+    #[serde(default = "default_stream")]
+    stream: String,
     #[serde(default)]
     output: Option<PathBuf>,
     #[serde(default)]
@@ -1423,6 +1450,8 @@ struct ViewerConfig {
     udp_port: Option<u16>,
 }
 
+fn default_stream() -> String { "main".to_string() }
+
 impl Default for ViewerConfig {
     fn default() -> Self {
         Self {
@@ -1430,6 +1459,7 @@ impl Default for ViewerConfig {
             relay: String::new(),
             enable_mdns: default_enable_mdns(),
             camera: String::new(),
+            stream: default_stream(),
             output: None,
             no_audio: false,
             play: false,
