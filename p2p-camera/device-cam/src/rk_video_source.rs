@@ -13,7 +13,7 @@
 use bytes::Bytes;
 use crossbeam_channel::Sender;
 use proto::media_packet::MediaPacket;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Mutex;
 use std::thread;
 use std::time::Instant;
@@ -48,7 +48,18 @@ extern "C" {
     fn rk_camera_request_idr_all() -> std::ffi::c_int;
     fn rk_camera_deinit();
 
-    fn rk_audio_init(sample_rate: std::ffi::c_int) -> std::ffi::c_int;
+    fn rk_audio_init(
+        sample_rate: std::ffi::c_int,
+        card_name: *const std::ffi::c_char,
+        channels: std::ffi::c_int,
+        frame_size: std::ffi::c_int,
+        volume: std::ffi::c_int,
+        encode_type: *const std::ffi::c_char,
+        format: *const std::ffi::c_char,
+        bit_rate: std::ffi::c_int,
+        enable_vqe: std::ffi::c_int,
+        vqe_cfg: *const std::ffi::c_char,
+    ) -> std::ffi::c_int;
     fn rk_audio_set_callback(cb: AudioCallback);
     fn rk_audio_deinit();
 }
@@ -385,10 +396,12 @@ impl Drop for RkVideoSource {
     }
 }
 
-// ============== 音频源 (不变) ==============
+// ============== 音频源 (AI + [AENC 编码]) ==============
 
 static GLOBAL_AUDIO_SENDER: Mutex<Option<Sender<MediaPacket>>> = Mutex::new(None);
 static GLOBAL_AUDIO_START_TIME: Mutex<Option<Instant>> = Mutex::new(None);
+/// Audio flags for MediaPacket: 0=PCM16LE, 2=G711A, 3=G711U
+static GLOBAL_AUDIO_FLAGS: AtomicU8 = AtomicU8::new(0);
 
 extern "C" fn on_audio_frame(data: *const u8, len: u32, _pts_us: u64) {
     let slice = unsafe { std::slice::from_raw_parts(data, len as usize) };
@@ -398,7 +411,13 @@ extern "C" fn on_audio_frame(data: *const u8, len: u32, _pts_us: u64) {
         .and_then(|t| t.as_ref().map(|s| s.elapsed().as_millis() as u64))
         .unwrap_or(0);
 
-    let packet = MediaPacket::audio_pcm(timestamp_ms, Bytes::copy_from_slice(slice));
+    let flags = GLOBAL_AUDIO_FLAGS.load(Ordering::Relaxed);
+    let packet = MediaPacket {
+        track: proto::media_packet::MediaTrack::Audio,
+        timestamp_ms,
+        flags,
+        data: Bytes::copy_from_slice(slice),
+    };
 
     if let Ok(sender) = GLOBAL_AUDIO_SENDER.lock() {
         if let Some(tx) = sender.as_ref() {
@@ -409,17 +428,61 @@ extern "C" fn on_audio_frame(data: *const u8, len: u32, _pts_us: u64) {
 
 pub struct RkAudioSource {
     sample_rate: u32,
+    card_name: String,
+    channels: u32,
+    frame_size: u32,
+    volume: u32,
+    format: String,
+    encode_type: String,
+    bit_rate: u32,
+    enable_vqe: bool,
+    vqe_cfg: String,
 }
 
 impl RkAudioSource {
-    pub fn new(sample_rate: u32) -> Self {
-        Self { sample_rate }
+    pub fn new(
+        sample_rate: u32, card_name: String, channels: u32, frame_size: u32, volume: u32,
+        format: String, encode_type: String, bit_rate: u32,
+        enable_vqe: bool, vqe_cfg: String,
+    ) -> Self {
+        Self {
+            sample_rate, card_name, channels, frame_size, volume,
+            format, encode_type, bit_rate, enable_vqe, vqe_cfg,
+        }
+    }
+
+    /// 返回编码类型对应的 MediaPacket flags 值
+    fn audio_flags(encode_type: &str) -> u8 {
+        match encode_type {
+            "G711A" => 2,
+            "G711U" => 3,
+            _ => 0, // PCM16LE
+        }
     }
 
     pub fn spawn(self, sender: Sender<MediaPacket>) -> thread::JoinHandle<()> {
-        let sample_rate = self.sample_rate;
-
         thread::spawn(move || {
+            let card_name_c = std::ffi::CString::new(self.card_name.as_str())
+                .expect("card_name must not contain null bytes");
+            let encode_type_c = std::ffi::CString::new(self.encode_type.as_str())
+                .expect("encode_type must not contain null bytes");
+            let format_c = std::ffi::CString::new(self.format.as_str())
+                .expect("format must not contain null bytes");
+            let vqe_cfg_c = std::ffi::CString::new(self.vqe_cfg.as_str())
+                .expect("vqe_cfg must not contain null bytes");
+
+            let sample_rate = self.sample_rate;
+            let channels = self.channels as i32;
+            let frame_size = self.frame_size as i32;
+            let _volume = self.volume as i32;
+            let bit_rate = self.bit_rate as i32;
+            let enable_vqe = self.enable_vqe as i32;
+            let encode_type_str = self.encode_type.clone();
+
+            // Set global audio flags before any callback fires
+            let flags = Self::audio_flags(&encode_type_str);
+            GLOBAL_AUDIO_FLAGS.store(flags, Ordering::Relaxed);
+
             {
                 let mut guard = GLOBAL_AUDIO_SENDER.lock().unwrap();
                 *guard = Some(sender);
@@ -429,14 +492,28 @@ impl RkAudioSource {
                 *guard = Some(Instant::now());
             }
 
-            let ret = unsafe { rk_audio_init(sample_rate as i32) };
+            let ret = unsafe {
+                rk_audio_init(
+                    sample_rate as i32,
+                    card_name_c.as_ptr(),
+                    channels,
+                    frame_size,
+                    _volume,
+                    encode_type_c.as_ptr(),
+                    format_c.as_ptr(),
+                    bit_rate,
+                    enable_vqe,
+                    vqe_cfg_c.as_ptr(),
+                )
+            };
             if ret != 0 {
                 eprintln!("[RkAudioSource] rk_audio_init failed: {}", ret);
                 return;
             }
 
             unsafe { rk_audio_set_callback(on_audio_frame); }
-            println!("[RkAudioSource] Audio started ({}Hz)", sample_rate);
+            println!("[RkAudioSource] Audio started: {}Hz {}ch {}samples/frame encode={}",
+                sample_rate, channels, frame_size, encode_type_str);
 
             loop {
                 let should_stop = GLOBAL_AUDIO_SENDER.lock()

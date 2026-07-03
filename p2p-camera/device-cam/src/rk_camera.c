@@ -22,6 +22,7 @@
 #include "rk_mpi_vpss.h"
 #include "rk_mpi_mb.h"
 #include "rk_mpi_ai.h"
+#include "rk_mpi_aenc.h"
 #include "rk_common.h"
 #include "rk_comm_video.h"
 #include "rk_comm_venc.h"
@@ -712,24 +713,35 @@ void rk_camera_deinit() {
     printf("[rk_camera] deinitialized\n");
 }
 
-// ============== 音频采集 (AI) — 与 v1 相同 ==============
+// ============== 音频采集 (AI) + 编码 (AENC) ==============
+//
+// 管线:
+//   PCM 模式:   AI → raw PCM → callback → MediaPacket(audio_pcm)
+//   编码模式:   AI → bind → AENC → encoded stream → callback → MediaPacket(audio_g711a/etc)
+//
+// AENC 支持: G711A / G711U / MP2 (Rockchip HW encoder)
 
 #define AI_DEV_ID   0
 #define AI_CHN_ID   0
+#define AENC_DEV_ID 0
+#define AENC_CHN_ID 0
 
 static pthread_t g_audio_thread;
 static volatile int g_audio_quit = 0;
 static volatile int g_audio_initialized = 0;
+static volatile int g_aenc_enabled = 0;
 
 typedef void (*audio_callback_t)(const uint8_t *data, uint32_t len, uint64_t pts_us);
 static audio_callback_t g_audio_callback = NULL;
+
+// ---- AI direct (PCM mode, no encoding) ----
 
 static void *audio_get_stream_thread(void *arg) {
     (void)arg;
     AUDIO_FRAME_S frame;
     int loopCount = 0;
 
-    printf("[rk_camera] audio thread started\n");
+    printf("[rk_camera] audio PCM thread started\n");
 
     while (!g_audio_quit) {
         int ret = RK_MPI_AI_GetFrame(AI_DEV_ID, AI_CHN_ID, &frame, RK_NULL, -1);
@@ -742,7 +754,7 @@ static void *audio_get_stream_thread(void *arg) {
             }
 
             if (loopCount == 0) {
-                printf("[rk_camera] first audio frame: len=%u\n", u32Len);
+                printf("[rk_camera] first audio PCM frame: len=%u\n", u32Len);
             }
             loopCount++;
 
@@ -752,33 +764,74 @@ static void *audio_get_stream_thread(void *arg) {
         }
     }
 
-    printf("[rk_camera] audio thread exit, total frames=%d\n", loopCount);
+    printf("[rk_camera] audio PCM thread exit, total frames=%d\n", loopCount);
     return NULL;
 }
 
-int rk_audio_init(int sample_rate) {
-    if (g_audio_initialized) return 0;
+// ---- AENC stream thread (encoding mode) ----
 
-    printf("[rk_camera] audio init: %dHz\n", sample_rate);
+static void *aenc_get_stream_thread(void *arg) {
+    (void)arg;
+    AUDIO_STREAM_S stream;
+    int loopCount = 0;
 
-    if (ensure_sys_init() != 0) return -1;
+    printf("[rk_camera] audio AENC thread started\n");
 
+    while (!g_audio_quit) {
+        int ret = RK_MPI_AENC_GetStream(AENC_CHN_ID, &stream, -1);
+        if (ret == RK_SUCCESS) {
+            void *pData = RK_MPI_MB_Handle2VirAddr(stream.pMbBlk);
+            uint32_t u32Len = stream.u32Len;
+
+            if (g_audio_callback && pData && u32Len > 0) {
+                g_audio_callback((const uint8_t *)pData, u32Len, stream.u64TimeStamp);
+            }
+
+            if (loopCount == 0) {
+                printf("[rk_camera] first audio AENC frame: len=%u pts=%llu\n",
+                       u32Len, (unsigned long long)stream.u64TimeStamp);
+            }
+            loopCount++;
+
+            RK_MPI_AENC_ReleaseStream(AENC_CHN_ID, &stream);
+        } else {
+            usleep(10 * 1000);
+        }
+    }
+
+    printf("[rk_camera] audio AENC thread exit, total frames=%d\n", loopCount);
+    return NULL;
+}
+
+// ---- Audio init helper: configure AI device ----
+
+static int audio_ai_init(int sample_rate, const char *card_name,
+                          int channels, int frame_size, const char *format) {
     AIO_ATTR_S aiAttr;
     AI_CHN_PARAM_S pstParams;
     int ret;
 
     memset(&aiAttr, 0, sizeof(AIO_ATTR_S));
-    sprintf((char *)aiAttr.u8CardName, "%s", "hw:0,0");
-    aiAttr.soundCard.channels = 2;
+    snprintf((char *)aiAttr.u8CardName, sizeof(aiAttr.u8CardName), "%s", card_name);
+
+    aiAttr.soundCard.channels = channels;
     aiAttr.soundCard.sampleRate = sample_rate;
-    aiAttr.soundCard.bitWidth = AUDIO_BIT_WIDTH_16;
-    aiAttr.enBitwidth = AUDIO_BIT_WIDTH_16;
+
+    // Configure bit width from format string
+    if (strcmp(format, "U8") == 0) {
+        aiAttr.soundCard.bitWidth = AUDIO_BIT_WIDTH_8;
+        aiAttr.enBitwidth = AUDIO_BIT_WIDTH_8;
+    } else {
+        aiAttr.soundCard.bitWidth = AUDIO_BIT_WIDTH_16;
+        aiAttr.enBitwidth = AUDIO_BIT_WIDTH_16;
+    }
+
     aiAttr.enSamplerate = (AUDIO_SAMPLE_RATE_E)sample_rate;
     aiAttr.enSoundmode = AUDIO_SOUND_MODE_MONO;
-    aiAttr.u32PtNumPerFrm = 1024;
+    aiAttr.u32PtNumPerFrm = frame_size;
     aiAttr.u32FrmNum = 4;
     aiAttr.u32EXFlag = 0;
-    aiAttr.u32ChnCnt = 2;
+    aiAttr.u32ChnCnt = channels;
 
     ret = RK_MPI_AI_SetPubAttr(AI_DEV_ID, &aiAttr);
     if (ret != RK_SUCCESS) {
@@ -806,12 +859,135 @@ int rk_audio_init(int sample_rate) {
         return -1;
     }
 
-    g_audio_quit = 0;
-    ret = pthread_create(&g_audio_thread, NULL, audio_get_stream_thread, NULL);
+    return 0;
+}
+
+// ---- VQE init (Voice Quality Enhancement) ----
+
+static int audio_vqe_init(int sample_rate, int frame_size, const char *vqe_cfg) {
+    int ret;
+    AI_VQE_CONFIG_S stAiVqeConfig;
+    int vqe_gap_ms = 16;
+
+    if (vqe_gap_ms != 16 && vqe_gap_ms != 10) return -1;
+
+    memset(&stAiVqeConfig, 0, sizeof(AI_VQE_CONFIG_S));
+    stAiVqeConfig.enCfgMode = AIO_VQE_CONFIG_LOAD_FILE;
+    snprintf(stAiVqeConfig.aCfgFile, sizeof(stAiVqeConfig.aCfgFile), "%s", vqe_cfg);
+    stAiVqeConfig.s32WorkSampleRate = sample_rate;
+    stAiVqeConfig.s32FrameSample = sample_rate * vqe_gap_ms / 1000;
+
+    ret = RK_MPI_AI_SetVqeAttr(AI_DEV_ID, AI_CHN_ID, 0, 0, &stAiVqeConfig);
+    if (ret != RK_SUCCESS) {
+        printf("[rk_camera] RK_MPI_AI_SetVqeAttr failed: %x\n", ret);
+        return -1;
+    }
+
+    ret = RK_MPI_AI_EnableVqe(AI_DEV_ID, AI_CHN_ID);
+    if (ret != RK_SUCCESS) {
+        printf("[rk_camera] RK_MPI_AI_EnableVqe failed: %x\n", ret);
+        return -1;
+    }
+    printf("[rk_camera] AIVQE enabled (cfg=%s)\n", vqe_cfg);
+    return 0;
+}
+
+// ---- Get AENC codec ID from string ----
+
+static RK_CODEC_ID_E get_aenc_codec(const char *encode_type) {
+    if (strcmp(encode_type, "G711A") == 0) return RK_AUDIO_ID_PCM_ALAW;
+    if (strcmp(encode_type, "G711U") == 0) return RK_AUDIO_ID_PCM_MULAW;
+    if (strcmp(encode_type, "MP2") == 0)   return RK_AUDIO_ID_MP2;
+    return RK_AUDIO_ID_PCM_ALAW; // default
+}
+
+// ---- Public API ----
+
+int rk_audio_init(int sample_rate, const char *card_name, int channels, int frame_size, int volume,
+                  const char *encode_type, const char *format, int bit_rate,
+                  int enable_vqe, const char *vqe_cfg) {
+    if (g_audio_initialized) return 0;
+
+    int use_aenc = (strcmp(encode_type, "PCM") != 0);
+
+    printf("[rk_camera] audio init: %dHz card=%s ch=%d frame=%d vol=%d encode=%s fmt=%s br=%d vqe=%d\n",
+           sample_rate, card_name, channels, frame_size, volume,
+           encode_type, format, bit_rate, enable_vqe);
+
+    if (ensure_sys_init() != 0) return -1;
+
+    // Step 1: AI device init (common for PCM and AENC modes)
+    int ret = audio_ai_init(sample_rate, card_name, channels, frame_size, format);
     if (ret != 0) return -1;
 
+    // Step 2: VQE (if enabled, before AENC binding)
+    if (enable_vqe) {
+        audio_vqe_init(sample_rate, frame_size, vqe_cfg);
+    }
+
+    if (use_aenc) {
+        // Step 3: AENC channel init
+        AENC_CHN_ATTR_S stAencAttr;
+        memset(&stAencAttr, 0, sizeof(stAencAttr));
+
+        RK_CODEC_ID_E codec_id = get_aenc_codec(encode_type);
+        stAencAttr.enType = codec_id;
+        stAencAttr.stCodecAttr.enType = codec_id;
+        stAencAttr.stCodecAttr.u32Channels = channels;
+        stAencAttr.stCodecAttr.u32SampleRate = sample_rate;
+
+        if (strcmp(format, "U8") == 0) {
+            stAencAttr.stCodecAttr.enBitwidth = AUDIO_BIT_WIDTH_8;
+        } else {
+            stAencAttr.stCodecAttr.enBitwidth = AUDIO_BIT_WIDTH_16;
+        }
+
+        if (bit_rate > 0) {
+            stAencAttr.stCodecAttr.u32Bitrate = bit_rate;
+        }
+
+        stAencAttr.u32BufCount = 4;
+
+        ret = RK_MPI_AENC_CreateChn(AENC_CHN_ID, &stAencAttr);
+        if (ret != RK_SUCCESS) {
+            printf("[rk_camera] RK_MPI_AENC_CreateChn failed: %x\n", ret);
+            return -1;
+        }
+        printf("[rk_camera] AENC channel %d created (codec=%s)\n", AENC_CHN_ID, encode_type);
+
+        // Step 4: Bind AI → AENC
+        MPP_CHN_S aiChn, aencChn;
+        aiChn.enModId = RK_ID_AI;
+        aiChn.s32DevId = AI_DEV_ID;
+        aiChn.s32ChnId = AI_CHN_ID;
+        aencChn.enModId = RK_ID_AENC;
+        aencChn.s32DevId = AENC_DEV_ID;
+        aencChn.s32ChnId = AENC_CHN_ID;
+
+        ret = RK_MPI_SYS_Bind(&aiChn, &aencChn);
+        if (ret != RK_SUCCESS) {
+            printf("[rk_camera] RK_MPI_SYS_Bind AI->AENC failed: %x\n", ret);
+            RK_MPI_AENC_DestroyChn(AENC_CHN_ID);
+            return -1;
+        }
+        printf("[rk_camera] AI→AENC bound\n");
+
+        // Step 5: Start AENC stream thread
+        g_aenc_enabled = 1;
+        g_audio_quit = 0;
+        ret = pthread_create(&g_audio_thread, NULL, aenc_get_stream_thread, NULL);
+        if (ret != 0) return -1;
+
+    } else {
+        // PCM mode: start AI stream thread directly
+        g_aenc_enabled = 0;
+        g_audio_quit = 0;
+        ret = pthread_create(&g_audio_thread, NULL, audio_get_stream_thread, NULL);
+        if (ret != 0) return -1;
+    }
+
     g_audio_initialized = 1;
-    printf("[rk_camera] audio initialized\n");
+    printf("[rk_camera] audio initialized (%s mode)\n", use_aenc ? encode_type : "PCM");
     return 0;
 }
 
@@ -825,12 +1001,28 @@ void rk_audio_deinit() {
     g_audio_quit = 1;
     pthread_join(g_audio_thread, NULL);
 
+    if (g_aenc_enabled) {
+        // Unbind AI → AENC
+        MPP_CHN_S aiChn, aencChn;
+        aiChn.enModId = RK_ID_AI;
+        aiChn.s32DevId = AI_DEV_ID;
+        aiChn.s32ChnId = AI_CHN_ID;
+        aencChn.enModId = RK_ID_AENC;
+        aencChn.s32DevId = AENC_DEV_ID;
+        aencChn.s32ChnId = AENC_CHN_ID;
+        RK_MPI_SYS_UnBind(&aiChn, &aencChn);
+
+        RK_MPI_AENC_DestroyChn(AENC_CHN_ID);
+        printf("[rk_camera] AENC channel destroyed\n");
+    }
+
     RK_MPI_AI_DisableChn(AI_DEV_ID, AI_CHN_ID);
     RK_MPI_AI_Disable(AI_DEV_ID);
 
     maybe_sys_exit();
 
     g_audio_initialized = 0;
+    g_aenc_enabled = 0;
     printf("[rk_camera] audio deinitialized\n");
 }
 

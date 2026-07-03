@@ -13,6 +13,9 @@
 //!   [video.main]    主码流 (高清, 如 2304x1296)
 //!   [video.sub]     子码流 (标清, 如 704x576, 低码率)
 //!   [video.third]   第三码流 (中清, 如 960x540)
+//!
+//! 音频采集+编码配置 (rv1106 模式):
+//!   [audio]    声卡设备、采样率、通道数、音量、编码(G711A/MP2)
 
 use std::path::PathBuf;
 
@@ -150,6 +153,77 @@ impl Default for VideoConfig {
     }
 }
 
+/// 音频采集+编码配置 (rv1106 模式)
+///
+/// 管线: AI(PCM采集) → [AENC(HW编码)] → MediaPacket → libp2p stream
+/// `encode_type = "PCM"` 时跳过编码，直接发送原始 PCM。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioConfig {
+    /// 是否启用音频采集
+    #[serde(default = "default_audio_enabled")]
+    pub enabled: bool,
+    /// 声卡设备名 (ALSA), 如 "hw:0,0"
+    #[serde(default = "default_audio_card_name")]
+    pub card_name: String,
+    /// 采样率 (Hz): 8000 | 16000 | 24000 | 32000 | 44100 | 48000 等
+    #[serde(default = "default_audio_sample_rate")]
+    pub sample_rate: u32,
+    /// 通道数 (1=mono, 2=stereo, 在采集端强制 mono)
+    #[serde(default = "default_audio_channels")]
+    pub channels: u32,
+    /// 每帧采样点数 (如 1024 @ 16kHz ≈ 64ms/frame)
+    #[serde(default = "default_audio_frame_size")]
+    pub frame_size: u32,
+    /// 声卡格式: "S16" (16-bit signed) | "U8"
+    #[serde(default = "default_audio_format")]
+    pub format: String,
+    /// 硬件音量 (0-100)
+    #[serde(default = "default_audio_volume")]
+    pub volume: u32,
+    /// 编码类型: "PCM" (不编码) | "G711A" | "G711U" | "MP2"
+    #[serde(default = "default_audio_encode_type")]
+    pub encode_type: String,
+    /// 编码码率 (bps, 仅编码模式): 16000 (G711A@8k) | 64000 (MP2)
+    #[serde(default = "default_audio_bit_rate")]
+    pub bit_rate: u32,
+    /// 是否启用 VQE (语音质量增强)
+    #[serde(default = "default_audio_enable_vqe")]
+    pub enable_vqe: bool,
+    /// VQE 配置文件路径
+    #[serde(default = "default_audio_vqe_cfg")]
+    pub vqe_cfg: String,
+}
+
+fn default_audio_enabled() -> bool { false }
+fn default_audio_card_name() -> String { "hw:0,0".to_string() }
+fn default_audio_sample_rate() -> u32 { 16000 }
+fn default_audio_channels() -> u32 { 1 }
+fn default_audio_frame_size() -> u32 { 1024 }
+fn default_audio_format() -> String { "S16".to_string() }
+fn default_audio_volume() -> u32 { 50 }
+fn default_audio_encode_type() -> String { "PCM".to_string() }
+fn default_audio_bit_rate() -> u32 { 16000 }
+fn default_audio_enable_vqe() -> bool { false }
+fn default_audio_vqe_cfg() -> String { "/oem/usr/share/vqefiles/config_aivqe.json".to_string() }
+
+impl Default for AudioConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_audio_enabled(),
+            card_name: default_audio_card_name(),
+            sample_rate: default_audio_sample_rate(),
+            channels: default_audio_channels(),
+            frame_size: default_audio_frame_size(),
+            format: default_audio_format(),
+            volume: default_audio_volume(),
+            encode_type: default_audio_encode_type(),
+            bit_rate: default_audio_bit_rate(),
+            enable_vqe: default_audio_enable_vqe(),
+            vqe_cfg: default_audio_vqe_cfg(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     /// 多 Relay 地址列表 (新格式优先)
@@ -166,8 +240,9 @@ pub struct Config {
     pub mode: String,
     #[serde(default = "default_key_file")]
     pub key_file: PathBuf,
+    /// 音频采集配置
     #[serde(default)]
-    pub enable_audio: bool,
+    pub audio: AudioConfig,
     #[serde(default)]
     pub udp_port: Option<u16>,
 
@@ -192,7 +267,7 @@ impl Default for Config {
             enable_mdns: default_enable_mdns(),
             mode: default_mode(),
             key_file: default_key_file(),
-            enable_audio: false,
+            audio: AudioConfig::default(),
             udp_port: None,
             video: VideoConfig::default(),
             video_file: None,
@@ -251,7 +326,7 @@ impl Config {
         }
         if let Some(ref mode) = cli.mode { self.mode = mode.clone(); }
         if let Some(ref key_file) = cli.key_file { self.key_file = key_file.clone(); }
-        if cli.enable_audio { self.enable_audio = true; }
+        if cli.enable_audio { self.audio.enabled = true; }
         if let Some(udp_port) = cli.udp_port { self.udp_port = Some(udp_port); }
         if let Some(ref video_file) = cli.video_file { self.video_file = Some(video_file.clone()); }
     }

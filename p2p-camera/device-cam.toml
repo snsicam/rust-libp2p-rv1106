@@ -22,8 +22,36 @@ key_file = "device-cam.key"
 # QUIC UDP 监听端口 (0=随机, 非0=固定端口便于端口映射)
 # udp_port = 9090
 
+# 是否启用音频采集 (命令行 --enable-audio 可覆盖)
+# config 文件中通过 [audio] enabled 控制
+
+# ============ 音频采集+编码 (rv1106 模式) ============
+# 管线: AI(PCM采集) → [AENC(硬件编码)] → MediaPacket → libp2p stream
+# encode_type="PCM" 跳过编码，直接发送原始 PCM
+# 参考: rkipc [audio.0] 配置段
+
+[audio]
 # 是否启用音频采集
-enable_audio = false
+enabled = false
+# 声卡设备名 (ALSA)
+card_name = "hw:0,0"
+# 采样率 (Hz): 8000 | 16000 | 24000 | 32000 | 44100 | 48000
+sample_rate = 16000
+# 通道数 (1=mono, 2=stereo)
+channels = 1
+# 每帧采样点数 (1024 @ 16kHz ≈ 64ms/frame)
+frame_size = 1024
+# 声卡位宽: "S16" (16-bit signed) | "U8"
+format = "S16"
+# 硬件音量 (0-100)
+volume = 50
+# 编码类型: "PCM" (不编码) | "G711A" | "G711U" | "MP2"
+encode_type = "PCM"
+# 编码码率 (bps): G711A = 64000@8kHz, 128000@16kHz; MP2 = 64000+
+bit_rate = 16000
+# VQE 语音质量增强 (依赖 vqe_cfg 配置文件)
+enable_vqe = false
+vqe_cfg = "/oem/usr/share/vqefiles/config_aivqe.json"
 
 # ============ 视频源 (文件模式，非 rv1106) ============
 

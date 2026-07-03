@@ -12,5 +12,5 @@ pub const VIDEO_SUB_PROTOCOL: StreamProtocol = StreamProtocol::new("/p2p-camera/
 /// 第三码流协议: 中清 H.264/H.265 NAL units
 pub const VIDEO_THIRD_PROTOCOL: StreamProtocol = StreamProtocol::new("/p2p-camera/video/third/1.0.0");
 
-/// 音频流协议: PCM/AAC 封装在 MediaPacket 中
+/// 音频流协议: PCM/G711A/G711U/AAC 封装在 MediaPacket 中
 pub const AUDIO_PROTOCOL: StreamProtocol = StreamProtocol::new("/p2p-camera/audio/1.0.0");

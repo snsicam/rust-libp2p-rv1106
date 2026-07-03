@@ -5,10 +5,10 @@
 //! |Track(1B)|Timestamp(8B)|Flags(1B)|Len(4B)|Data(N)|
 //! +--------+------------+-------+--------+--------+
 //!
-//! Track:  0x01=Video(H.265 NAL), 0x02=Audio(PCM/AAC)
+//! Track:  0x01=Video(H.265 NAL), 0x02=Audio(PCM/AAC/G711)
 //!
 //! Flags (Video):  bit 0: 0=IDR关键帧, 1=非关键帧
-//! Flags (Audio):  bit 0-1: 0=PCM16LE, 1=AAC
+//! Flags (Audio):  bit 0-1: 0=PCM16LE, 1=AAC, 2=G711A, 3=G711U
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
@@ -56,6 +56,26 @@ impl MediaPacket {
             track: MediaTrack::Audio,
             timestamp_ms,
             flags: 0, // PCM16LE
+            data,
+        }
+    }
+
+    /// 创建 G.711A 音频包 (硬件编码)
+    pub fn audio_g711a(timestamp_ms: u64, data: Bytes) -> Self {
+        MediaPacket {
+            track: MediaTrack::Audio,
+            timestamp_ms,
+            flags: 2, // G711A
+            data,
+        }
+    }
+
+    /// 创建 G.711U 音频包 (硬件编码)
+    pub fn audio_g711u(timestamp_ms: u64, data: Bytes) -> Self {
+        MediaPacket {
+            track: MediaTrack::Audio,
+            timestamp_ms,
+            flags: 3, // G711U
             data,
         }
     }

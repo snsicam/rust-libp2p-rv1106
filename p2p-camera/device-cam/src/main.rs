@@ -195,17 +195,29 @@ async fn main() -> Result<()> {
     // 音频源
     #[cfg(feature = "rv1106")]
     {
-        if cfg.enable_audio {
-            let source = rk_video_source::RkAudioSource::new(16000);
+        if cfg.audio.enabled {
+            let source = rk_video_source::RkAudioSource::new(
+                cfg.audio.sample_rate,
+                cfg.audio.card_name.clone(),
+                cfg.audio.channels,
+                cfg.audio.frame_size,
+                cfg.audio.volume,
+                cfg.audio.format.clone(),
+                cfg.audio.encode_type.clone(),
+                cfg.audio.bit_rate,
+                cfg.audio.enable_vqe,
+                cfg.audio.vqe_cfg.clone(),
+            );
             source.spawn(broadcast_sender_to_crossbeam(audio_tx.clone()));
-            println!("[DeviceCam] Audio source: RV1106 AI (16kHz mono)");
+            println!("[DeviceCam] Audio source: RV1106 AI ({}Hz mono, frame={}, encode={})",
+                cfg.audio.sample_rate, cfg.audio.frame_size, cfg.audio.encode_type);
         }
     }
 
     #[cfg(not(feature = "rv1106"))]
     {
-        if cfg.enable_audio {
-            let source = media_source::SilenceAudioSource::new(16000, 1);
+        if cfg.audio.enabled {
+            let source = media_source::SilenceAudioSource::new(cfg.audio.sample_rate, cfg.audio.channels as u8);
             source.spawn(broadcast_sender_to_crossbeam(audio_tx.clone()));
             println!("[DeviceCam] Audio source: silence (16kHz mono)");
         }
@@ -899,6 +911,18 @@ fn validate_device_cam_config(cfg: &config::Config) {
         cfg.video.third.width, cfg.video.third.height,
         cfg.video.third.dst_frame_rate_num, cfg.video.third.dst_frame_rate_den,
         cfg.video.third.bitrate_kbps, cfg.video.third.codec);
+
+    // 打印音频状态
+    println!("[DeviceCam] Audio: {} ({}Hz, {}ch, {}samples/frame, card={}, fmt={}, encode={}, bitrate={}, vqe={})",
+        if cfg.audio.enabled { "ON" } else { "OFF" },
+        cfg.audio.sample_rate,
+        cfg.audio.channels,
+        cfg.audio.frame_size,
+        cfg.audio.card_name,
+        cfg.audio.format,
+        cfg.audio.encode_type,
+        cfg.audio.bit_rate,
+        cfg.audio.enable_vqe);
 }
 
 fn is_same_subnet(a: Ipv4Addr, b: Ipv4Addr) -> bool {
