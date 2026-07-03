@@ -1,5 +1,7 @@
 # P2P 摄像头视频监控 — 完整开发方案
 
+> 文档索引: [docs/README.md](README.md) | Bug 记录: [docs/bugfix-log.md](bugfix-log.md) | NAT 穿透对比: [docs/dcutr-vs-stun-turn.md](dcutr-vs-stun-turn.md)
+
 ## 硬件与现状
 
 | 项目 | 详情 |

@@ -190,6 +190,10 @@ impl<P: Provider> GenTransport<P> {
             socket.set_only_v6(true)?;
         }
 
+        socket.set_reuse_address(true)?;
+        #[cfg(all(unix, not(any(target_os = "solaris", target_os = "illumos"))))]
+        socket.set_reuse_port(true)?;
+
         socket.bind(&socket_addr.into())?;
 
         Ok(socket.into())
@@ -204,7 +208,16 @@ impl<P: Provider> GenTransport<P> {
             SocketFamily::Ipv4 => SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0),
             SocketFamily::Ipv6 => SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 0),
         };
-        let socket = UdpSocket::bind(listen_socket_addr)?;
+        let socket = Socket::new(
+            Domain::for_address(listen_socket_addr),
+            Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )?;
+        socket.set_reuse_address(true)?;
+        #[cfg(all(unix, not(any(target_os = "solaris", target_os = "illumos"))))]
+        socket.set_reuse_port(true)?;
+        socket.bind(&listen_socket_addr.into())?;
+        let socket: UdpSocket = socket.into();
         let endpoint_config = self.quinn_config.endpoint_config.clone();
         let endpoint = Self::new_endpoint(endpoint_config, None, socket)?;
         Ok(endpoint)
