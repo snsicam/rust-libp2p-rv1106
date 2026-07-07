@@ -49,14 +49,10 @@ use proto::{
     stream_protocols,
 };
 use tokio::sync::broadcast;
-use tokio::time::timeout;
 use tracing_subscriber::EnvFilter;
 
 // broadcast channel 容量: 缓冲约 2 秒的视频帧 (25fps * 2)
 const BROADCAST_CAPACITY: usize = 100;
-
-// write_all/flush 超时: viewer 消费过慢时直接断开，避免阻塞导致 broadcast channel 积压丢帧
-const WRITE_TIMEOUT: Duration = Duration::from_secs(3);
 
 // 重连间隔 (指数退避: base → 2x → 4x → ... → max)
 const RECONNECT_DELAY_BASE: Duration = Duration::from_secs(3);
@@ -771,11 +767,14 @@ async fn stream_video_to_viewer(
     let mut bytes_sent: u64 = 0;
     let mut video_start: Option<std::time::Instant> = None;
     let mut lagged_count: u64 = 0;
+    let mut dropped_count: u64 = 0;
     // peer_id 短标识，用于日志区分不同 viewer
     let peer_short = peer_id.to_string();
     let peer_short = &peer_short[peer_short.len().saturating_sub(7)..];
     // write_all+flush 耗时超过此阈值则输出警告
     const WRITE_SLOW_THRESHOLD_MS: u64 = 100;
+    // write_all+flush 超过此时间则断开该 viewer（防止慢 viewer 阻塞帧发送）
+    const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
     // 先发送 VPS/SPS/PPS
     for nal in &init_nals {
@@ -784,29 +783,15 @@ async fn stream_video_to_viewer(
         au_with_sc.extend_from_slice(nal);
         let packet = MediaPacket::video(0, true, Bytes::from(au_with_sc));
         let encoded = packet.encode();
-        match timeout(WRITE_TIMEOUT, stream.write_all(&encoded)).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                tracing::warn!("Init NAL write to {peer_id} failed: {e}");
-                return;
-            }
-            Err(_elapsed) => {
-                tracing::warn!("Init NAL write to {peer_id} timed out (viewer too slow)");
-                return;
-            }
+        if let Err(e) = stream.write_all(&encoded).await {
+            tracing::warn!("Init NAL write to {peer_id} failed: {e}");
+            return;
         }
     }
     if !init_nals.is_empty() {
-        match timeout(WRITE_TIMEOUT, stream.flush()).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                tracing::warn!("Init flush to {peer_id} failed: {e}");
-                return;
-            }
-            Err(_elapsed) => {
-                tracing::warn!("Init flush to {peer_id} timed out (viewer too slow)");
-                return;
-            }
+        if let Err(e) = stream.flush().await {
+            tracing::warn!("Init flush to {peer_id} failed: {e}");
+            return;
         }
         println!("[DeviceCam] Sent {} init NALs to ..{peer_short} ({stream_name})", init_nals.len());
     }
@@ -817,55 +802,51 @@ async fn stream_video_to_viewer(
                 let encoded = packet.encode();
                 let write_start = std::time::Instant::now();
 
-                // write_all 带超时: viewer 消费过慢时直接断开，避免阻塞导致 broadcast channel 积压丢帧
-                match timeout(WRITE_TIMEOUT, stream.write_all(&encoded)).await {
-                    Ok(Ok(())) => {}
+                // 带超时的写入：防止慢 viewer 阻塞帧发送
+                let write_result = tokio::time::timeout(WRITE_TIMEOUT, async {
+                    stream.write_all(&encoded).await?;
+                    stream.flush().await?;
+                    Ok::<(), std::io::Error>(())
+                }).await;
+
+                match write_result {
+                    Ok(Ok(())) => {
+                        let write_ms = write_start.elapsed().as_millis() as u64;
+                        if write_ms > WRITE_SLOW_THRESHOLD_MS {
+                            println!("[DeviceCam] SLOW write ..{peer_short}: {write_ms}ms frame #{frame_count} ({stream_name}, {} bytes)",
+                                encoded.len());
+                        }
+
+                        frame_count += 1;
+                        bytes_sent += encoded.len() as u64;
+
+                        if video_start.is_none() {
+                            video_start = Some(std::time::Instant::now());
+                        }
+
+                        if frame_count % 100 == 0 {
+                            if let Some(start) = video_start {
+                                let elapsed = start.elapsed().as_secs_f64();
+                                let fps = frame_count as f64 / elapsed;
+                                let kbps = (bytes_sent * 8) as f64 / elapsed / 1000.0;
+                                let keyframe = if packet.is_keyframe() { "[I]" } else { "   " };
+                                println!(
+                                    "[DeviceCam] {keyframe} frame #{} | {:.1} fps | {:.0} kbps | ts={} | ..{peer_short} {stream_name}",
+                                    frame_count, fps, kbps, packet.timestamp_ms
+                                );
+                            }
+                        }
+                    }
                     Ok(Err(e)) => {
                         println!("[DeviceCam] Write to ..{peer_short} failed: {e} ({stream_name}, frame #{frame_count})");
                         break;
                     }
-                    Err(_elapsed) => {
-                        println!("[DeviceCam] Write to ..{peer_short} timed out after {}s ({stream_name}, frame #{frame_count}) — disconnecting slow viewer",
+                    Err(_) => {
+                        // 写入超时：viewer 处理太慢，断开连接
+                        dropped_count += 1;
+                        println!("[DeviceCam] WRITE TIMEOUT ..{peer_short}: write blocked >{}s, disconnecting ({stream_name}, frame #{frame_count}, dropped: {dropped_count})",
                             WRITE_TIMEOUT.as_secs());
                         break;
-                    }
-                }
-                match timeout(WRITE_TIMEOUT, stream.flush()).await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => {
-                        println!("[DeviceCam] Flush to ..{peer_short} failed: {e} ({stream_name}, frame #{frame_count})");
-                        break;
-                    }
-                    Err(_elapsed) => {
-                        println!("[DeviceCam] Flush to ..{peer_short} timed out after {}s ({stream_name}, frame #{frame_count}) — disconnecting slow viewer",
-                            WRITE_TIMEOUT.as_secs());
-                        break;
-                    }
-                }
-
-                let write_ms = write_start.elapsed().as_millis() as u64;
-                if write_ms > WRITE_SLOW_THRESHOLD_MS {
-                    println!("[DeviceCam] SLOW write ..{peer_short}: {write_ms}ms frame #{frame_count} ({stream_name}, {} bytes)",
-                        encoded.len());
-                }
-
-                frame_count += 1;
-                bytes_sent += encoded.len() as u64;
-
-                if video_start.is_none() {
-                    video_start = Some(std::time::Instant::now());
-                }
-
-                if frame_count % 100 == 0 {
-                    if let Some(start) = video_start {
-                        let elapsed = start.elapsed().as_secs_f64();
-                        let fps = frame_count as f64 / elapsed;
-                        let kbps = (bytes_sent * 8) as f64 / elapsed / 1000.0;
-                        let keyframe = if packet.is_keyframe() { "[I]" } else { "   " };
-                        println!(
-                            "[DeviceCam] {keyframe} frame #{} | {:.1} fps | {:.0} kbps | ts={} | ..{peer_short} {stream_name}",
-                            frame_count, fps, kbps, packet.timestamp_ms
-                        );
                     }
                 }
             }
@@ -891,13 +872,14 @@ async fn stream_video_to_viewer(
         }
     }
     let _ = stream.close().await;
-    println!("[DeviceCam] Video stream ({stream_name}) to ..{peer_short} ended ({frame_count} frames sent, {lagged_count} lagged)");
+    println!("[DeviceCam] Video stream ({stream_name}) to ..{peer_short} ended ({frame_count} frames sent, {lagged_count} lagged, {dropped_count} dropped)");
 
     // Summary
     println!("[DeviceCam] === Summary ({stream_name} -> ..{peer_short}) ===");
     println!("[DeviceCam] Total frames: {frame_count}");
     println!("[DeviceCam] Total bytes: {bytes_sent}");
     println!("[DeviceCam] Total lagged: {lagged_count}");
+    println!("[DeviceCam] Total dropped: {dropped_count}");
     if let Some(start) = video_start {
         let elapsed = start.elapsed().as_secs_f64();
         println!("[DeviceCam] Duration: {elapsed:.1}s");
@@ -919,16 +901,9 @@ async fn stream_audio_to_viewer(
         match source.recv().await {
             Ok(packet) => {
                 let data = packet.encode();
-                match timeout(WRITE_TIMEOUT, stream.write_all(&data)).await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => {
-                        tracing::warn!("Audio write to {peer_id} failed: {e}");
-                        break;
-                    }
-                    Err(_elapsed) => {
-                        tracing::warn!("Audio write to {peer_id} timed out — disconnecting slow viewer");
-                        break;
-                    }
+                if let Err(e) = stream.write_all(&data).await {
+                    tracing::warn!("Audio write to {peer_id} failed: {e}");
+                    break;
                 }
             }
             Err(broadcast::error::RecvError::Lagged(_)) => {
