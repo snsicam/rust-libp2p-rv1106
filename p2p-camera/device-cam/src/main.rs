@@ -27,6 +27,7 @@ mod rk_video_source;
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -65,6 +66,8 @@ struct RelayState {
     connected: bool,
     reconnect_attempt: u32,
     dial_pending: bool,
+    /// 重连定时器：到期时执行 swarm.dial()
+    reconnect_timer: Option<Pin<Box<tokio::time::Sleep>>>,
 }
 
 impl RelayState {
@@ -246,6 +249,7 @@ async fn main() -> Result<()> {
             connected: false,
             reconnect_attempt: 0,
             dial_pending: false,
+            reconnect_timer: None,
         }
     }).collect();
 
@@ -348,6 +352,7 @@ async fn main() -> Result<()> {
                                 state.connected = true;
                                 state.reconnect_attempt = 0;
                                 state.dial_pending = false;
+                                state.reconnect_timer = None;
                             }
                         }
                         let reserved_count = relay_states.iter().filter(|s| s.connected).count();
@@ -520,6 +525,7 @@ async fn main() -> Result<()> {
                                 }
                                 state.reconnect_attempt = 0;
                                 state.dial_pending = false;
+                                state.reconnect_timer = None;
                                 if state.reservation_id.is_none() {
                                     match swarm.listen_on(state.addr.clone().with(Protocol::P2pCircuit)) {
                                         Ok(new_id) => {
@@ -572,6 +578,7 @@ async fn main() -> Result<()> {
                                 let delay = state.reconnect_delay();
                                 println!("[DeviceCam] *** Relay {} connection lost! Reconnecting in {}s (attempt {}) ***",
                                     peer_id, delay.as_secs(), state.reconnect_attempt);
+                                state.reconnect_timer = Some(Box::pin(tokio::time::sleep(delay)));
                             }
                         }
                         if !is_relay && num_established == 0 {
@@ -589,6 +596,7 @@ async fn main() -> Result<()> {
                                 println!("[DeviceCam] *** Failed to connect to relay {}! Retrying in {}s (attempt {}) ***",
                                     peer_id, delay.as_secs(), state.reconnect_attempt);
                                 tracing::warn!("[DeviceCam] Relay connection error: {error}");
+                                state.reconnect_timer = Some(Box::pin(tokio::time::sleep(delay)));
                             }
                         } else {
                             tracing::warn!("[DeviceCam] Outgoing connection error: {error}");
@@ -649,25 +657,41 @@ async fn main() -> Result<()> {
                     tracing::error!("[DeviceCam] Audio stream accept channel closed");
                 }
             }
-        }
 
-        // Relay 重连逻辑
-        for state in &mut relay_states {
-            if !state.connected && !state.dial_pending && !swarm.is_connected(&state.peer_id) && state.reconnect_attempt > 0 {
-                let delay = state.reconnect_delay();
-                tracing::info!("[DeviceCam] Waiting {}s before reconnecting to relay {}...", delay.as_secs(), state.peer_id);
-                tokio::time::sleep(delay).await;
-                match swarm.dial(state.addr.clone()) {
-                    Ok(()) => {
-                        println!("[DeviceCam] Dialing relay {} (attempt {})...", state.peer_id, state.reconnect_attempt);
-                        state.dial_pending = true;
-                    }
-                    Err(e) => {
-                        tracing::error!("[DeviceCam] Failed to dial relay {}: {e}", state.peer_id);
-                        state.reconnect_attempt += 1;
+            // Relay 重连定时器（非阻塞：timer 到期时执行 dial，未到期时其他分支正常轮询）
+            _ = async {
+                // 找到最早到期的 relay 重连 timer
+                let timer = relay_states.iter_mut()
+                    .filter_map(|s| s.reconnect_timer.as_mut())
+                    .min_by_key(|t| t.deadline());
+                if let Some(t) = timer {
+                    t.await;
+                } else {
+                    // 没有活跃的 timer，用无限期 future 让此分支永远不被选中
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                // 找到到期的 relay 并执行 dial
+                for state in &mut relay_states {
+                    if let Some(ref mut timer) = state.reconnect_timer {
+                        if timer.is_elapsed() {
+                            state.reconnect_timer = None;
+                            match swarm.dial(state.addr.clone()) {
+                                Ok(()) => {
+                                    println!("[DeviceCam] Dialing relay {} (attempt {})...", state.peer_id, state.reconnect_attempt);
+                                    state.dial_pending = true;
+                                }
+                                Err(e) => {
+                                    tracing::error!("[DeviceCam] Failed to dial relay {}: {e}", state.peer_id);
+                                    state.reconnect_attempt += 1;
+                                    let delay = state.reconnect_delay();
+                                    state.reconnect_timer = Some(Box::pin(tokio::time::sleep(delay)));
+                                }
+                            }
+                            break;
+                        }
                     }
                 }
-                break;
             }
         }
     }
@@ -740,6 +764,14 @@ async fn stream_video_to_viewer(
     stream_name: &str,
 ) {
     let mut frame_count: u64 = 0;
+    let mut bytes_sent: u64 = 0;
+    let mut video_start: Option<std::time::Instant> = None;
+    let mut lagged_count: u64 = 0;
+    // peer_id 短标识，用于日志区分不同 viewer
+    let peer_short = peer_id.to_string();
+    let peer_short = &peer_short[peer_short.len().saturating_sub(7)..];
+    // write_all+flush 耗时超过此阈值则输出警告
+    const WRITE_SLOW_THRESHOLD_MS: u64 = 100;
 
     // 先发送 VPS/SPS/PPS
     for nal in &init_nals {
@@ -758,29 +790,51 @@ async fn stream_video_to_viewer(
             tracing::warn!("Init flush to {peer_id} failed: {e}");
             return;
         }
-        println!("[DeviceCam] Sent {} init NALs to {peer_id} ({stream_name})", init_nals.len());
+        println!("[DeviceCam] Sent {} init NALs to ..{peer_short} ({stream_name})", init_nals.len());
     }
 
     loop {
         match source.recv().await {
             Ok(packet) => {
                 let encoded = packet.encode();
+                let write_start = std::time::Instant::now();
                 if let Err(e) = stream.write_all(&encoded).await {
-                    tracing::warn!("Write to {peer_id} failed: {e}");
+                    println!("[DeviceCam] Write to ..{peer_short} failed: {e} ({stream_name}, frame #{frame_count})");
                     break;
                 }
                 if let Err(e) = stream.flush().await {
-                    tracing::warn!("Flush to {peer_id} failed: {e}");
+                    println!("[DeviceCam] Flush to ..{peer_short} failed: {e} ({stream_name}, frame #{frame_count})");
                     break;
                 }
+                let write_ms = write_start.elapsed().as_millis() as u64;
+                if write_ms > WRITE_SLOW_THRESHOLD_MS {
+                    println!("[DeviceCam] SLOW write ..{peer_short}: {write_ms}ms frame #{frame_count} ({stream_name}, {} bytes)",
+                        encoded.len());
+                }
+
                 frame_count += 1;
-                if frame_count == 1 {
-                    println!("[DeviceCam] First frame ({stream_name}) sent to {peer_id} ({} bytes, keyframe={})",
-                        encoded.len(), packet.is_keyframe());
+                bytes_sent += encoded.len() as u64;
+
+                if video_start.is_none() {
+                    video_start = Some(std::time::Instant::now());
+                }
+
+                if frame_count % 100 == 0 {
+                    if let Some(start) = video_start {
+                        let elapsed = start.elapsed().as_secs_f64();
+                        let fps = frame_count as f64 / elapsed;
+                        let kbps = (bytes_sent * 8) as f64 / elapsed / 1000.0;
+                        let keyframe = if packet.is_keyframe() { "[I]" } else { "   " };
+                        println!(
+                            "[DeviceCam] {keyframe} frame #{} | {:.1} fps | {:.0} kbps | ts={} | ..{peer_short} {stream_name}",
+                            frame_count, fps, kbps, packet.timestamp_ms
+                        );
+                    }
                 }
             }
             Err(broadcast::error::RecvError::Lagged(n)) => {
-                tracing::warn!("Video stream ({stream_name}) to {peer_id} lagged by {n} frames, requesting IDR");
+                lagged_count += n;
+                println!("[DeviceCam] LAGGED ..{peer_short} {stream_name}: {n} frames dropped (total lagged: {lagged_count}, sent: {frame_count})");
                 #[cfg(feature = "rv1106")]
                 {
                     // Request IDR for appropriate channel based on stream name
@@ -794,13 +848,29 @@ async fn stream_video_to_viewer(
                 }
             }
             Err(broadcast::error::RecvError::Closed) => {
-                println!("[DeviceCam] Broadcast closed for {peer_id} after {frame_count} frames ({stream_name})");
+                println!("[DeviceCam] Broadcast closed for ..{peer_short} after {frame_count} frames ({stream_name})");
                 break;
             }
         }
     }
     let _ = stream.close().await;
-    println!("[DeviceCam] Video stream ({stream_name}) to {peer_id} ended ({frame_count} frames sent)");
+    println!("[DeviceCam] Video stream ({stream_name}) to ..{peer_short} ended ({frame_count} frames sent, {lagged_count} lagged)");
+
+    // Summary
+    println!("[DeviceCam] === Summary ({stream_name} -> ..{peer_short}) ===");
+    println!("[DeviceCam] Total frames: {frame_count}");
+    println!("[DeviceCam] Total bytes: {bytes_sent}");
+    println!("[DeviceCam] Total lagged: {lagged_count}");
+    if let Some(start) = video_start {
+        let elapsed = start.elapsed().as_secs_f64();
+        println!("[DeviceCam] Duration: {elapsed:.1}s");
+        println!("[DeviceCam] Avg fps: {:.1}", frame_count as f64 / elapsed);
+        println!("[DeviceCam] Avg bitrate: {:.0} kbps", (bytes_sent * 8) as f64 / elapsed / 1000.0);
+    } else {
+        println!("[DeviceCam] Duration: N/A");
+        println!("[DeviceCam] Avg fps: N/A");
+        println!("[DeviceCam] Avg bitrate: N/A");
+    }
 }
 
 async fn stream_audio_to_viewer(

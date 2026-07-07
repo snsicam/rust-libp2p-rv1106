@@ -1,5 +1,9 @@
 fn main() {
     let build_time = chrono_now();
+    let out_dir = std::env::var("OUT_DIR").unwrap();
+    let stamp_path = std::path::Path::new(&out_dir).join("build_stamp");
+    std::fs::write(&stamp_path, &build_time).unwrap();
+    println!("cargo:rerun-if-changed={}", stamp_path.display());
     println!("cargo:rustc-env=BUILD_TIME={build_time}");
 }
 
@@ -8,13 +12,15 @@ fn chrono_now() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let days = now / 86400;
-    let time_of_day = now % 86400;
+    // 北京时间 UTC+8
+    let now_local = now + 8 * 3600;
+    let days = now_local / 86400;
+    let time_of_day = now_local % 86400;
     let hours = time_of_day / 3600;
     let minutes = (time_of_day % 3600) / 60;
     let seconds = time_of_day % 60;
     let (year, month, day) = days_to_ymd(days);
-    format!("{year:04}-{month:02}-{day:02} {hours:02}:{minutes:02}:{seconds:02} UTC")
+    format!("{year:04}-{month:02}-{day:02} {hours:02}:{minutes:02}:{seconds:02} CST")
 }
 
 fn days_to_ymd(mut days: u64) -> (u64, u64, u64) {
