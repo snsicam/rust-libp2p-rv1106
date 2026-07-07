@@ -6,9 +6,9 @@
 
 # Relay Server 地址列表 (支持多个 Relay，并发拨号)
 # 格式: /ip4/<ip>/tcp/<port>/p2p/<PeerId> 或 /ip4/<ip>/udp/<port>/quic-v1/p2p/<PeerId>
-relays = []
-# 旧格式 (向后兼容，和 relays 同时存在时 relays 优先)
-relay = ""
+relays = ["/ip4/101.35.90.171/udp/4001/quic-v1/p2p/12D3KooWDGUejVsts1G4tGyf8ukkr73eWxCr1EUfCQxgcbSDUie1", 
+"/ip4/134.175.248.113/udp/4001/quic-v1/p2p/12D3KooWMZNFG6htyb5gBrChtgag81YE5ySmXLoFiYhaUnQaTopr"]
+
 
 # mDNS 局域网发现 (默认开启，同局域网 viewer 优先直连)
 enable_mdns = true

@@ -62,6 +62,16 @@ impl ConnectionType {
             Self::Disconnected => "Disconnected",
         }
     }
+
+    /// 是否为转发连接（通过 Relay Server 中继）
+    pub fn is_relay(&self) -> bool {
+        matches!(self, Self::RelayCircuit)
+    }
+
+    /// 是否为直连（局域网直连、DCUtR 打洞直连、TCP 直连）
+    pub fn is_direct(&self) -> bool {
+        matches!(self, Self::QuicDirect | Self::LanDirect | Self::TcpDirect)
+    }
 }
 
 #[derive(Debug, Clone)]

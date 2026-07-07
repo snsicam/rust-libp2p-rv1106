@@ -61,6 +61,23 @@ fn get_video_protocol(stream_type: &str) -> StreamProtocol {
     }
 }
 
+/// 根据连接方式和 stream_type 参数决定使用哪个码流协议
+///
+/// "auto" 模式：转发→子码流，直连→主码流
+/// 手动模式：直接使用用户指定的码流
+fn resolve_stream_protocol(stream_type: &str, is_relay: bool) -> StreamProtocol {
+    match stream_type {
+        "auto" => {
+            if is_relay {
+                stream_protocols::VIDEO_SUB_PROTOCOL
+            } else {
+                stream_protocols::VIDEO_MAIN_PROTOCOL
+            }
+        }
+        other => get_video_protocol(other),
+    }
+}
+
 // SDL2 要求事件循环在主线程, 使用 current_thread runtime
 #[cfg_attr(feature = "player", tokio::main(flavor = "current_thread"))]
 #[cfg_attr(not(feature = "player"), tokio::main)]
@@ -88,8 +105,8 @@ async fn main() -> Result<()> {
     if opt.play { cfg.play = true; }
     if let Some(udp_port) = opt.udp_port { cfg.udp_port = Some(udp_port); }
     if let Some(enable_mdns) = opt.enable_mdns { cfg.enable_mdns = enable_mdns; }
-    // stream CLI arg always overrides config
-    if opt.stream != "main" { cfg.stream = opt.stream.clone(); }
+    // stream CLI arg always overrides config (unless it's the default "auto")
+    if opt.stream != "auto" { cfg.stream = opt.stream.clone(); }
 
     // 解析 relays (兼容旧格式 relay 字段)
     cfg.resolve_relays();
@@ -175,7 +192,7 @@ async fn main() -> Result<()> {
     let mut direct_via_lan = false;
     let mut local_nat_type: Option<NatType> = None;
     let mut remote_nat_hint: Option<String> = None;
-    let start = std::time::Instant::now();
+    let mut video_start: Option<std::time::Instant> = None;
 
     // 启动初始 session (后台任务)
     spawn_session(
@@ -205,7 +222,7 @@ async fn main() -> Result<()> {
 
                         // 消费残留缓冲帧 (旧 session 已 abort，不再有新数据)
                         drain_channel(&mut rx, &mut frame_count, &mut bytes_received,
-                            &start, &mut output_file,
+                            &mut video_start, &mut output_file,
                             #[cfg(feature = "player")]
                             player.as_mut());
                         drain_audio_channel(&mut audio_rx, &mut audio_count,
@@ -248,7 +265,7 @@ async fn main() -> Result<()> {
                     packet,
                     &mut frame_count,
                     &mut bytes_received,
-                    &start,
+                    &mut video_start,
                     &mut output_file,
                     #[cfg(feature = "player")]
                     player.as_mut(),
@@ -279,7 +296,7 @@ async fn main() -> Result<()> {
     }
 
     // ---- Summary ----
-    let elapsed = start.elapsed().as_secs_f64();
+    let video_elapsed = video_start.map(|s| s.elapsed().as_secs_f64()).unwrap_or(0.0);
     println!("\n[Viewer] === Summary ===");
     println!("[Viewer] Local NAT: {}", local_nat_type.map(|t| t.short_name()).unwrap_or("Unknown"));
     println!("[Viewer] Remote NAT: {}", remote_nat_hint.as_deref().unwrap_or("Unknown"));
@@ -288,10 +305,10 @@ async fn main() -> Result<()> {
     } else { "NO (relay circuit)" });
     println!("[Viewer] Total frames: {frame_count}");
     println!("[Viewer] Total bytes: {bytes_received}");
-    if elapsed > 0.0 {
-        println!("[Viewer] Duration: {elapsed:.1}s");
-        println!("[Viewer] Avg fps: {:.1}", frame_count as f64 / elapsed);
-        println!("[Viewer] Avg bitrate: {:.0} kbps", (bytes_received * 8) as f64 / elapsed / 1000.0);
+    if video_elapsed > 0.0 {
+        println!("[Viewer] Duration: {video_elapsed:.1}s");
+        println!("[Viewer] Avg fps: {:.1}", frame_count as f64 / video_elapsed);
+        println!("[Viewer] Avg bitrate: {:.0} kbps", (bytes_received * 8) as f64 / video_elapsed / 1000.0);
     }
 
     if let Some(path) = &opt.output {
@@ -357,13 +374,13 @@ fn drain_channel(
     rx: &mut mpsc::Receiver<MediaPacket>,
     frame_count: &mut u64,
     bytes_received: &mut u64,
-    start: &std::time::Instant,
+    video_start: &mut Option<std::time::Instant>,
     output_file: &mut Option<std::fs::File>,
     #[cfg(feature = "player")] mut player: Option<&mut player::VideoPlayer>,
 ) {
     while let Ok(packet) = rx.try_recv() {
         if !process_video_frame(
-            packet, frame_count, bytes_received, start, output_file,
+            packet, frame_count, bytes_received, video_start, output_file,
             #[cfg(feature = "player")]
             player.as_mut().map(|p| &mut **p),
         ) {
@@ -586,6 +603,7 @@ async fn run_viewer_session(
     }
 
     // ---- 2. 使用 mDNS LAN 直连 或 Relay circuit 拨号 DeviceCam ----
+    let mut initial_is_relay = false;
     if let Some(lan_addr) = mdns_discovered_addr {
         // mDNS 发现了目标 DeviceCam，优先使用 LAN 直连
         tracing::info!("[Viewer] Using mDNS-discovered LAN address: {lan_addr}");
@@ -607,6 +625,7 @@ async fn run_viewer_session(
             SwarmEvent::ConnectionEstablished { peer_id, .. } if *peer_id == device_cam
         ), "device-cam circuit connection", &mut local_ips, &mut local_quic_port, &mut pending_events).await?;
         println!("[Viewer] Connected to device-cam {device_cam} via relay circuit");
+        initial_is_relay = true;
     } else {
         anyhow::bail!("Failed to connect: no relay connection established and no mDNS discovery");
     }
@@ -625,12 +644,15 @@ async fn run_viewer_session(
 
     // ---- 3. 打开 video stream ----
     let mut stream_control = swarm.behaviour().stream.new_control();
-    let video_protocol = get_video_protocol(&stream_type);
+    let video_protocol = resolve_stream_protocol(&stream_type, initial_is_relay);
+    let resolved_name = if video_protocol == stream_protocols::VIDEO_MAIN_PROTOCOL { "main" }
+        else if video_protocol == stream_protocols::VIDEO_SUB_PROTOCOL { "sub" }
+        else { "third" };
     let video_stream = stream_control
         .open_stream(device_cam, video_protocol)
         .await
         .context("Failed to open video stream")?;
-    println!("[Viewer] Video stream opened (stream={})", stream_type);
+    println!("[Viewer] Video stream opened (requested={}, resolved={}, relay={})", stream_type, resolved_name, initial_is_relay);
 
     // ---- 3b. 打开 audio stream (可选) ----
     let mut audio_abort_handle: Option<tokio::task::AbortHandle> = None;
@@ -652,8 +674,9 @@ async fn run_viewer_session(
     let mut video_abort_handle: Option<tokio::task::AbortHandle> =
         Some(tokio::spawn(receive_frames(device_cam, video_stream, video_tx.clone())).abort_handle());
 
-    let mut direct_upgraded = false;
+    let mut direct_upgraded = !initial_is_relay; // 初始直连时无需再升级
     let mut lan_direct_attempted = false;
+    let mut relay_connection_id: Option<libp2p::swarm::ConnectionId> = None;
 
     // 初始化 NAT 诊断（如果 wait_for_event 期间已收集到 local_ips）
     if nat_diagnostic.is_none() && local_quic_port != 0 && !local_ips.is_empty() {
@@ -680,11 +703,12 @@ async fn run_viewer_session(
 
         match event {
             // DCUtR 或局域网直连建立后，升级 stream
-            SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } if peer_id == device_cam && !direct_upgraded => {
+            SwarmEvent::ConnectionEstablished { peer_id, endpoint, connection_id, .. } if peer_id == device_cam && !direct_upgraded => {
                 let addr = endpoint.get_remote_address().clone();
                 let is_relay = addr.iter().any(|p| matches!(p, Protocol::P2pCircuit));
                 if is_relay {
-                    // 初始的 circuit 连接，忽略
+                    // 记录中继连接 ID，直连升级后关闭
+                    relay_connection_id = Some(connection_id);
                     continue;
                 }
                 // 判断直连类型：如果远程地址是私有 IP，则为局域网直连
@@ -693,18 +717,34 @@ async fn run_viewer_session(
                 });
                 let via = if is_lan { "LAN direct" } else { "DCUtR hole punch" };
                 println!("[Viewer] Direct connection established with {device_cam} via {via}, upgrading streams...");
-                let video_protocol2 = get_video_protocol(&stream_type);
-                match stream_control.open_stream(device_cam, video_protocol2).await {
+                // 直连升级：如果 stream_type 为 "auto"，在直连上打开主码流
+                let upgrade_protocol = if stream_type == "auto" {
+                    stream_protocols::VIDEO_MAIN_PROTOCOL
+                } else {
+                    get_video_protocol(&stream_type)
+                };
+                match stream_control.open_stream(device_cam, upgrade_protocol).await {
                     Ok(new_stream) => {
                         if let Some(h) = video_abort_handle.take() { h.abort(); }
                         let handle = tokio::spawn(receive_frames(device_cam, new_stream, video_tx.clone())).abort_handle();
                         video_abort_handle = Some(handle);
                         direct_upgraded = true;
                         let _ = event_tx.send(SessionEvent::DirectUpgraded { via_lan: is_lan }).await;
-                        println!("[Viewer] Video stream upgraded to direct connection");
+                        if stream_type == "auto" {
+                            println!("[Viewer] Stream upgraded: sub → main (direct connection)");
+                        } else {
+                            println!("[Viewer] Video stream upgraded to direct connection (stream={})", stream_type);
+                        }
+
+                        // 直连升级成功后，关闭中继连接
+                        // 防止 DCUtR 基于中继连接继续尝试打洞，导致视频卡顿
+                        if let Some(relay_conn_id) = relay_connection_id.take() {
+                            tracing::info!("[Viewer] Closing relay circuit connection after direct upgrade (prevents DCUtR interference)");
+                            swarm.close_connection(relay_conn_id);
+                        }
                     }
                     Err(e) => {
-                        println!("[Viewer] Failed to open direct video stream (staying on circuit): {e}");
+                        println!("[Viewer] Failed to open direct video stream (staying on current): {e}");
                     }
                 }
                 if direct_upgraded && !no_audio {
@@ -931,12 +971,17 @@ fn process_video_frame(
     packet: MediaPacket,
     frame_count: &mut u64,
     bytes_received: &mut u64,
-    start: &std::time::Instant,
+    video_start: &mut Option<std::time::Instant>,
     output_file: &mut Option<std::fs::File>,
     #[cfg(feature = "player")] player: Option<&mut player::VideoPlayer>,
 ) -> bool {
     *frame_count += 1;
     *bytes_received += packet.data.len() as u64;
+
+    // 第一帧到达时记录起始时间，用于 fps 计算
+    if video_start.is_none() {
+        *video_start = Some(std::time::Instant::now());
+    }
 
     if let Some(file) = output_file {
         use std::io::Write;
@@ -961,14 +1006,16 @@ fn process_video_frame(
     }
 
     if *frame_count % 100 == 0 {
-        let elapsed = start.elapsed().as_secs_f64();
-        let fps = *frame_count as f64 / elapsed;
-        let kbps = (*bytes_received * 8) as f64 / elapsed / 1000.0;
-        let keyframe = if packet.is_keyframe() { "[I]" } else { "   " };
-        println!(
-            "[Viewer] {keyframe} frame #{} | {:.1} fps | {:.0} kbps | ts={}",
-            frame_count, fps, kbps, packet.timestamp_ms
-        );
+        if let Some(start) = video_start {
+            let elapsed = start.elapsed().as_secs_f64();
+            let fps = *frame_count as f64 / elapsed;
+            let kbps = (*bytes_received * 8) as f64 / elapsed / 1000.0;
+            let keyframe = if packet.is_keyframe() { "[I]" } else { "   " };
+            println!(
+                "[Viewer] {keyframe} frame #{} | {:.1} fps | {:.0} kbps | ts={}",
+                frame_count, fps, kbps, packet.timestamp_ms
+            );
+        }
     }
 
     true
@@ -1387,8 +1434,8 @@ struct Opt {
     #[arg(long, default_value = "viewer.toml")]
     config: PathBuf,
 
-    /// 视频流类型 (覆盖配置文件): main, sub, third (默认 main)
-    #[arg(long, default_value = "main")]
+    /// 视频流类型 (覆盖配置文件): auto, main, sub, third (默认 auto)
+    #[arg(long, default_value = "auto")]
     stream: String,
 
     /// Relay Server 地址 (可多次使用, 覆盖配置文件)
@@ -1450,7 +1497,7 @@ struct ViewerConfig {
     udp_port: Option<u16>,
 }
 
-fn default_stream() -> String { "main".to_string() }
+fn default_stream() -> String { "auto".to_string() }
 
 impl Default for ViewerConfig {
     fn default() -> Self {

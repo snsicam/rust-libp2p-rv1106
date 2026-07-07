@@ -41,6 +41,60 @@ fn get_video_protocol(stream_type: &str) -> StreamProtocol {
     }
 }
 
+/// 码流选择决策器：根据连接方式和用户偏好决定使用哪个码流
+///
+/// - "auto" 模式：转发→子码流，直连→主码流
+/// - 手动模式：直接使用用户指定的码流
+struct StreamTypeResolver {
+    /// 用户指定的 stream_type: "auto" | "main" | "sub" | "third"
+    stream_type: String,
+    /// 当前连接方式
+    connection_type: ConnectionType,
+}
+
+impl StreamTypeResolver {
+    fn new(stream_type: &str) -> Self {
+        Self {
+            stream_type: stream_type.to_string(),
+            connection_type: ConnectionType::Disconnected,
+        }
+    }
+
+    /// 根据连接方式决定码流协议
+    fn resolve(&self) -> StreamProtocol {
+        match self.stream_type.as_str() {
+            "auto" => {
+                // 自动选择：转发→子码流，直连→主码流，未知→子码流（保守策略）
+                match self.connection_type {
+                    ConnectionType::RelayCircuit => stream_protocols::VIDEO_SUB_PROTOCOL,
+                    ConnectionType::QuicDirect
+                    | ConnectionType::LanDirect
+                    | ConnectionType::TcpDirect => stream_protocols::VIDEO_MAIN_PROTOCOL,
+                    ConnectionType::Disconnected => stream_protocols::VIDEO_SUB_PROTOCOL,
+                }
+            }
+            other => get_video_protocol(other),
+        }
+    }
+
+    /// 更新连接方式（ConnectionEstablished 时调用）
+    fn update_connection_type(&mut self, conn_type: ConnectionType) {
+        self.connection_type = conn_type;
+    }
+
+    /// 判断是否需要码流切换（从转发升级到直连时）
+    fn should_upgrade_stream(&self, old_conn: ConnectionType) -> bool {
+        self.stream_type == "auto"
+            && old_conn.is_relay()
+            && self.connection_type.is_direct()
+    }
+
+    /// 直连升级后应使用的码流协议（主码流）
+    fn upgrade_protocol(&self) -> StreamProtocol {
+        stream_protocols::VIDEO_MAIN_PROTOCOL
+    }
+}
+
 /// P2P Viewer — 对外暴露的核心结构
 pub struct P2pViewer {
     swarm: Swarm<ViewerBehaviour>,
@@ -54,6 +108,9 @@ pub struct P2pViewer {
     connection_quality: ConnectionQuality,
     device_cam_peer_id: Option<PeerId>,
     lan_direct_attempted: bool,
+    stream_resolver: StreamTypeResolver,
+    video_abort_handle: Option<tokio::task::AbortHandle>,
+    relay_connection_id: Option<libp2p::swarm::ConnectionId>,
     pub connected: bool,
 }
 
@@ -98,6 +155,9 @@ impl P2pViewer {
             connection_quality: ConnectionQuality::default(),
             device_cam_peer_id: None,
             lan_direct_attempted: false,
+            stream_resolver: StreamTypeResolver::new("auto"),
+            video_abort_handle: None,
+            relay_connection_id: None,
             connected: false,
         })
     }
@@ -109,7 +169,8 @@ impl P2pViewer {
     /// - 如果 enable_mdns，并行监听 mDNS 发现事件
     /// - mDNS 发现目标 DeviceCam 时，优先使用 LAN 直连
     /// - mDNS 5 秒超时后回退到 Relay circuit
-    /// - stream_type: "main" | "sub" | "third" 选择请求哪个码流
+    /// - stream_type: "auto" | "main" | "sub" | "third" 选择请求哪个码流
+    ///   "auto" 模式下根据连接方式自动选择：转发→子码流，直连→主码流
     pub async fn connect(
         &mut self,
         relay_addrs: &[String],
@@ -119,6 +180,9 @@ impl P2pViewer {
     ) -> Result<()> {
         let device_cam: PeerId = device_cam_peer_id.parse()?;
         self.device_cam_peer_id = Some(device_cam);
+
+        // 初始化码流选择器
+        self.stream_resolver = StreamTypeResolver::new(stream_type);
 
         // 解析所有 Relay 地址
         let relay_multiaddrs: Vec<Multiaddr> = relay_addrs.iter()
@@ -221,7 +285,8 @@ impl P2pViewer {
         if let Some(lan_addr) = mdns_discovered_addr {
             tracing::info!("[Viewer] Using mDNS-discovered LAN address: {lan_addr}");
             self.swarm.dial(lan_addr)?;
-            self.wait_for_connection().await?;
+            let conn_type = self.wait_for_connection_and_classify().await?;
+            self.stream_resolver.update_connection_type(conn_type);
         } else if let Some((_relay_peer_id, relay_addr)) = connected_relay {
             // 通过 Relay circuit 拨号 DeviceCam
             let circuit_addr = relay_addr
@@ -229,13 +294,24 @@ impl P2pViewer {
                 .with(Protocol::P2p(device_cam));
             tracing::info!("[Viewer] Dialing DeviceCam via circuit: {circuit_addr}");
             self.swarm.dial(circuit_addr)?;
-            self.wait_for_connection().await?;
+            let conn_type = self.wait_for_connection_and_classify().await?;
+            self.stream_resolver.update_connection_type(conn_type);
         } else {
             anyhow::bail!("Failed to connect: no relay connection and no mDNS discovery");
         }
 
-        // 打开视频 stream (选择码流类型)
-        let video_protocol = get_video_protocol(stream_type);
+        // 根据连接方式选择码流
+        let video_protocol = self.stream_resolver.resolve();
+        let resolved_name = if video_protocol == stream_protocols::VIDEO_MAIN_PROTOCOL { "main" }
+            else if video_protocol == stream_protocols::VIDEO_SUB_PROTOCOL { "sub" }
+            else { "third" };
+        tracing::info!(
+            "[Viewer] Stream selected: {} (connection={:?}, stream_type={})",
+            resolved_name,
+            self.stream_resolver.connection_type,
+            stream_type
+        );
+
         let video_stream = self.stream_control
             .open_stream(device_cam, video_protocol)
             .await
@@ -253,7 +329,8 @@ impl P2pViewer {
         let video_sender = self.video_sender.clone();
         let audio_sender = self.audio_sender.clone();
 
-        tokio::spawn(Self::receive_frames(device_cam, video_stream, video_sender));
+        let video_handle = tokio::spawn(Self::receive_frames(device_cam, video_stream, video_sender)).abort_handle();
+        self.video_abort_handle = Some(video_handle);
         tokio::spawn(Self::receive_frames(device_cam, audio_stream, audio_sender));
 
         self.connected = true;
@@ -378,11 +455,18 @@ impl P2pViewer {
                         }
                     }
                 }
-                SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+                SwarmEvent::ConnectionEstablished { peer_id, endpoint, connection_id, .. } => {
                     let addr = endpoint.get_remote_address().clone();
                     self.connection_quality.active_connections += 1;
+
+                    // 记录旧连接方式，用于判断是否需要码流切换
+                    let old_conn_type = self.stream_resolver.connection_type;
+
                     if addr.iter().any(|p| matches!(p, Protocol::P2pCircuit)) {
                         self.connection_quality.connection_type = ConnectionType::RelayCircuit;
+                        self.stream_resolver.update_connection_type(ConnectionType::RelayCircuit);
+                        // 记录中继连接 ID，直连升级后关闭
+                        self.relay_connection_id = Some(connection_id);
 
                         // DCUtR 尝试前预测：在 circuit 连接建立后立即输出 NAT 上下文
                         let prediction = self.nat_diagnostic.dcutr_prediction();
@@ -398,11 +482,41 @@ impl P2pViewer {
                         if is_lan {
                             self.connection_quality.connection_type = ConnectionType::LanDirect;
                             self.connection_quality.direct_upgraded = true;
+                            self.stream_resolver.update_connection_type(ConnectionType::LanDirect);
                             tracing::info!("[Viewer] LAN direct connection established with {peer_id}");
                         } else {
                             self.connection_quality.connection_type = ConnectionType::QuicDirect;
+                            self.stream_resolver.update_connection_type(ConnectionType::QuicDirect);
                         }
                     }
+
+                    // 直连升级码流切换：从转发升级到直连时，从子码流切换到主码流
+                    if let Some(device_cam) = self.device_cam_peer_id {
+                        if peer_id == device_cam && self.stream_resolver.should_upgrade_stream(old_conn_type) {
+                            let main_protocol = self.stream_resolver.upgrade_protocol();
+                            match self.stream_control.open_stream(device_cam, main_protocol).await {
+                                Ok(new_stream) => {
+                                    if let Some(h) = self.video_abort_handle.take() { h.abort(); }
+                                    let handle = tokio::spawn(
+                                        Self::receive_frames(device_cam, new_stream, self.video_sender.clone())
+                                    ).abort_handle();
+                                    self.video_abort_handle = Some(handle);
+                                    tracing::info!("[Viewer] Stream upgraded: sub → main (direct connection established)");
+
+                                    // 直连升级成功后，关闭中继连接
+                                    // 防止 DCUtR 基于中继连接继续尝试打洞，导致视频卡顿
+                                    if let Some(relay_conn_id) = self.relay_connection_id.take() {
+                                        tracing::info!("[Viewer] Closing relay circuit connection after direct upgrade (prevents DCUtR interference)");
+                                        self.swarm.close_connection(relay_conn_id);
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!("[Viewer] Failed to open main stream on direct connection, staying on sub: {e}");
+                                }
+                            }
+                        }
+                    }
+
                     tracing::debug!("[Viewer] Connection established: {peer_id}, active={}", self.connection_quality.active_connections);
                 }
                 SwarmEvent::ConnectionClosed { peer_id, num_established, .. } => {
@@ -436,12 +550,37 @@ impl P2pViewer {
 
     // ---- 内部方法 ----
 
-    async fn wait_for_connection(&mut self) -> Result<()> {
+    /// 等待与 DeviceCam 的连接建立，并判断连接方式（转发/直连）
+    ///
+    /// 在 ConnectionEstablished 事件中分析 Multiaddr 判断连接方式，
+    /// 返回 ConnectionType 用于码流自动选择。
+    async fn wait_for_connection_and_classify(&mut self) -> Result<ConnectionType> {
         loop {
             match self.swarm.select_next_some().await {
-                SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                SwarmEvent::ConnectionEstablished { peer_id, endpoint, connection_id, .. } => {
+                    let addr = endpoint.get_remote_address().clone();
                     println!("[Viewer] Connected to {peer_id}");
-                    return Ok(());
+
+                    // 判断连接方式
+                    let conn_type = if addr.iter().any(|p| matches!(p, Protocol::P2pCircuit)) {
+                        // 记录中继连接 ID，直连升级后关闭
+                        self.relay_connection_id = Some(connection_id);
+                        ConnectionType::RelayCircuit
+                    } else if addr.iter().any(|p| matches!(p, Protocol::QuicV1)) {
+                        let is_lan = addr.iter().any(|p| {
+                            if let Protocol::Ip4(ip) = p { ip.is_private() } else { false }
+                        });
+                        if is_lan {
+                            ConnectionType::LanDirect
+                        } else {
+                            ConnectionType::QuicDirect
+                        }
+                    } else {
+                        ConnectionType::TcpDirect
+                    };
+
+                    tracing::info!("[Viewer] Connection type: {}", conn_type.description());
+                    return Ok(conn_type);
                 }
                 SwarmEvent::OutgoingConnectionError { error, .. } => {
                     anyhow::bail!("Connection failed: {error}");
