@@ -9,6 +9,7 @@
 | [P2P_CAMERA_PLAN.md](P2P_CAMERA_PLAN.md) | 项目概览、总体架构、模块设计、协议定义、关键技术决策 | 首次了解项目 |
 | [bugfix-log.md](bugfix-log.md) | Bug 修复记录、关键设计决策、API 注意事项 | 排查问题或修改代码前 |
 | [dcutr-vs-stun-turn.md](dcutr-vs-stun-turn.md) | DCUtR 与 STUN/TURN NAT 穿透方案对比 | 理解 NAT 穿透选型 |
+| [auth-and-device-management.md](auth-and-device-management.md) | 设备授权与用户管理方案（外网+局域网双场景） | 实现设备注册、用户绑定、权限控制前 |
 
 ## 项目速览
 
