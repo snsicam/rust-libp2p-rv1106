@@ -350,6 +350,19 @@ impl P2pViewer {
         self.jitter.next_video()
     }
 
+    /// 获取下一个音频帧 (供 Native UI 层轮询)
+    pub fn poll_audio_frame(&mut self) -> Option<MediaPacket> {
+        // 先尝试从 Jitter Buffer 取
+        if let Some(frame) = self.jitter.next_audio() {
+            return Some(frame);
+        }
+        // 再尝试从接收 channel 取新包送入 jitter
+        while let Ok(packet) = self.audio_receiver.try_recv() {
+            self.jitter.push(packet);
+        }
+        self.jitter.next_audio()
+    }
+
     /// 驱动 Swarm 事件循环 (需要定期调用)
     pub async fn poll_swarm(&mut self) {
         if let Some(event) = self.swarm.next().await {
