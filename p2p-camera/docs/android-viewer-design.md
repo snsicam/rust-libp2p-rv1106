@@ -75,7 +75,7 @@
 ## 3. Android 项目结构
 
 ```
-p2p-camera/android-media/demos/p2pviewer/          ← 新建
+p2p-camera/android-media/demos/mediaplayer/          ← 新建
 ├── build.gradle                                     # 依赖声明
 ├── src/main/
 │   ├── AndroidManifest.xml
@@ -576,7 +576,7 @@ onLowMemory()
 
 # Step 3: Gradle 编译 APK
 cd p2p-camera/android-media
-ANDROID_HOME=$HOME/android-sdk ./gradlew :demos:p2pviewer:assembleRelease
+ANDROID_HOME=$HOME/android-sdk ./gradlew :demos:mediaplayer:assembleRelease
 ```
 
 ### 9.2 开发工作流
@@ -586,7 +586,7 @@ ANDROID_HOME=$HOME/android-sdk ./gradlew :demos:p2pviewer:assembleRelease
 ./scripts/build_android.sh                    # 编译 .so + 复制到 jniLibs
 
 # 2. 用 Android Studio 打开 android-media/ 目录
-# 3. 选择 demos:p2pviewer 模块运行
+# 3. 选择 demos:mediaplayer 模块运行
 ```
 
 ---
@@ -608,7 +608,7 @@ ANDROID_HOME=$HOME/android-sdk ./gradlew :demos:p2pviewer:assembleRelease
 
 | 子任务 | 说明 |
 |--------|------|
-| 创建 `demos/p2pviewer/` 目录 | `build.gradle` + `AndroidManifest.xml` |
+| 创建 `demos/mediaplayer/` 目录 | `build.gradle` + `AndroidManifest.xml` |
 | 注册到 Gradle settings | `core_settings.gradle` 或新建 `settings.gradle` |
 | 验证 Gradle sync 通过 | 能编译空 Activity |
 

@@ -479,7 +479,7 @@ impl MediaPacket {
 ├─────────────────────────────────────────┤
 │  Rust FFI Layer (.so / .a)              │
 │  ┌─────────────────────────────────────┐│
-│  │ p2p_viewer_lib (Rust)               ││
+│  │ media_player_lib (Rust)             ││
 │  │                                     ││
 │  │ - libp2p Swarm (QUIC + Noise)       ││
 │  │ - relay::client + dcutr            ││
@@ -745,7 +745,7 @@ Track: 0x01=Video(H.265 NAL), 0x02=Audio(PCM/AAC)
 ```
 任务:
 ├── [Day1-2] Rust FFI 核心库
-│   ├── p2p_viewer_lib crate
+│   ├── media_player_lib crate
 │   ├── C API 导出 (视频+音频分离接口)
 │   ├── Android: cargo-ndk 编译 .so
 │   └── iOS: cargo-lipo 编译 .a

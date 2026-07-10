@@ -96,7 +96,7 @@ impl StreamTypeResolver {
 }
 
 /// P2P Viewer — 对外暴露的核心结构
-pub struct P2pViewer {
+pub struct MediaPlayer {
     swarm: Swarm<ViewerBehaviour>,
     stream_control: Control,
     jitter: AvJitterBuffer,
@@ -114,7 +114,7 @@ pub struct P2pViewer {
     pub connected: bool,
 }
 
-impl P2pViewer {
+impl MediaPlayer {
     /// 创建新的 Viewer 实例
     pub async fn new() -> Result<Self> {
         let keypair = libp2p::identity::Keypair::generate_ed25519();

@@ -133,7 +133,7 @@ p2p-camera/
 │   ├── app/
 │   │   ├── build.gradle.kts
 │   │   └── src/main/
-│   │       ├── java/yj/p2pviewer/
+│   │       ├── java/yj/mediaplayer/
 │   │       │   └── MainActivity.kt
 │   │       └── jniLibs/
 │   │           ├── arm64-v8a/
