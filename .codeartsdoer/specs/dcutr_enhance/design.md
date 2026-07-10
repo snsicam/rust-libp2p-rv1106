@@ -137,7 +137,7 @@ p2p-camera/
 
 ### 模块 C: viewer.rs 同步增强
 
-**问题**：`mobile-core/src/viewer.rs` 中的 `P2pViewer` 已有 `NatDiagnostic` 集成，但缺少 4G 检测和策略建议。
+**问题**：`mobile-core/src/viewer.rs` 中的 `MediaPlayer` 已有 `NatDiagnostic` 集成，但缺少 4G 检测和策略建议。
 
 **方案**：
 

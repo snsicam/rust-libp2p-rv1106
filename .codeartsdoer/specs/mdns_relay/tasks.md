@@ -174,7 +174,7 @@
 
 ## 阶段四：Viewer mDNS 优先 + 多 Relay 并发拨号
 
-### 任务 10：P2pViewer::connect() 改造（viewer.rs）
+### 任务 10：MediaPlayer::connect() 改造（viewer.rs）
 
 **文件**: `p2p-camera/mobile-core/src/viewer.rs`
 
@@ -255,7 +255,7 @@
                                                                     │
 任务 4 (DeviceCam Cargo.toml) ──→ 任务 5 (DeviceCam Behaviour) ──→ │
                                                                     │
-任务 6 (mobile-core Cargo.toml) ──→ 任务 7 (viewer.rs Behaviour) ──→ 任务 10 (P2pViewer connect)
+任务 6 (mobile-core Cargo.toml) ──→ 任务 7 (viewer.rs Behaviour) ──→ 任务 10 (MediaPlayer connect)
                   │                                                 │
                   └──→ 任务 8 (viewer_cli Behaviour) ──────────────→│
                                                                     │

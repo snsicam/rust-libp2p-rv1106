@@ -844,7 +844,7 @@ p2p-camera/
 │   ├── build.rs               # 编译时间戳
 │   ├── src/
 │   │   ├── lib.rs             # FFI 导出 (视频+音频接口)
-│   │   ├── viewer.rs          # P2pViewer 核心
+│   │   ├── viewer.rs          # MediaPlayer 核心
 │   │   ├── behaviour.rs       # NetworkBehaviour
 │   │   ├── jitter_buffer.rs   # AvJitterBuffer (音视频分离)
 │   │   ├── media_packet.rs    # MediaPacket 解析
@@ -857,14 +857,14 @@ p2p-camera/
 │   ├── app/
 │   │   ├── build.gradle
 │   │   └── src/main/
-│   │       ├── java/.../P2pViewer.kt      # JNI 封装
+│   │       ├── java/.../MediaPlayer.kt      # JNI 封装
 │   │       ├── java/.../VideoDecoder.kt    # MediaCodec
 │   │       └── java/.../MainActivity.kt    # UI
 │   └── jniLibs/               # .so 文件
 │
 ├── mobile-ios/                # iOS APP (可选)
-│   ├── P2PViewer/
-│   │   ├── P2pViewer.swift    # C FFI 封装
+│   ├── MediaPlayer/
+│   │   ├── MediaPlayer.swift    # C FFI 封装
 │   │   ├── VideoDecoder.swift # VideoToolbox
 │   │   └── ContentView.swift  # UI
 │   └── libs/                  # .a 文件

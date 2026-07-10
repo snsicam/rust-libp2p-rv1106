@@ -97,7 +97,7 @@ start_emulator() {
     fi
 
     info "启动模拟器: $AVD_NAME"
-    nohup "$EMULATOR" -avd "$AVD_NAME" -no-snapshot-load -gpu swiftshader_indirect > /tmp/emulator.log 2>&1 &
+    nohup "$EMULATOR" -avd "$AVD_NAME" -no-window -no-snapshot-load -gpu swiftshader_indirect > /tmp/emulator.log 2>&1 &
 
     info "等待模拟器启动..."
     "$ADB" wait-for-device || true

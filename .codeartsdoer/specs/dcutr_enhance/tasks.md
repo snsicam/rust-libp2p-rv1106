@@ -143,7 +143,7 @@
 
 **实现要点**:
 
-1. `P2pViewer::new()` 中 `NatDiagnostic::new(0)` 改为 `NatDiagnostic::new(0, Vec::new())`（初始无 IP 信息，后续通过 Identify 事件补充）
+1. `MediaPlayer::new()` 中 `NatDiagnostic::new(0)` 改为 `NatDiagnostic::new(0, Vec::new())`（初始无 IP 信息，后续通过 Identify 事件补充）
 
 2. 在 `SwarmEvent::Behaviour(ViewerBehaviourEvent::Dcutr(Event { result: Err(...), ... }))` 事件处理中：
    - 获取 `nat_diagnostic.diagnose()` 的策略建议

@@ -650,7 +650,7 @@ ANDROID_HOME=$HOME/android-sdk ./gradlew :demos:p2pviewer:assembleRelease
 | 文件 | 用途 |
 |------|------|
 | `mobile-core/src/jni_bridge.rs` | JNI 导出函数（待补充音频+PTS） |
-| `mobile-core/src/viewer.rs` | P2pViewer 核心逻辑 |
+| `mobile-core/src/viewer.rs` | MediaPlayer 核心逻辑 |
 | `mobile-core/src/jitter_buffer.rs` | 音视频 Jitter Buffer |
 | `proto/src/media_packet.rs` | MediaPacket 协议定义 |
 | `scripts/build_android.sh` | 交叉编译脚本 |

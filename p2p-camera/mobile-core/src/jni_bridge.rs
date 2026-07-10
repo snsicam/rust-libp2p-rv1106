@@ -1,4 +1,4 @@
-//! JNI 桥接 — Android (Kotlin/Java) 调用 Rust P2pViewer 的接口
+//! JNI 桥接 — Android (Kotlin/Java) 调用 Rust MediaPlayer 的接口
 //!
 //! Kotlin 侧对应类: com.p2pcamera.mediaplayer.RustBridge
 //!
@@ -21,7 +21,7 @@ use jni::{
 use serde::Serialize;
 use tokio::runtime::Runtime;
 
-use crate::viewer::P2pViewer;
+use crate::viewer::MediaPlayer;
 use proto::media_packet::MediaPacket;
 
 // ── Event 类型 ──
@@ -122,7 +122,7 @@ pub extern "system" fn Java_com_p2pcamera_mediaplayer_RustBridge_nativeCreate(
     let (event_tx, event_rx) = bounded::<ViewerEvent>(32);
     let (cmd_tx, cmd_rx) = bounded::<Cmd>(4);
 
-    // 启动后台 tokio runtime，驱动 P2pViewer
+    // 启动后台 tokio runtime，驱动 MediaPlayer
     std::thread::spawn(move || {
         let rt = match Runtime::new() {
             Ok(rt) => rt,
@@ -136,7 +136,7 @@ pub extern "system" fn Java_com_p2pcamera_mediaplayer_RustBridge_nativeCreate(
 
         rt.block_on(async {
             // 创建 viewer
-            let mut viewer = match P2pViewer::new().await {
+            let mut viewer = match MediaPlayer::new().await {
                 Ok(v) => v,
                 Err(e) => {
                     let _ = event_tx.send(ViewerEvent::Error {
