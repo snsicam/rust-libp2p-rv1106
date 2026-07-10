@@ -47,6 +47,9 @@ enum Cmd {
     Connect {
         relays: Vec<String>,
         device_id: String,
+        enable_mdns: bool,
+        stream_type: String,
+        no_audio: bool,
     },
 }
 
@@ -82,16 +85,24 @@ fn alloc_handle(handle: ViewerHandle) -> usize {
     with_handles(|handles| {
         if let Some(pos) = handles.iter().position(|h| h.is_none()) {
             handles[pos] = Some(handle);
-            pos
+            pos + 1 // 返回 1-based 索引，0 表示无效句柄
         } else {
             handles.push(Some(handle));
-            handles.len() - 1
+            handles.len() // len 已经是 1-based
         }
     })
 }
 
 fn take_handle(idx: usize) -> Option<ViewerHandle> {
-    with_handles(|handles| handles.get_mut(idx)?.take())
+    if idx == 0 { return None; }
+    with_handles(|handles| handles.get_mut(idx - 1)?.take())
+}
+
+/// 将 JNI handle (1-based) 转为 Vec 索引 (0-based)
+fn handle_to_idx(handle: jlong) -> Option<usize> {
+    let idx = handle as usize;
+    if idx == 0 { return None; }
+    Some(idx - 1)
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -135,13 +146,16 @@ pub extern "system" fn Java_com_p2pcamera_mediaplayer_RustBridge_nativeCreate(
                 }
             };
 
+            // audio_tx 用 Option 包装，no_audio 时 take() 关闭发送端
+            let mut audio_tx = Some(audio_tx);
+
             // 等待连接命令
             match cmd_rx.recv() {
-                Ok(Cmd::Connect { relays, device_id }) => {
+                Ok(Cmd::Connect { relays, device_id, enable_mdns, stream_type, no_audio }) => {
                     let _ = event_tx.send(ViewerEvent::Connecting);
                     let relay_strs: Vec<String> = relays.clone();
                     match viewer
-                        .connect(&relay_strs, &device_id, false, "auto")
+                        .connect(&relay_strs, &device_id, enable_mdns, &stream_type)
                         .await
                     {
                         Ok(()) => {
@@ -157,6 +171,11 @@ pub extern "system" fn Java_com_p2pcamera_mediaplayer_RustBridge_nativeCreate(
                             });
                             return;
                         }
+                    }
+
+                    // 如果 no_audio，关闭音频发送端（Android 侧 pollAudioFrame 将返回 null）
+                    if no_audio {
+                        drop(audio_tx.take());
                     }
                 }
                 Err(_) => return, // channel closed
@@ -176,10 +195,17 @@ pub extern "system" fn Java_com_p2pcamera_mediaplayer_RustBridge_nativeCreate(
                             }
                         }
                         // 定期拉音频帧 → 发送到 Android 侧
-                        while let Some(frame) = viewer.poll_audio_frame() {
-                            if audio_tx.send(frame).is_err() {
-                                return; // Android 侧已销毁
+                        // (如果 no_audio 已 take audio_tx，poll 结果会被忽略)
+                        if let Some(tx) = audio_tx.as_ref() {
+                            while let Some(frame) = viewer.poll_audio_frame() {
+                                if tx.send(frame).is_err() {
+                                    // Android 侧已销毁
+                                    return;
+                                }
                             }
+                        } else {
+                            // no_audio 模式：丢弃音频帧
+                            while viewer.poll_audio_frame().is_some() {}
                         }
                     }
                 }
@@ -207,7 +233,10 @@ pub extern "system" fn Java_com_p2pcamera_mediaplayer_RustBridge_nativeConnect(
     handle: jlong,
     json: JString,
 ) -> jboolean {
-    let idx = handle as usize;
+    let idx = match handle_to_idx(handle) {
+        Some(i) => i,
+        None => return JNI_FALSE,
+    };
 
     let json_str: String = match env.get_string(&json) {
         Ok(s) => s.into(),
@@ -242,6 +271,15 @@ pub extern "system" fn Java_com_p2pcamera_mediaplayer_RustBridge_nativeConnect(
         .unwrap_or("")
         .to_string();
 
+    let enable_mdns = config["enable_mdns"].as_bool().unwrap_or(false);
+
+    let stream_type = config["stream_type"]
+        .as_str()
+        .unwrap_or("auto")
+        .to_string();
+
+    let no_audio = config["no_audio"].as_bool().unwrap_or(false);
+
     if relays.is_empty() || device_id.is_empty() {
         let _ = env.throw_new(
             "java/lang/IllegalArgumentException",
@@ -254,7 +292,7 @@ pub extern "system" fn Java_com_p2pcamera_mediaplayer_RustBridge_nativeConnect(
         handles
             .get(idx)
             .and_then(|h| h.as_ref())
-            .map(|h| h.cmd_tx.send(Cmd::Connect { relays, device_id }).is_ok())
+            .map(|h| h.cmd_tx.send(Cmd::Connect { relays, device_id, enable_mdns, stream_type, no_audio }).is_ok())
             .unwrap_or(false)
     });
 
@@ -284,7 +322,10 @@ pub extern "system" fn Java_com_p2pcamera_mediaplayer_RustBridge_nativePollVideo
     _class: JClass,
     handle: jlong,
 ) -> jbyteArray {
-    let idx = handle as usize;
+    let idx = match handle_to_idx(handle) {
+        Some(i) => i,
+        None => return std::ptr::null_mut(),
+    };
     let frame = with_handles(|handles| {
         handles
             .get(idx)
@@ -342,7 +383,10 @@ pub extern "system" fn Java_com_p2pcamera_mediaplayer_RustBridge_nativePollAudio
     _class: JClass,
     handle: jlong,
 ) -> jbyteArray {
-    let idx = handle as usize;
+    let idx = match handle_to_idx(handle) {
+        Some(i) => i,
+        None => return std::ptr::null_mut(),
+    };
     let frame = with_handles(|handles| {
         handles
             .get(idx)
@@ -388,7 +432,10 @@ pub extern "system" fn Java_com_p2pcamera_mediaplayer_RustBridge_nativePollEvent
     _class: JClass,
     handle: jlong,
 ) -> jstring {
-    let idx = handle as usize;
+    let idx = match handle_to_idx(handle) {
+        Some(i) => i,
+        None => return std::ptr::null_mut(),
+    };
     let event = with_handles(|handles| {
         handles
             .get(idx)
