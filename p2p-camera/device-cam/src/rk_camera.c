@@ -142,8 +142,9 @@ static int isp_init() {
     rk_aiq_uapi2_sysctl_preInit_devBufCnt(
         aiq_static_info.sensor_info.sensor_name, "rkraw_rx", 2);
 
+    // sub_scene 不能为 NULL (对标 rkipc: 至少传空字符串 "")
     ret = rk_aiq_uapi2_sysctl_preInit_scene(
-        aiq_static_info.sensor_info.sensor_name, "normal", NULL);
+        aiq_static_info.sensor_info.sensor_name, "normal", "");
     if (ret < 0) printf("[rk_camera] WARN: preInit_scene failed\n");
 
     g_aiq_ctx = rk_aiq_uapi2_sysctl_init(
