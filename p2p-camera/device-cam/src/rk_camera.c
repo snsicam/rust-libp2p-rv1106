@@ -348,7 +348,7 @@ static int get_mirror(const char *m_str) {
 }
 
 static int venc_init_single(int chn_id, int width, int height,
-                             int fps, int bitrate_kbps, int gop,
+                             int fps_num, int fps_den, int bitrate_kbps, int gop,
                              int codec, int rc_mode, int rc_quality,
                              int profile, int gop_mode, int mirror,
                              int smartp_viridrlen, int stream_buf_cnt) {
@@ -372,21 +372,37 @@ static int venc_init_single(int chn_id, int width, int height,
     pRcAttr = &stAttr.stRcAttr;
     pRcAttr->enRcMode = rc_mode;
 
-    // 设置码率、GOP、帧率 (根据编码类型设置对应 union 字段)
+    // 设置帧率/GOP/码率 (根据编码类型和RC模式设置对应 union 字段)
+    int is_vbr = (rc_mode == VENC_RC_MODE_H264VBR || rc_mode == VENC_RC_MODE_H265VBR);
+
     if (codec == RK_VIDEO_ID_AVC) {
-        pRcAttr->stH264Cbr.u32BitRate = bitrate_kbps;
+        // H264: GOP + 帧率 (CBR/VBR 字段布局相同, base 通用)
         pRcAttr->stH264Cbr.u32Gop = gop;
-        pRcAttr->stH264Cbr.u32SrcFrameRateNum = fps;
-        pRcAttr->stH264Cbr.u32SrcFrameRateDen = 1;
-        pRcAttr->stH264Cbr.fr32DstFrameRateNum = fps;
-        pRcAttr->stH264Cbr.fr32DstFrameRateDen = 1;
+        pRcAttr->stH264Cbr.u32SrcFrameRateNum = fps_num;
+        pRcAttr->stH264Cbr.u32SrcFrameRateDen = fps_den;
+        pRcAttr->stH264Cbr.fr32DstFrameRateNum = fps_num;
+        pRcAttr->stH264Cbr.fr32DstFrameRateDen = fps_den;
+        if (is_vbr) {
+            pRcAttr->stH264Vbr.u32BitRate = bitrate_kbps;
+            pRcAttr->stH264Vbr.u32MaxBitRate = bitrate_kbps * 3 / 2;
+            pRcAttr->stH264Vbr.u32MinBitRate = bitrate_kbps / 2;
+        } else {
+            pRcAttr->stH264Cbr.u32BitRate = bitrate_kbps;
+        }
     } else {
-        pRcAttr->stH265Cbr.u32BitRate = bitrate_kbps;
+        // H265: GOP + 帧率
         pRcAttr->stH265Cbr.u32Gop = gop;
-        pRcAttr->stH265Cbr.u32SrcFrameRateNum = fps;
-        pRcAttr->stH265Cbr.u32SrcFrameRateDen = 1;
-        pRcAttr->stH265Cbr.fr32DstFrameRateNum = fps;
-        pRcAttr->stH265Cbr.fr32DstFrameRateDen = 1;
+        pRcAttr->stH265Cbr.u32SrcFrameRateNum = fps_num;
+        pRcAttr->stH265Cbr.u32SrcFrameRateDen = fps_den;
+        pRcAttr->stH265Cbr.fr32DstFrameRateNum = fps_num;
+        pRcAttr->stH265Cbr.fr32DstFrameRateDen = fps_den;
+        if (is_vbr) {
+            pRcAttr->stH265Vbr.u32BitRate = bitrate_kbps;
+            pRcAttr->stH265Vbr.u32MaxBitRate = bitrate_kbps * 3 / 2;
+            pRcAttr->stH265Vbr.u32MinBitRate = bitrate_kbps / 2;
+        } else {
+            pRcAttr->stH265Cbr.u32BitRate = bitrate_kbps;
+        }
     }
 
     // GOP 属性
@@ -395,6 +411,23 @@ static int venc_init_single(int chn_id, int width, int height,
 
     int ret = RK_MPI_VENC_CreateChn(chn_id, &stAttr);
     if (ret != RK_SUCCESS) return ret;
+
+    // 设置 RC quality (对标 rkipc video.c)
+    if (rc_quality >= 0) {
+        VENC_RC_PARAM_S rc_param;
+        memset(&rc_param, 0, sizeof(rc_param));
+        RK_MPI_VENC_GetRcParam(chn_id, &rc_param);
+        // quality 0(lowest)..6(highest) → minQp 40..10 (每档差 5)
+        int min_qp = 40 - rc_quality * 5;
+        if (codec == RK_VIDEO_ID_AVC) {
+            rc_param.stParamH264.u32MinQp = min_qp;
+        } else {
+            rc_param.stParamH265.u32MinQp = min_qp;
+        }
+        RK_MPI_VENC_SetRcParam(chn_id, &rc_param);
+        printf("[rk_camera] chn[%d] rc_quality=%d -> u32MinQp=%d\n",
+               chn_id, rc_quality, min_qp);
+    }
 
     VENC_RECV_PIC_PARAM_S stRecvParam;
     memset(&stRecvParam, 0, sizeof(stRecvParam));
@@ -546,7 +579,8 @@ int rk_camera_init(int main_w, int main_h, int fps, int bitrate) {
         ret = venc_init_single(
             venc_chns[i],
             a->width, a->height,
-            ch_fps, ch_br, ch_gop,
+            a->dst_fps_num, a->dst_fps_den > 0 ? a->dst_fps_den : 1,
+            ch_br, ch_gop,
             a->codec ? a->codec : RK_VIDEO_ID_HEVC,
             a->rc_mode,
             a->rc_quality,
