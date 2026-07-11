@@ -85,7 +85,10 @@ async fn main() -> Result<()> {
     println!("[Viewer] p2p-camera media-viewer v{} ({})", env!("CARGO_PKG_VERSION"), env!("BUILD_TIME"));
 
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
+        .with_env_filter(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .init();
 
     let opt = Opt::parse();

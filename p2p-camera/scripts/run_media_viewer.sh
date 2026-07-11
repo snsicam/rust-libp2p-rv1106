@@ -71,7 +71,7 @@ echo "  ESC / Close window to quit"
 echo "============================================"
 echo ""
 
-export RUST_LOG="${RUST_LOG:+$RUST_LOG,}libp2p_dcutr=debug,libp2p_relay=debug"
+export RUST_LOG=debug
 
 # 检测是否支持 --play (需要 --features player 编译)
 if "$VIEWER_BIN" --help 2>&1 | grep -q -- '--play'; then
