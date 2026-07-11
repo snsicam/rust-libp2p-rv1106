@@ -439,15 +439,8 @@ static int venc_init_single(int chn_id, int width, int height,
 
 // ---- VENC 取流线程 (每个通道一个) ----
 
-static int is_keyframe_h265(int nal_type) {
-    // H265E_NALU_BLA_W_LP=16, BLA_W_RADL=17, BLA_N_LP=18
-    // H265E_NALU_IDRSLICE=19, IDRSLICE_RADL=20
-    // H265E_NALU_CRA=21 (GOP boundary in normalP mode)
-    return (nal_type >= 16 && nal_type <= 21);
-}
-
 // 从 Annex B raw buffer 扫描 H.265 IRAP NAL
-static int is_keyframe_h265_from_buf(const uint8_t *data, uint32_t len) {
+static int is_keyframe_h265(const uint8_t *data, uint32_t len) {
     uint32_t i = 0;
     while (i + 4 < len) {
         // 4-byte start code: 0x00 0x00 0x00 0x01
@@ -472,13 +465,8 @@ static int is_keyframe_h265_from_buf(const uint8_t *data, uint32_t len) {
     return 0;
 }
 
-static int is_keyframe_h264(int nal_type) {
-    // H264E_NALU_IDRSLICE = 5
-    return (nal_type == 5);
-}
-
 // 从 Annex B raw buffer 扫描 H.264 IDR
-static int is_keyframe_h264_from_buf(const uint8_t *data, uint32_t len) {
+static int is_keyframe_h264(const uint8_t *data, uint32_t len) {
     uint32_t i = 0;
     while (i + 4 < len) {
         if (data[i] == 0 && data[i+1] == 0 && data[i+2] == 0 && data[i+3] == 1) {
@@ -514,9 +502,9 @@ static void *get_stream_thread(void *arg) {
             int is_kf = 0;
             const uint8_t *buf = (const uint8_t *)pData;
             if (g_chn_attr[chn_id].codec == RK_VIDEO_ID_HEVC) {
-                is_kf = is_keyframe_h265_from_buf(buf, u32Len);
+                is_kf = is_keyframe_h265(buf, u32Len);
             } else {
-                is_kf = is_keyframe_h264_from_buf(buf, u32Len);
+                is_kf = is_keyframe_h264(buf, u32Len);
             }
 
             if (g_callback && pData && u32Len > 0) {

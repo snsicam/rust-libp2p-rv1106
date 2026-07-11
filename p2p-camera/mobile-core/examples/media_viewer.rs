@@ -1253,7 +1253,7 @@ fn process_video_frame(
 
     #[cfg(feature = "player")]
     if let Some(p) = player {
-        match p.render(&packet.data) {
+        match p.render(&packet.data, packet.is_keyframe()) {
             Ok(action) => return action,
             Err(e) => {
                 tracing::error!("[Viewer] Player error: {e}");
@@ -1408,37 +1408,6 @@ mod player {
     /// 判断 access unit 是否为 IDR 帧 (支持 H.264 / H.265)
     /// 扫描 Annex B buffer 中所有 NAL unit，查找 IDR
     /// H.265 IDR: type 19 (IDR_W_RADL) 或 20 (IDR_N_LP)
-    /// H.264 IDR: type 5
-    /// 解码器 flush 后需要真正的 IDR 才能解码，BLA/CRA 不保证参考帧完整
-    fn is_idr(au: &[u8], is_hevc: bool) -> bool {
-        let len = au.len();
-        if len < 5 { return false; }
-        let mut i = 0;
-        while i + 3 < len {
-            // Annex B start code: 0x00 0x00 0x01 (3B) 或 0x00 0x00 0x00 0x01 (4B)
-            let nal_start = if &au[i..i+3] == &[0, 0, 1] {
-                i + 3
-            } else if i + 4 <= len && &au[i..i+4] == &[0, 0, 0, 1] {
-                i + 4
-            } else {
-                i += 1;
-                continue;
-            };
-            let header = match au.get(nal_start) {
-                Some(&h) => h,
-                None => break,
-            };
-            if is_hevc {
-                let nal_type = (header >> 1) & 0x3F;
-                if nal_type == 19 || nal_type == 20 { return true; }
-            } else {
-                let nal_type = header & 0x1F;
-                if nal_type == 5 { return true; }
-            }
-            i = nal_start + 1;
-        }
-        false
-    }
     use sdl2::keyboard::Keycode;
     use sdl2::pixels::PixelFormatEnum;
     use sdl2::rect::Rect;
@@ -1466,8 +1435,6 @@ mod player {
         minimized: bool,
         /// 解码器 flush 后等待关键帧：跳过非关键帧，避免 POC 错误导致花屏
         waiting_for_keyframe: bool,
-        /// H.265 解码器标记（用于 IDR 检测时区分 H.264/H.265 NAL 解析）
-        is_hevc: bool,
     }
 
     impl VideoPlayer {
@@ -1518,7 +1485,6 @@ mod player {
                 .open_as(codec)
                 .context("Failed to open HEVC decoder")?
                 .video()?;
-            let is_hevc = codec_id == ffmpeg::codec::Id::HEVC;
 
             let sdl_context = map_sdl(sdl2::init(), "init")?;
             let video_subsystem = map_sdl(sdl_context.video(), "video")?;
@@ -1549,12 +1515,11 @@ mod player {
                 frame_count: 0,
                 minimized: false,
                 waiting_for_keyframe: false,
-                is_hevc,
             })
         }
 
         /// 渲染一个 H.265 access unit, 返回 RenderAction 表示渲染结果和窗口状态
-        pub fn render(&mut self, au: &[u8]) -> Result<RenderAction> {
+        pub fn render(&mut self, au: &[u8], is_keyframe: bool) -> Result<RenderAction> {
             for event in self.event_pump.poll_iter() {
                 match event {
                     Event::Quit { .. }
@@ -1585,13 +1550,13 @@ mod player {
             // 最小化时 session 已被 abort，不会有新帧进来，此处仅作防御性处理
             let skip_render = self.minimized;
 
-            // 解码器 flush 后等待 IDR 关键帧
+            // 解码器 flush 后等待关键帧
             if self.waiting_for_keyframe {
-                if !is_idr(au, self.is_hevc) {
+                if !is_keyframe {
                     return Ok(RenderAction::Continue);
                 }
                 self.waiting_for_keyframe = false;
-                eprintln!("[Player] IDR received, resuming decode");
+                eprintln!("[Player] keyframe received, resuming decode");
             }
 
             let mut packet = ffmpeg::Packet::new(au.len());

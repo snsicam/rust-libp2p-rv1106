@@ -150,32 +150,23 @@ static GLOBAL_START_TIMES: [Mutex<Option<Instant>>; MAX_CHN] = [
     Mutex::new(None),
 ];
 
-/// 扫描 Annex B 格式 buffer，返回所有 NAL header byte 列表
-/// Annex B: 0x00 0x00 0x01 或 0x00 0x00 0x00 0x01 + NAL header + payload
-fn scan_nal_units(data: &[u8]) -> Vec<u8> {
+/// 解析第一个 NAL header byte（用于判断编码类型）
+fn first_nal_header(data: &[u8]) -> Option<u8> {
     let len = data.len();
-    let mut nals = Vec::new();
     let mut i = 0;
-
     while i + 3 < len {
         let step = if i + 4 <= len && data[i] == 0 && data[i+1] == 0 && data[i+2] == 0 && data[i+3] == 1 {
-            4 // 4-byte start code
+            4
         } else if data[i] == 0 && data[i+1] == 0 && data[i+2] == 1 {
-            3 // 3-byte start code
+            3
         } else {
-            // Not a start code — skip this byte, keep scanning
             i += 1;
             continue;
         };
-        // NAL header is the byte immediately after start code
-        let header_pos = i + step;
-        if header_pos < len {
-            nals.push(data[header_pos]);
-        }
-        // Advance past start_code + header byte
-        i = header_pos + 1;
+        let pos = i + step;
+        return if pos < len { Some(data[pos]) } else { None };
     }
-    nals
+    None
 }
 
 /// C 帧回调 — 在 VENC 取流线程中调用
@@ -189,37 +180,21 @@ extern "C" fn on_frame(
     if chn >= MAX_CHN { return; }
 
     let slice = unsafe { std::slice::from_raw_parts(data, len as usize) };
+    let is_keyframe = _is_keyframe_c != 0;
 
-    // 扫描 buffer 中所有 NAL unit，支持 Annex B (start code) 和 AVCC (length prefix) 两种格式
-    let nals = scan_nal_units(slice);
-
-    // 从第一个实际 NAL 判断编码类型
-    let first_nal = nals.first().copied();
-    let (is_h265, nal_type) = match first_nal {
-        Some(t) => {
-            let h265_t = ((t >> 1) & 0x3F) as u8;
-            if h265_t >= 16 { (true, h265_t) } else { (false, (t & 0x1F) as u8) }
+    // 从第一个 NAL header 判断编码类型
+    let (is_h265, nal_type) = match first_nal_header(slice) {
+        Some(b) => {
+            let t = ((b >> 1) & 0x3F) as u8;
+            if t >= 16 { (true, t) } else { (false, (b & 0x1F) as u8) }
         }
         None => return,
     };
 
-    // 提取其中的 IRAP NAL type（即触发 is_keyframe 的 NAL）
-    let irap_types: Vec<u8> = nals.iter().filter_map(|&b| {
-        if is_h265 {
-            let t = ((b >> 1) & 0x3F) as u8;
-            if t >= 16 && t <= 21 { Some(t) } else { None }
-        } else {
-            let t = (b & 0x1F) as u8;
-            if t == 5 { Some(t) } else { None }
-        }
-    }).collect();
-    let is_keyframe = !irap_types.is_empty();
-
     if is_keyframe {
-        let types_str: Vec<String> = irap_types.iter().map(|t| format!("{}", t)).collect();
         tracing::info!(
-            "[rk_video] keyframe: chn={}, is_keyframe_c={}, irap_types=[{}], is_h265={}, len={}",
-            chn, _is_keyframe_c, types_str.join(","), is_h265, len
+            "[rk_video] keyframe: chn={}, is_h265={}, len={}",
+            chn, is_h265, len
         );
     }
 
