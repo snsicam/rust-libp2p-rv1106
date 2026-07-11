@@ -203,8 +203,6 @@ extern "C" fn on_frame(
         None => return,
     };
 
-    let first_byte = slice.first().copied().unwrap_or(0);
-
     // 提取其中的 IRAP NAL type（即触发 is_keyframe 的 NAL）
     let irap_types: Vec<u8> = nals.iter().filter_map(|&b| {
         if is_h265 {
