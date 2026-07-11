@@ -150,35 +150,30 @@ static GLOBAL_START_TIMES: [Mutex<Option<Instant>>; MAX_CHN] = [
     Mutex::new(None),
 ];
 
-/// 扫描 Annex B 或 AVCC 格式 buffer，返回所有 NAL header byte 列表
-/// Annex B: 0x00 0x00 0x01 或 0x00 0x00 0x00 0x01 + NAL data
-/// AVCC:    4B big-endian length + NAL data (首帧不一定是 start code)
+/// 扫描 Annex B 格式 buffer，返回所有 NAL header byte 列表
+/// Annex B: 0x00 0x00 0x01 或 0x00 0x00 0x00 0x01 + NAL header + payload
 fn scan_nal_units(data: &[u8]) -> Vec<u8> {
     let len = data.len();
     let mut nals = Vec::new();
     let mut i = 0;
 
-    // 4-byte start code: [0, 0, 0, 1]
-    const SC_4: &[u8] = &[0, 0, 0, 1];
-    // 3-byte start code: [0, 0, 1]
-    const SC_3: &[u8] = &[0, 0, 1];
-
     while i + 3 < len {
-        if data[i..].starts_with(SC_4) {
-            i += 4;
-        } else if data[i..].starts_with(SC_3) {
-            i += 3;
+        let step = if i + 4 <= len && data[i] == 0 && data[i+1] == 0 && data[i+2] == 0 && data[i+3] == 1 {
+            4 // 4-byte start code
+        } else if data[i] == 0 && data[i+1] == 0 && data[i+2] == 1 {
+            3 // 3-byte start code
         } else {
-            // Fallback: treat as raw NAL header (no start code)
-            nals.push(data[i]);
+            // Not a start code — skip this byte, keep scanning
             i += 1;
             continue;
+        };
+        // NAL header is the byte immediately after start code
+        let header_pos = i + step;
+        if header_pos < len {
+            nals.push(data[header_pos]);
         }
-        // Read NAL header byte after start code
-        if i < len {
-            nals.push(data[i]);
-            i += 1;
-        }
+        // Advance past start_code + header byte
+        i = header_pos + 1;
     }
     nals
 }

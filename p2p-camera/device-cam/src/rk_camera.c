@@ -440,8 +440,10 @@ static int venc_init_single(int chn_id, int width, int height,
 // ---- VENC 取流线程 (每个通道一个) ----
 
 static int is_keyframe_h265(int nal_type) {
-    // H265E_NALU_IDRSLICE = 19, H265E_NALU_IDRSLICE_RADL = 20
-    return (nal_type == 19 || nal_type == 20);
+    // H265E_NALU_BLA_W_LP=16, BLA_W_RADL=17, BLA_N_LP=18
+    // H265E_NALU_IDRSLICE=19, IDRSLICE_RADL=20
+    // H265E_NALU_CRA=21 (GOP boundary in normalP mode)
+    return (nal_type >= 16 && nal_type <= 21);
 }
 
 static int is_keyframe_h264(int nal_type) {
