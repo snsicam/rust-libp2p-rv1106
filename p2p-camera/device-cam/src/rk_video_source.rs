@@ -45,6 +45,7 @@ extern "C" {
     ) -> std::ffi::c_int;
     fn rk_camera_set_callback(cb: FrameCallback);
     fn rk_camera_request_idr(chn_id: std::ffi::c_int) -> std::ffi::c_int;
+    #[allow(dead_code)]
     fn rk_camera_request_idr_all() -> std::ffi::c_int;
     fn rk_camera_deinit();
 
@@ -114,6 +115,7 @@ pub fn request_idr(chn_id: u8) {
 }
 
 /// 请求所有通道的 IDR
+#[allow(dead_code)]
 pub fn request_idr_all() {
     unsafe { rk_camera_request_idr_all(); }
 }
@@ -125,6 +127,7 @@ pub fn get_param_sets(chn_id: usize) -> Vec<Vec<u8>> {
 }
 
 /// 获取所有通道的参数集
+#[allow(dead_code)]
 pub fn get_all_param_sets() -> Vec<Vec<Vec<u8>>> {
     GLOBAL_PARAM_SETS.lock().unwrap().clone()
 }
@@ -180,6 +183,13 @@ extern "C" fn on_frame(
         // H.264 IDR: type 5
         nal_type == 5
     };
+
+    if is_keyframe {
+        tracing::info!(
+            "[rk_video] keyframe: chn={}, is_keyframe_c={}, is_keyframe_rs=true, nal_type={}, is_h265={}, first_byte=0x{:02x}, len={}",
+            chn, _is_keyframe_c, nal_type, is_h265, first_byte, len
+        );
+    }
 
     // 缓存参数集 (区分 H.265/H.264 的 param set NAL type)
     let is_param_set = if is_h265 {

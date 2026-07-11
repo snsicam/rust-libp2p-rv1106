@@ -8,8 +8,8 @@ publish = false
 crate-type = ["cdylib", "staticlib", "rlib"]  # .so for Android, .a for iOS, rlib for examples
 
 [features]
-# SDL2 + ffmpeg 实时播放 (viewer_cli --play)
-# 编译: cargo build --example viewer_cli --features player
+# SDL2 + ffmpeg 实时播放 (media_viewer --play)
+# 编译: cargo build --example media_viewer --features player
 player = ["dep:ffmpeg-next", "dep:sdl2"]
 
 [dependencies]

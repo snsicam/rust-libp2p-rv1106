@@ -853,7 +853,7 @@ p2p-camera/
 │   │   ├── net_diag.rs        # NAT 诊断 + ConnectionType
 │   │   └── stream_protocols.rs # 协议常量
 │   └── examples/
-│       └── viewer_cli.rs      # PC 端 Viewer (含 TOML 配置支持)
+│       └── media_viewer.rs      # PC 端 Viewer (含 TOML 配置支持)
 │
 ├── mobile-android/            # Android APP
 │   ├── app/
@@ -1000,9 +1000,9 @@ cd device-cam && cargo run -- \
 
 # 终端3: Viewer (首次运行自动生成 viewer.toml)
 # 方式1: 编辑 viewer.toml 填入 relay 和 camera 后运行
-cd mobile-core && cargo run --example viewer_cli --features player
+cd mobile-core && cargo run --example media_viewer --features player
 # 方式2: 命令行参数覆盖
-cd mobile-core && cargo run --example viewer_cli --features player -- \
+cd mobile-core && cargo run --example media_viewer --features player -- \
     --relay /ip4/127.0.0.1/tcp/4001/p2p/<relay_peer> \
     --camera 12D3KooX... --play
 # 输出: 保存视频到 output.h265 + SDL 实时播放

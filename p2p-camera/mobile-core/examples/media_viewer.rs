@@ -1,14 +1,14 @@
-//! Viewer CLI — 端到端测试工具
+//! Media Viewer — 端到端测试工具
 //!
 //! 用法:
-//!   cargo run --example viewer_cli -- \
+//!   cargo run --example media_viewer -- \
 //!     --relay /ip4/127.0.0.1/tcp/4001/p2p/<RELAY_PEER> \
 //!     --camera <DEVICE_CAM_PEER_ID> \
 //!     --output output.h265
 //!
 //! 实时播放 (需 --features player):
-//!   cargo build --example viewer_cli --features player
-//!   viewer_cli --relay ... --camera ... --play
+//!   cargo build --example media_viewer --features player
+//!   media_viewer --relay ... --camera ... --play
 //!
 //! 自动重连: 连接断开时自动重新连接 Relay + DeviceCam + 打开 stream，
 //!           播放器和输出文件持续运行不中断。
@@ -82,7 +82,7 @@ fn resolve_stream_protocol(stream_type: &str, is_relay: bool) -> StreamProtocol 
 #[cfg_attr(feature = "player", tokio::main(flavor = "current_thread"))]
 #[cfg_attr(not(feature = "player"), tokio::main)]
 async fn main() -> Result<()> {
-    println!("[Viewer] p2p-camera viewer-cli v{} ({})", env!("CARGO_PKG_VERSION"), env!("BUILD_TIME"));
+    println!("[Viewer] p2p-camera media-viewer v{} ({})", env!("CARGO_PKG_VERSION"), env!("BUILD_TIME"));
 
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
@@ -1402,29 +1402,20 @@ mod player {
     use sdl2::event::Event;
     use sdl2::event::WindowEvent;
 
-    /// 从 HEVC access unit 数据中判断是否包含 IDR 帧
-    fn is_hevc_idr(au: &[u8]) -> bool {
-        let mut i = 0;
-        while i + 4 < au.len() {
-            if au[i] == 0 && au[i + 1] == 0 {
-                let sc_len = if i + 3 < au.len() && au[i + 2] == 0 && au[i + 3] == 1 {
-                    4
-                } else if au[i + 2] == 1 {
-                    3
-                } else {
-                    i += 1;
-                    continue;
-                };
-                let nal_type = (au[i + sc_len] >> 1) & 0x3F;
-                if nal_type == 19 || nal_type == 20 {
-                    return true;
-                }
-                i += sc_len + 1;
-            } else {
-                i += 1;
-            }
+    /// 判断 access unit 是否为 IDR 帧 (支持 H.264 / H.265)
+    /// AU 固定结构: 0x00 0x00 0x00 0x01 (4B start_code) + NAL_header (1B) + payload
+    /// H.265 IDR: type 19 (IDR_W_RADL) 或 20 (IDR_N_LP)
+    /// H.264 IDR: type 5
+    /// 解码器 flush 后需要真正的 IDR 才能解码，BLA/CRA 不保证参考帧完整
+    fn is_idr(au: &[u8], is_hevc: bool) -> bool {
+        if au.len() < 5 { return false; }
+        if is_hevc {
+            let nal_type = (au[4] >> 1) & 0x3F;
+            nal_type == 19 || nal_type == 20
+        } else {
+            let nal_type = au[4] & 0x1F;
+            nal_type == 5
         }
-        false
     }
     use sdl2::keyboard::Keycode;
     use sdl2::pixels::PixelFormatEnum;
@@ -1453,6 +1444,8 @@ mod player {
         minimized: bool,
         /// 解码器 flush 后等待关键帧：跳过非关键帧，避免 POC 错误导致花屏
         waiting_for_keyframe: bool,
+        /// H.265 解码器标记（用于 IDR 检测时区分 H.264/H.265 NAL 解析）
+        is_hevc: bool,
     }
 
     impl VideoPlayer {
@@ -1495,13 +1488,15 @@ mod player {
         pub fn new() -> Result<Self> {
             ffmpeg::init()?;
 
-            let codec = ffmpeg::decoder::find(ffmpeg::codec::Id::HEVC)
+            let codec_id = ffmpeg::codec::Id::HEVC;
+            let codec = ffmpeg::decoder::find(codec_id)
                 .context("HEVC decoder not found (install libavcodec-dev / libavcodec-extra)")?;
             let decoder = ffmpeg::codec::Context::new()
                 .decoder()
                 .open_as(codec)
                 .context("Failed to open HEVC decoder")?
                 .video()?;
+            let is_hevc = codec_id == ffmpeg::codec::Id::HEVC;
 
             let sdl_context = map_sdl(sdl2::init(), "init")?;
             let video_subsystem = map_sdl(sdl_context.video(), "video")?;
@@ -1532,6 +1527,7 @@ mod player {
                 frame_count: 0,
                 minimized: false,
                 waiting_for_keyframe: false,
+                is_hevc,
             })
         }
 
@@ -1567,14 +1563,13 @@ mod player {
             // 最小化时 session 已被 abort，不会有新帧进来，此处仅作防御性处理
             let skip_render = self.minimized;
 
-            // 解码器 flush 后等待关键帧：从 NAL 数据判断是否为 IDR，跳过非关键帧避免花屏
+            // 解码器 flush 后等待 IDR 关键帧
             if self.waiting_for_keyframe {
-                let is_idr = is_hevc_idr(au);
-                if !is_idr {
+                if !is_idr(au, self.is_hevc) {
                     return Ok(RenderAction::Continue);
                 }
                 self.waiting_for_keyframe = false;
-                eprintln!("[Player] Keyframe received, resuming decode");
+                eprintln!("[Player] IDR received, resuming decode");
             }
 
             let mut packet = ffmpeg::Packet::new(au.len());
@@ -1759,6 +1754,7 @@ struct ViewerBehaviour {
 }
 
 impl ViewerBehaviour {
+    #[allow(dead_code)]
     fn new(
         local_public_key: libp2p::identity::PublicKey,
         relay_client: relay::client::Behaviour,
@@ -1797,7 +1793,7 @@ impl ViewerBehaviour {
 // ---- CLI ----
 
 #[derive(Debug, Parser)]
-#[command(name = "viewer-cli")]
+#[command(name = "media-viewer")]
 struct Opt {
     /// 配置文件路径 (不存在则自动生成默认配置)
     #[arg(long, default_value = "viewer.toml")]

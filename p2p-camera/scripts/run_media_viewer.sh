@@ -1,17 +1,17 @@
 #!/bin/bash
-# run_viewer.sh — 启动 viewer_cli 并实时播放
+# run_media_viewer.sh — 启动 media_viewer 并实时播放
 #
 # 用法:
-#   方式1 (配置文件): ./run_viewer.sh
+#   方式1 (配置文件): ./run_media_viewer.sh
 #     → 首次运行自动生成 viewer.toml，编辑后重启
 #
-#   方式2 (命令行覆盖): ./run_viewer.sh <relay_addr> <device_cam_peer> [udp_port]
+#   方式2 (命令行覆盖): ./run_media_viewer.sh <relay_addr> <device_cam_peer> [udp_port]
 #     → 命令行参数覆盖配置文件中的值
 #
 # 示例:
-#   ./run_viewer.sh
-#   ./run_viewer.sh /ip4/101.35.90.171/udp/4001/quic-v1/p2p/12D3KooW... 12D3KooW...
-#   ./run_viewer.sh /ip4/101.35.90.171/udp/4001/quic-v1/p2p/12D3KooW... 12D3KooW... 34501
+#   ./run_media_viewer.sh
+#   ./run_media_viewer.sh /ip4/101.35.90.171/udp/4001/quic-v1/p2p/12D3KooW... 12D3KooW...
+#   ./run_media_viewer.sh /ip4/101.35.90.171/udp/4001/quic-v1/p2p/12D3KooW... 12D3KooW... 34501
 #
 # 注意: 外部地址由 identify 协议自动发现（公网 IP）和 NewListenAddr 事件自动注入（本地 IP），
 #       无需手动指定 --external-ip。
@@ -22,11 +22,11 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-VIEWER_BIN="$PROJECT_ROOT/target/debug/examples/viewer_cli"
+VIEWER_BIN="$PROJECT_ROOT/target/debug/examples/media_viewer"
 LOG_DIR="$SCRIPT_DIR/logs"
 
 if [ ! -f "$VIEWER_BIN" ]; then
-    echo "[ERROR] viewer_cli not found at $VIEWER_BIN"
+    echo "[ERROR] media_viewer not found at $VIEWER_BIN"
     echo "  Please run './build_viewer.sh' first to compile."
     exit 1
 fi

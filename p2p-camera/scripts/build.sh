@@ -3,7 +3,7 @@
 # 用法:
 #   ./build.sh           # 默认 debug
 #   ./build.sh release   # release 模式
-#   ./build.sh player    # release + SDL 播放器 (viewer_cli --play)
+#   ./build.sh player    # release + SDL 播放器 (media_viewer --play)
 #   ./build.sh test      # 编译 + 运行测试
 
 set -e
@@ -28,14 +28,14 @@ case "$MODE" in
         cargo build -p relay-server -p device-cam --release
         echo "[4/4] Building mobile-core + example (release)..."
         cargo build -p mobile-core --release
-        cargo build --example viewer_cli -p mobile-core --release
+        cargo build --example media_viewer -p mobile-core --release
         ;;
 
     test)
         echo "[1/5] Building all crates..."
         cargo build -p proto -p relay-server -p device-cam -p mobile-core
-        echo "[2/5] Building viewer_cli example..."
-        cargo build --example viewer_cli -p mobile-core
+        echo "[2/5] Building media_viewer example..."
+        cargo build --example media_viewer -p mobile-core
         echo "[3/5] Running proto unit tests..."
         cargo test -p proto
         echo "[4/5] Running clippy (warnings)..."
@@ -46,8 +46,8 @@ case "$MODE" in
     player)
         echo "[1/3] Building relay-server + device-cam (release)..."
         cargo build -p relay-server -p device-cam --release
-        echo "[2/3] Building viewer_cli (release, player feature)..."
-        cargo build --example viewer_cli -p mobile-core --release --features player
+        echo "[2/3] Building media_viewer (release, player feature)..."
+        cargo build --example media_viewer -p mobile-core --release --features player
         echo "[3/3] Done."
         ;;
 
@@ -60,7 +60,7 @@ case "$MODE" in
         cargo build -p relay-server -p device-cam
         echo "[4/4] Building mobile-core + example..."
         cargo build -p mobile-core
-        cargo build --example viewer_cli -p mobile-core
+        cargo build --example media_viewer -p mobile-core
         ;;
 esac
 
@@ -72,7 +72,7 @@ echo ""
 echo "Binaries:"
 echo "  Relay Server:  target/debug/relay-server"
 echo "  DeviceCam:       target/debug/device-cam"
-echo "  Viewer CLI:    target/debug/examples/viewer_cli"
+echo "  Media Viewer:  target/debug/examples/media_viewer"
 echo ""
 echo "Quick start:"
 echo "  # Terminal 1: Relay Server (首次运行自动生成 relay-server.toml)"
@@ -82,4 +82,4 @@ echo "  # Terminal 2: DeviceCam (首次运行自动生成 device-cam.toml)"
 echo "  ./p2p-camera/scripts/run_device_cam.sh --relay <relay_addr> --enable-audio"
 echo ""
 echo "  # Terminal 3: Viewer (首次运行自动生成 viewer.toml)"
-echo "  ./p2p-camera/scripts/run_viewer.sh <relay_addr> <device_cam_peer>"
+echo "  ./p2p-camera/scripts/run_media_viewer.sh <relay_addr> <device_cam_peer>"

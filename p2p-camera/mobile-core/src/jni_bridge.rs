@@ -149,10 +149,8 @@ pub extern "system" fn Java_com_p2pcamera_mediaplayer_RustBridge_nativeCreate(
             // audio_tx 用 Option 包装，no_audio 时 take() 关闭发送端
             let mut audio_tx = Some(audio_tx);
 
-            // 保存 device_id 用于重连时发送事件
-            let mut device_id = String::new();
-
             // 等待连接命令
+            let device_id;
             match cmd_rx.recv() {
                 Ok(Cmd::Connect { relays, device_id: did, enable_mdns, stream_type, no_audio }) => {
                     device_id = did.clone();
@@ -357,7 +355,7 @@ pub extern "system" fn Java_com_p2pcamera_mediaplayer_RustBridge_nativeConnect(
 /// ```
 #[no_mangle]
 pub extern "system" fn Java_com_p2pcamera_mediaplayer_RustBridge_nativePollVideoFrame(
-    mut env: JNIEnv,
+    env: JNIEnv,
     _class: JClass,
     handle: jlong,
 ) -> jbyteArray {
@@ -418,7 +416,7 @@ pub extern "system" fn Java_com_p2pcamera_mediaplayer_RustBridge_nativePollVideo
 /// ```
 #[no_mangle]
 pub extern "system" fn Java_com_p2pcamera_mediaplayer_RustBridge_nativePollAudioFrame(
-    mut env: JNIEnv,
+    env: JNIEnv,
     _class: JClass,
     handle: jlong,
 ) -> jbyteArray {
@@ -467,7 +465,7 @@ pub extern "system" fn Java_com_p2pcamera_mediaplayer_RustBridge_nativePollAudio
 /// 返回 JSON 事件字符串，无事件时返回 null
 #[no_mangle]
 pub extern "system" fn Java_com_p2pcamera_mediaplayer_RustBridge_nativePollEvent(
-    mut env: JNIEnv,
+    env: JNIEnv,
     _class: JClass,
     handle: jlong,
 ) -> jstring {
