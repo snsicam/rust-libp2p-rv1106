@@ -150,8 +150,42 @@ static GLOBAL_START_TIMES: [Mutex<Option<Instant>>; MAX_CHN] = [
     Mutex::new(None),
 ];
 
+/// 扫描 Annex B 或 AVCC 格式 buffer，返回所有 NAL header byte 列表
+/// Annex B: 0x00 0x00 0x01 或 0x00 0x00 0x00 0x01 + NAL data
+/// AVCC:    4B big-endian length + NAL data (首帧不一定是 start code)
+fn scan_nal_units(data: &[u8]) -> Vec<u8> {
+    let len = data.len();
+    let mut nals = Vec::new();
+    let mut i = 0;
+
+    // 4-byte start code: [0, 0, 0, 1]
+    const SC_4: &[u8] = &[0, 0, 0, 1];
+    // 3-byte start code: [0, 0, 1]
+    const SC_3: &[u8] = &[0, 0, 1];
+
+    while i + 3 < len {
+        if data[i..].starts_with(SC_4) {
+            i += 4;
+        } else if data[i..].starts_with(SC_3) {
+            i += 3;
+        } else {
+            // Fallback: treat as raw NAL header (no start code)
+            nals.push(data[i]);
+            i += 1;
+            continue;
+        }
+        // Read NAL header byte after start code
+        if i < len {
+            nals.push(data[i]);
+            i += 1;
+        }
+    }
+    nals
+}
+
 /// C 帧回调 — 在 VENC 取流线程中调用
 /// chn_id: 0=main, 1=sub, 2=third
+/// data 格式: Annex B (start code + NAL) 或 AVCC (4B len prefix + NAL)
 extern "C" fn on_frame(
     chn_id: std::ffi::c_int, data: *const u8, len: u32,
     pts_us: u64, _is_keyframe_c: std::ffi::c_int,
@@ -160,34 +194,39 @@ extern "C" fn on_frame(
     if chn >= MAX_CHN { return; }
 
     let slice = unsafe { std::slice::from_raw_parts(data, len as usize) };
-    let first_byte = slice.first().copied().unwrap_or(0);
 
-    // 提取 NAL unit type:
-    //   H.265: (b >> 1) & 0x3F → 6-bit type [0..63]
-    //   H.264: b & 0x1F        → 5-bit type [0..31]
-    // 区分方法: H.265 的 param set 类型为 32-34、H.264 为 7-8;
-    //           H.265 IDR 类型为 19, H.264 IDR 为 5
-    let h265_nal = ((first_byte >> 1) & 0x3F) as u8;
-    let h264_nal = (first_byte & 0x1F) as u8;
+    // 扫描 buffer 中所有 NAL unit，支持 Annex B (start code) 和 AVCC (length prefix) 两种格式
+    let nals = scan_nal_units(slice);
 
-    // 通过 NAL type 判断编码类型
-    // H.265: VPS=32, SPS=33, PPS=34, IDR≥16;  H.264: 所有类型 ≤ 15 (h265_nal ← (b>>1)&0x3F)
-    let is_h265 = h265_nal >= 16;
-    let nal_type = if is_h265 { h265_nal } else { h264_nal };
-
-    // 从帧数据直接判断关键帧 (不依赖 C 参数, 更可靠)
-    let is_keyframe = if is_h265 {
-        // H.265 IRAP: BLA(16-18), IDR(19-20), CRA(21)
-        nal_type >= 16 && nal_type <= 21
-    } else {
-        // H.264 IDR: type 5
-        nal_type == 5
+    // 从第一个实际 NAL 判断编码类型
+    let first_nal = nals.first().copied();
+    let (is_h265, nal_type) = match first_nal {
+        Some(t) => {
+            let h265_t = ((t >> 1) & 0x3F) as u8;
+            if h265_t >= 16 { (true, h265_t) } else { (false, (t & 0x1F) as u8) }
+        }
+        None => return,
     };
 
-    if is_keyframe {
+    let first_byte = slice.first().copied().unwrap_or(0);
+
+    // 从帧数据直接判断关键帧 (不依赖 C 参数, 更可靠)
+    // 需要遍历所有 NAL：关键帧可能包含 VPS/SPS/PPS 等多个 NAL，IDR 不一定是第一个
+    let is_keyframe = if is_h265 {
+        // H.265 IRAP: BLA(16-18), IDR(19-20), CRA(21)
+        nals.iter().any(|&b| {
+            let t = ((b >> 1) & 0x3F) as u8;
+            t >= 16 && t <= 21
+        })
+    } else {
+        // H.264 IDR: type 5
+        nals.iter().any(|&b| (b & 0x1F) as u8 == 5)
+    };
+
+    if is_keyframe || _is_keyframe_c != 0 {
         tracing::info!(
-            "[rk_video] keyframe: chn={}, is_keyframe_c={}, is_keyframe_rs=true, nal_type={}, is_h265={}, first_byte=0x{:02x}, len={}",
-            chn, _is_keyframe_c, nal_type, is_h265, first_byte, len
+            "[rk_video] keyframe: chn={}, is_keyframe_c={}, is_keyframe_rs=true, nal_type={}, is_h265={}, first_byte=0x{:02x}, nals_in_frame={}, len={}",
+            chn, _is_keyframe_c, nal_type, is_h265, first_byte, nals.len(), len
         );
     }
 

@@ -1406,19 +1406,38 @@ mod player {
     use sdl2::event::WindowEvent;
 
     /// 判断 access unit 是否为 IDR 帧 (支持 H.264 / H.265)
-    /// AU 固定结构: 0x00 0x00 0x00 0x01 (4B start_code) + NAL_header (1B) + payload
+    /// 扫描 Annex B buffer 中所有 NAL unit，查找 IDR
     /// H.265 IDR: type 19 (IDR_W_RADL) 或 20 (IDR_N_LP)
     /// H.264 IDR: type 5
     /// 解码器 flush 后需要真正的 IDR 才能解码，BLA/CRA 不保证参考帧完整
     fn is_idr(au: &[u8], is_hevc: bool) -> bool {
-        if au.len() < 5 { return false; }
-        if is_hevc {
-            let nal_type = (au[4] >> 1) & 0x3F;
-            nal_type == 19 || nal_type == 20
-        } else {
-            let nal_type = au[4] & 0x1F;
-            nal_type == 5
+        let len = au.len();
+        if len < 5 { return false; }
+        let mut i = 0;
+        while i + 3 < len {
+            // Annex B start code: 0x00 0x00 0x01 (3B) 或 0x00 0x00 0x00 0x01 (4B)
+            let nal_start = if &au[i..i+3] == &[0, 0, 1] {
+                i + 3
+            } else if i + 4 <= len && &au[i..i+4] == &[0, 0, 0, 1] {
+                i + 4
+            } else {
+                i += 1;
+                continue;
+            };
+            let header = match au.get(nal_start) {
+                Some(&h) => h,
+                None => break,
+            };
+            if is_hevc {
+                let nal_type = (header >> 1) & 0x3F;
+                if nal_type == 19 || nal_type == 20 { return true; }
+            } else {
+                let nal_type = header & 0x1F;
+                if nal_type == 5 { return true; }
+            }
+            i = nal_start + 1;
         }
+        false
     }
     use sdl2::keyboard::Keycode;
     use sdl2::pixels::PixelFormatEnum;
