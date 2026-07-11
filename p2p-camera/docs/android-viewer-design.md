@@ -373,6 +373,9 @@ class ViewerViewModel : ViewModel() {
     // ─── 内部轮询 ───
     // viewModelScope 后台协程:
     //   - 每 5ms 轮询 nativePollEvent() → 更新 connectionState
+    //     - Disconnected 事件: Rust 侧已自动重连，Android 侧更新 UI 状态
+    //     - Connecting 事件: 显示"重连中"
+    //     - Connected + StreamReady: 恢复播放
     //   - 每 5ms 轮询 nativePollVideoFrame() → → H265Decoder.feedFrame()
     //   - 每 10ms 轮询 nativePollAudioFrame() → → PcmAudioPlayer.write()
 }
@@ -515,13 +518,19 @@ Offset  Size  Field
 ### 8.1 连接断开检测
 
 ```
-ConnctionClosed (num_established == 0)
+ConnctionClosed (num_established == 0) 或 Stream EOF
   │
-  ├─ viewer_connected = false
+  ├─ viewer.rs 发送 MediaPlayerEvent::Disconnected
+  ├─ jni_bridge.rs 检测到 Disconnected 事件
+  │   ├─ 发送 ViewerEvent::Disconnected → Android 侧 nativePollEvent() 返回 {"type":"Disconnected"}
+  │   ├─ 发送 ViewerEvent::Connecting → Android 侧显示"重连中"
+  │   ├─ 调用 viewer.reconnect() 自动重连
+  │   │   ├─ 成功: 发送 ViewerEvent::Connected + StreamReady → 恢复播放
+  │   │   └─ 失败: 发送 ViewerEvent::Error → 退出
+  │   └─ （自动重连，无需用户手动触发）
   ├─ MediaCodec signalEndOfInputStream()
   ├─ AudioTrack stop()
-  ├─ → UI 显示"连接断开"，提供重连按钮
-  └─ （不自动重连，由用户手动触发）
+  └─ → UI 显示"连接断开"（如重连失败）
 
 DCUtR 升级→码流切换→旧 circuit 关闭 (num_established > 0)
   │
@@ -600,6 +609,7 @@ ANDROID_HOME=$HOME/android-sdk ./gradlew :demos:mediaplayer:assembleRelease
 | ~~JNI bridge 基本框架~~ | ✅ 完成 | nativeCreate/Connect/PollVideo/Event/Destroy |
 | ~~p2p-camera workspace 修复~~ | ✅ 完成 | 独立 [workspace] 定义 |
 | ~~Android cross-compile 调试~~ | ✅ 完成 | cargo-ndk 参数修正 |
+| ~~断连检测 + 自动重连~~ | ✅ 完成 | MediaPlayerEvent::Disconnected + reconnect() + ViewerEvent::Disconnected |
 | **nativePollVideoFrame 增加 PTS** | ❌ 待做 | 返回数据前 2B flags + 8B timestamp |
 | **nativePollAudioFrame 导出** | ❌ 待做 | 音频帧轮询 + JNI 导出 |
 | **构建脚本集成** | ❌ 待做 | `build_android.sh` 自动复制 .so |

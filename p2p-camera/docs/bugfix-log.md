@@ -22,6 +22,7 @@
 | 15 | 2026-07-02 | Relay Server | Relay 服务器崩溃：`assertion left == right failed (None vs Active)` | Viewer 发起 circuit 请求时，Relay 找到 DeviceCam 连接但 reservation 状态为 `None`（尚未完成或已失效），原代码用 `assert_eq!` 断言状态必须为 `Active`，导致 panic | 将 `assert_eq!` 替换为条件判断：`Active` 则接受 circuit 请求，否则返回 `NoReservation` 拒绝请求，避免 Relay 崩溃 | `protocols/relay/src/behaviour.rs` |
 | 16 | 2026-07-03 | 协议清理 | — | `VIDEO_PROTOCOL` (`/p2p-camera/video/1.0.0`) 是为旧版单码流设计的向后兼容协议，现在已有 `VIDEO_MAIN/SUB/THIRD_PROTOCOL` 三个明确协议，旧协议不再需要 | 删除 `stream_protocols.rs` 中 `VIDEO_PROTOCOL` 常量定义；删除 `main.rs` 中 `incoming_legacy_video` accept 及 `select!` 中 `legacy_video` 分支 | `proto/src/stream_protocols.rs`, `device-cam/src/main.rs` |
 | 17 | 2026-07-03 | 音频编码 | 音频仅支持原始 PCM 采集，无硬件编码，带宽占用大 | 未使用 RK AENC 硬件编码器 | 新增 G711A/G711U/MP2 HW 编码支持：<br>(1) `config.rs` AudioConfig 新增 `encode_type`/`format`/`bit_rate`/`enable_vqe`/`vqe_cfg` 字段<br>(2) `rk_camera.c` 新增 AENC 管线：AI→AENC bind + `aenc_get_stream_thread`<br>(3) `media_packet.rs` 新增 `audio_g711a()`/`audio_g711u()` 构造函数 (flags=2/3)<br>(4) `device-cam.toml` 新增 `[audio]` 编码配置段 | `device-cam/src/config.rs`, `device-cam/src/rk_camera.c`, `device-cam/src/rk_video_source.rs`, `proto/src/media_packet.rs`, `device-cam.toml` |
+| 18 | 2026-07-10 | Viewer (mobile-core) | 连接断开后无任何通知，Android 侧无法感知断连，也不会自动重连 | (1) `receive_frames` EOF 时静默退出，无通知<br>(2) `ConnectionClosed` 只更新状态，不通知上层<br>(3) `ViewerEvent::Disconnected` 枚举已定义但从未发送<br>(4) 无重连机制 | 新增断连检测 + 自动重连：<br>(1) `MediaPlayerEvent` 枚举：`Disconnected`/`DirectUpgraded`<br>(2) `MediaPlayer` 新增 `event_sender`/`event_receiver` 内部事件通道<br>(3) `receive_frames` EOF/错误时发送 `MediaPlayerEvent::Disconnected`<br>(4) `ConnectionClosed (num_established==0)` 时发送 `Disconnected`<br>(5) 新增 `poll_event()` 非阻塞轮询内部事件<br>(6) 新增 `reconnect()` 方法：3s 延迟 → abort 旧任务 → 清空 jitter → 重新 connect<br>(7) `jni_bridge.rs` 主循环检测 `Disconnected` → 发送 `ViewerEvent::Disconnected` → 自动 `reconnect()`<br>(8) `AvJitterBuffer` 新增 `clear()` 方法 | `mobile-core/src/viewer.rs`, `mobile-core/src/jni_bridge.rs`, `mobile-core/src/jitter_buffer.rs`, `mobile-core/src/lib.rs` |
 
 ## 关键设计决策
 
@@ -58,3 +59,12 @@
 - 必填项（如 relay 地址）为空时在 main 中检查并报错退出
 - device-cam.toml / relay-server.toml / viewer.toml 分别对应三个软件
 - `--config` 参数可指定配置文件路径，默认为当前目录
+
+### 断连检测 + 自动重连设计（2026-07-10 新增）
+- **事件通道架构**：`MediaPlayer` 内部维护 `event_sender`/`event_receiver` (mpsc channel)，`receive_frames` 和 `poll_swarm` 通过 `event_sender` 发送 `MediaPlayerEvent`，上层通过 `poll_event()` 非阻塞轮询
+- **断连触发源**：
+  - `receive_frames` EOF 或读错误 → `MediaPlayerEvent::Disconnected`
+  - `ConnectionClosed (num_established==0)` → `MediaPlayerEvent::Disconnected`
+- **重连流程**：`jni_bridge.rs` 主循环检测到 `Disconnected` → 发送 `ViewerEvent::Disconnected` 给 Android → 发送 `ViewerEvent::Connecting` → 调用 `viewer.reconnect()` → 成功则 `Connected`+`StreamReady`，失败则 `Error` 并退出
+- **重连不重建 Swarm**：`reconnect()` 复用现有 Swarm，只重新拨号 Relay + 打开 stream，避免重新生成 PeerId 和重建 transport
+- **Jitter Buffer 清空**：重连时调用 `jitter.clear()` 丢弃旧数据，避免旧帧干扰新会话

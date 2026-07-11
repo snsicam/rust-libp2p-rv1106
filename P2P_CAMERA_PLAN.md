@@ -748,9 +748,11 @@ Track: 0x01=Video(H.265 NAL), 0x02=Audio(PCM/AAC)
 │   ├── Gateway 单帧源 → 多 viewer 分发
 │   └── QUIC stream 优先级 (关键帧优先)
 │
-├── [ ] 断线重连
-│   ├── 连接断开自动重连
-│   └── 重连期间发送 I 帧
+├── [x] 断线重连
+│   ├── [x] 连接断开自动重连 (MediaPlayerEvent::Disconnected + reconnect())
+│   ├── [x] receive_frames EOF 时发送断连通知
+│   ├── [x] ConnectionClosed 时发送 ViewerEvent::Disconnected
+│   └── [ ] 重连期间发送 I 帧
 │
 ├── [ ] 录制/回放 (可选)
 │   └── Gateway 本地 SD 卡录制

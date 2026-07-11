@@ -794,9 +794,11 @@ Track: 0x01=Video(H.265 NAL), 0x02=Audio(PCM/AAC)
 │   ├── DeviceCam 单帧源 → 多 viewer 分发
 │   └── QUIC stream 优先级 (关键帧优先)
 │
-├── [ ] 断线重连
-│   ├── 连接断开自动重连
-│   └── 重连期间发送 I 帧
+├── [x] 断线重连
+│   ├── [x] 连接断开自动重连 (MediaPlayerEvent::Disconnected + reconnect())
+│   ├── [x] receive_frames EOF 时发送断连通知
+│   ├── [x] ConnectionClosed 时发送 ViewerEvent::Disconnected
+│   └── [ ] 重连期间发送 I 帧
 │
 ├── [ ] 录制/回放 (可选)
 │   └── DeviceCam 本地 SD 卡录制
@@ -844,7 +846,7 @@ p2p-camera/
 │   ├── build.rs               # 编译时间戳
 │   ├── src/
 │   │   ├── lib.rs             # FFI 导出 (视频+音频接口)
-│   │   ├── viewer.rs          # MediaPlayer 核心
+│   │   ├── viewer.rs          # MediaPlayer 核心 (含断连检测 + 自动重连)
 │   │   ├── behaviour.rs       # NetworkBehaviour
 │   │   ├── jitter_buffer.rs   # AvJitterBuffer (音视频分离)
 │   │   ├── media_packet.rs    # MediaPacket 解析

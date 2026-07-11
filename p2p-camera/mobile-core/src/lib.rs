@@ -13,4 +13,4 @@ pub mod jni_bridge;
 // Re-export key types
 pub use net_diag::{ConnectionType, ConnectionQuality, NatDiagnosis, NatType};
 pub use proto::media_packet::{MediaPacket, MediaTrack};
-pub use viewer::MediaPlayer;
+pub use viewer::{MediaPlayer, MediaPlayerEvent};

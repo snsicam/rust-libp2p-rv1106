@@ -31,6 +31,16 @@ use crate::net_diag::{ConnectionQuality, ConnectionType, NatDiagnostic, NatDiagn
 
 const STREAM_READ_BUF: usize = 65536; // 64KB
 const MDNS_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
+const RECONNECT_DELAY: Duration = Duration::from_secs(3);
+
+/// MediaPlayer 内部事件，用于通知上层（JNI bridge）连接状态变化
+#[derive(Debug, Clone)]
+pub enum MediaPlayerEvent {
+    /// 连接已断开，reason 描述断开原因
+    Disconnected { reason: String },
+    /// 直连升级成功 (DCUtR 或 LAN direct)
+    DirectUpgraded { via_lan: bool },
+}
 
 /// 将 stream 名称映射到对应的协议
 fn get_video_protocol(stream_type: &str) -> StreamProtocol {
@@ -104,14 +114,28 @@ pub struct MediaPlayer {
     video_receiver: mpsc::Receiver<MediaPacket>,
     audio_sender: mpsc::Sender<MediaPacket>,
     audio_receiver: mpsc::Receiver<MediaPacket>,
+    event_sender: mpsc::Sender<MediaPlayerEvent>,
+    event_receiver: mpsc::Receiver<MediaPlayerEvent>,
     nat_diagnostic: NatDiagnostic,
     connection_quality: ConnectionQuality,
     device_cam_peer_id: Option<PeerId>,
     lan_direct_attempted: bool,
     stream_resolver: StreamTypeResolver,
     video_abort_handle: Option<tokio::task::AbortHandle>,
+    audio_abort_handle: Option<tokio::task::AbortHandle>,
     relay_connection_id: Option<libp2p::swarm::ConnectionId>,
+    /// 保存连接参数用于重连
+    connect_params: Option<ConnectParams>,
     pub connected: bool,
+}
+
+/// 保存连接参数，用于断连后自动重连
+#[derive(Clone)]
+struct ConnectParams {
+    relay_addrs: Vec<String>,
+    device_cam_peer_id: String,
+    enable_mdns: bool,
+    stream_type: String,
 }
 
 impl MediaPlayer {
@@ -139,6 +163,7 @@ impl MediaPlayer {
 
         let (video_sender, video_receiver) = mpsc::channel::<MediaPacket>(60);
         let (audio_sender, audio_receiver) = mpsc::channel::<MediaPacket>(200);
+        let (event_sender, event_receiver) = mpsc::channel::<MediaPlayerEvent>(32);
 
         Ok(Self {
             swarm,
@@ -151,13 +176,17 @@ impl MediaPlayer {
             video_receiver,
             audio_sender,
             audio_receiver,
+            event_sender,
+            event_receiver,
             nat_diagnostic: NatDiagnostic::new(0, Vec::new()),
             connection_quality: ConnectionQuality::default(),
             device_cam_peer_id: None,
             lan_direct_attempted: false,
             stream_resolver: StreamTypeResolver::new("auto"),
             video_abort_handle: None,
+            audio_abort_handle: None,
             relay_connection_id: None,
+            connect_params: None,
             connected: false,
         })
     }
@@ -181,8 +210,17 @@ impl MediaPlayer {
         let device_cam: PeerId = device_cam_peer_id.parse()?;
         self.device_cam_peer_id = Some(device_cam);
 
+        // 保存连接参数用于重连
+        self.connect_params = Some(ConnectParams {
+            relay_addrs: relay_addrs.to_vec(),
+            device_cam_peer_id: device_cam_peer_id.to_string(),
+            enable_mdns,
+            stream_type: stream_type.to_string(),
+        });
+
         // 初始化码流选择器
         self.stream_resolver = StreamTypeResolver::new(stream_type);
+        self.lan_direct_attempted = false;
 
         // 解析所有 Relay 地址
         let relay_multiaddrs: Vec<Multiaddr> = relay_addrs.iter()
@@ -328,10 +366,16 @@ impl MediaPlayer {
         // 启动接收任务
         let video_sender = self.video_sender.clone();
         let audio_sender = self.audio_sender.clone();
+        let event_sender = self.event_sender.clone();
 
-        let video_handle = tokio::spawn(Self::receive_frames(device_cam, video_stream, video_sender)).abort_handle();
+        let video_handle = tokio::spawn(
+            Self::receive_frames(device_cam, video_stream, video_sender, event_sender.clone())
+        ).abort_handle();
         self.video_abort_handle = Some(video_handle);
-        tokio::spawn(Self::receive_frames(device_cam, audio_stream, audio_sender));
+        let audio_handle = tokio::spawn(
+            Self::receive_frames(device_cam, audio_stream, audio_sender, event_sender)
+        ).abort_handle();
+        self.audio_abort_handle = Some(audio_handle);
 
         self.connected = true;
         Ok(())
@@ -511,7 +555,7 @@ impl MediaPlayer {
                                 Ok(new_stream) => {
                                     if let Some(h) = self.video_abort_handle.take() { h.abort(); }
                                     let handle = tokio::spawn(
-                                        Self::receive_frames(device_cam, new_stream, self.video_sender.clone())
+                                        Self::receive_frames(device_cam, new_stream, self.video_sender.clone(), self.event_sender.clone())
                                     ).abort_handle();
                                     self.video_abort_handle = Some(handle);
                                     tracing::info!("[Viewer] Stream upgraded: sub → main (direct connection established)");
@@ -538,6 +582,18 @@ impl MediaPlayer {
                         tracing::warn!("[Viewer] All connections to {peer_id} closed");
                         self.connection_quality.connection_type = ConnectionType::Disconnected;
                         self.connection_quality.direct_upgraded = false;
+                        self.connected = false;
+
+                        // 通知上层断连
+                        let is_device_cam = self.device_cam_peer_id == Some(peer_id);
+                        let reason = if is_device_cam {
+                            "DeviceCam connection closed".to_string()
+                        } else {
+                            format!("Connection to {peer_id} closed")
+                        };
+                        let _ = self.event_sender.send(MediaPlayerEvent::Disconnected {
+                            reason,
+                        }).await;
                     } else {
                         tracing::info!("[Viewer] Connection to {peer_id} closed, {num_established} remaining");
                     }
@@ -559,6 +615,37 @@ impl MediaPlayer {
 
     pub fn connection_quality(&self) -> &ConnectionQuality {
         &self.connection_quality
+    }
+
+    /// 轮询内部事件（非阻塞），供上层检测断连/直连升级等
+    pub fn poll_event(&mut self) -> Option<MediaPlayerEvent> {
+        self.event_receiver.try_recv().ok()
+    }
+
+    /// 自动重连：使用保存的连接参数重新连接
+    ///
+    /// 不需要重建 Swarm，底层 transport 仍然可用。
+    /// 重新拨号 Relay → Circuit → 打开 stream。
+    pub async fn reconnect(&mut self) -> Result<()> {
+        let params = self.connect_params.clone()
+            .ok_or_else(|| anyhow::anyhow!("No connect params saved, cannot reconnect"))?;
+
+        tracing::info!("[Viewer] Reconnecting in {}s...", RECONNECT_DELAY.as_secs());
+        tokio::time::sleep(RECONNECT_DELAY).await;
+
+        // 停止旧的接收任务
+        if let Some(h) = self.video_abort_handle.take() { h.abort(); }
+        if let Some(h) = self.audio_abort_handle.take() { h.abort(); }
+
+        // 清空 jitter buffer 中的旧数据
+        self.jitter.clear();
+
+        self.connect(
+            &params.relay_addrs,
+            &params.device_cam_peer_id,
+            params.enable_mdns,
+            &params.stream_type,
+        ).await
     }
 
     // ---- 内部方法 ----
@@ -606,17 +693,25 @@ impl MediaPlayer {
     }
 
     /// 从 stream 持续读取帧，送入 channel
+    /// EOF 或读错误时通过 event_sender 发送 Disconnected 通知
     async fn receive_frames(
         peer_id: PeerId,
         mut stream: libp2p::swarm::Stream,
         sender: mpsc::Sender<MediaPacket>,
+        event_sender: mpsc::Sender<MediaPlayerEvent>,
     ) {
         let mut buf = bytes::BytesMut::with_capacity(STREAM_READ_BUF);
         let mut read_buf = vec![0u8; STREAM_READ_BUF];
 
         loop {
             match stream.read(&mut read_buf).await {
-                Ok(0) => break, // EOF
+                Ok(0) => {
+                    tracing::warn!("[Viewer] Stream EOF from {peer_id}");
+                    let _ = event_sender.send(MediaPlayerEvent::Disconnected {
+                        reason: format!("Stream EOF from {peer_id}"),
+                    }).await;
+                    break;
+                }
                 Ok(n) => {
                     buf.extend_from_slice(&read_buf[..n]);
 
@@ -629,6 +724,9 @@ impl MediaPlayer {
                 }
                 Err(e) => {
                     tracing::warn!("Stream read error from {peer_id}: {e}");
+                    let _ = event_sender.send(MediaPlayerEvent::Disconnected {
+                        reason: format!("Stream read error from {peer_id}: {e}"),
+                    }).await;
                     break;
                 }
             }

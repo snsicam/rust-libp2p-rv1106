@@ -193,9 +193,14 @@ async fn main() -> Result<()> {
     let mut local_nat_type: Option<NatType> = None;
     let mut remote_nat_hint: Option<String> = None;
     let mut video_start: Option<std::time::Instant> = None;
+    let mut stream_disconnected = false;
+    #[cfg(feature = "player")]
+    let mut window_minimized = false;
+    #[allow(unused_assignments)]
+    let mut session_abort_handle: Option<tokio::task::AbortHandle> = None;
 
     // 启动初始 session (后台任务)
-    spawn_session(
+    session_abort_handle = Some(spawn_session(
         relay_addrs.clone(),
         device_cam_str.clone(),
         no_audio,
@@ -205,7 +210,7 @@ async fn main() -> Result<()> {
         tx.clone(),
         audio_tx.clone(),
         session_tx.clone(),
-    );
+    ));
 
     println!("[Viewer] Receiving video frames... (Ctrl+C to stop)");
 
@@ -216,31 +221,153 @@ async fn main() -> Result<()> {
             session_event = session_rx.recv() => {
                 match session_event {
                     Some(SessionEvent::Disconnected { reason }) => {
-                        tracing::warn!("[Viewer] Session disconnected: {reason}. Reconnecting in {}s...",
-                            RECONNECT_DELAY.as_secs());
-                        tokio::time::sleep(RECONNECT_DELAY).await;
-
-                        // 消费残留缓冲帧 (旧 session 已 abort，不再有新数据)
-                        drain_channel(&mut rx, &mut frame_count, &mut bytes_received,
-                            &mut video_start, &mut output_file,
-                            #[cfg(feature = "player")]
-                            player.as_mut());
-                        drain_audio_channel(&mut audio_rx, &mut audio_count,
-                            #[cfg(feature = "player")]
-                            audio_player.as_mut());
-
-                        // 重新启动 session
-                        spawn_session(
-                            relay_addrs.clone(),
-                            device_cam_str.clone(),
-                            no_audio,
-                            udp_port,
-                            enable_mdns,
-                            stream_type.clone(),
-                            tx.clone(),
-                            audio_tx.clone(),
-                            session_tx.clone(),
-                        );
+                        // 忽略重复的 Disconnected 事件
+                        if stream_disconnected {
+                            continue;
+                        }
+                        eprintln!("[Viewer] Session disconnected: {reason}");
+                        stream_disconnected = true;
+                        #[cfg(not(feature = "player"))]
+                        {
+                            eprintln!("[Viewer] Reconnecting in {}s...", RECONNECT_DELAY.as_secs());
+                            tokio::time::sleep(RECONNECT_DELAY).await;
+                            reset_stats(&mut frame_count, &mut bytes_received, &mut video_start);
+                            drain_channel(&mut rx, &mut frame_count, &mut bytes_received,
+                                &mut video_start, &mut output_file,
+                                #[cfg(feature = "player")]
+                                player.as_mut());
+                            drain_audio_channel(&mut audio_rx, &mut audio_count,
+                                #[cfg(feature = "player")]
+                                audio_player.as_mut());
+                            session_abort_handle = Some(spawn_session(
+                                relay_addrs.clone(),
+                                device_cam_str.clone(),
+                                no_audio,
+                                udp_port,
+                                enable_mdns,
+                                stream_type.clone(),
+                                tx.clone(),
+                                audio_tx.clone(),
+                                session_tx.clone(),
+                            ));
+                            stream_disconnected = false;
+                        }
+                        #[cfg(feature = "player")]
+                        {
+                            // 先轮询 SDL 事件，检查窗口是否已最小化
+                            // 避免在窗口最小化时重连（浪费资源）
+                            if let Some(p) = player.as_mut() {
+                                let action = p.poll_events();
+                                if let RenderAction::WindowMinimized = action {
+                                    window_minimized = true;
+                                } else if let RenderAction::Quit = action {
+                                    break;
+                                }
+                            }
+                            if !window_minimized {
+                                eprintln!("[Viewer] Reconnecting in {}s...", RECONNECT_DELAY.as_secs());
+                                tokio::time::sleep(RECONNECT_DELAY).await;
+                                // 先消费残留帧，再 flush 解码器
+                                reset_stats(&mut frame_count, &mut bytes_received, &mut video_start);
+                                drain_channel(&mut rx, &mut frame_count, &mut bytes_received,
+                                    &mut video_start, &mut output_file,
+                                    player.as_mut());
+                                drain_audio_channel(&mut audio_rx, &mut audio_count,
+                                    audio_player.as_mut());
+                                // drain 完成后再 flush 解码器，设置 waiting_for_keyframe
+                                if let Some(p) = player.as_mut() {
+                                    p.reset_decoder();
+                                }
+                                session_abort_handle = Some(spawn_session(
+                                    relay_addrs.clone(),
+                                    device_cam_str.clone(),
+                                    no_audio,
+                                    udp_port,
+                                    enable_mdns,
+                                    stream_type.clone(),
+                                    tx.clone(),
+                                    audio_tx.clone(),
+                                    session_tx.clone(),
+                                ));
+                                stream_disconnected = false;
+                            } else {
+                                eprintln!("[Viewer] Window is minimized, will reconnect on restore");
+                            }
+                        }
+                    }
+                    Some(SessionEvent::StreamEOF { reason }) => {
+                        // 忽略重复的 StreamEOF（视频和音频 stream 各发一个）
+                        if stream_disconnected {
+                            continue;
+                        }
+                        tracing::warn!("[Viewer] Stream EOF: {reason}");
+                        stream_disconnected = true;
+                        #[cfg(not(feature = "player"))]
+                        {
+                            eprintln!("[Viewer] Reconnecting in {}s...", RECONNECT_DELAY.as_secs());
+                            tokio::time::sleep(RECONNECT_DELAY).await;
+                            reset_stats(&mut frame_count, &mut bytes_received, &mut video_start);
+                            drain_channel(&mut rx, &mut frame_count, &mut bytes_received,
+                                &mut video_start, &mut output_file,
+                                #[cfg(feature = "player")]
+                                player.as_mut());
+                            drain_audio_channel(&mut audio_rx, &mut audio_count,
+                                #[cfg(feature = "player")]
+                                audio_player.as_mut());
+                            session_abort_handle = Some(spawn_session(
+                                relay_addrs.clone(),
+                                device_cam_str.clone(),
+                                no_audio,
+                                udp_port,
+                                enable_mdns,
+                                stream_type.clone(),
+                                tx.clone(),
+                                audio_tx.clone(),
+                                session_tx.clone(),
+                            ));
+                            stream_disconnected = false;
+                        }
+                        #[cfg(feature = "player")]
+                        {
+                            // 先轮询 SDL 事件，检查窗口是否已最小化
+                            if let Some(p) = player.as_mut() {
+                                let action = p.poll_events();
+                                if let RenderAction::WindowMinimized = action {
+                                    window_minimized = true;
+                                } else if let RenderAction::Quit = action {
+                                    break;
+                                }
+                            }
+                            if !window_minimized {
+                                eprintln!("[Viewer] Reconnecting in {}s...", RECONNECT_DELAY.as_secs());
+                                tokio::time::sleep(RECONNECT_DELAY).await;
+                                // 先消费残留帧，再 flush 解码器
+                                reset_stats(&mut frame_count, &mut bytes_received, &mut video_start);
+                                drain_channel(&mut rx, &mut frame_count, &mut bytes_received,
+                                    &mut video_start, &mut output_file,
+                                    player.as_mut());
+                                drain_audio_channel(&mut audio_rx, &mut audio_count,
+                                    audio_player.as_mut());
+                                // drain 完成后再 flush 解码器，设置 waiting_for_keyframe
+                                if let Some(p) = player.as_mut() {
+                                    p.reset_decoder();
+                                }
+                                session_abort_handle = Some(spawn_session(
+                                    relay_addrs.clone(),
+                                    device_cam_str.clone(),
+                                    no_audio,
+                                    udp_port,
+                                    enable_mdns,
+                                    stream_type.clone(),
+                                    tx.clone(),
+                                    audio_tx.clone(),
+                                    session_tx.clone(),
+                                ));
+                                stream_disconnected = false;
+                            } else {
+                                eprintln!("[Viewer] Window is minimized, will reconnect on restore");
+                            }
+                        }
                     }
                     Some(SessionEvent::DirectUpgraded { via_lan }) => {
                         direct_upgraded = true;
@@ -261,7 +388,7 @@ async fn main() -> Result<()> {
             // 接收视频帧
             packet = rx.recv() => {
                 let Some(packet) = packet else { continue; };
-                if !process_video_frame(
+                match process_video_frame(
                     packet,
                     &mut frame_count,
                     &mut bytes_received,
@@ -270,7 +397,63 @@ async fn main() -> Result<()> {
                     #[cfg(feature = "player")]
                     player.as_mut(),
                 ) {
-                    break; // 用户关闭窗口
+                    RenderAction::Quit => break,
+                    RenderAction::WindowMinimized => {
+                        #[cfg(feature = "player")]
+                        {
+                            window_minimized = true;
+                            if !stream_disconnected {
+                                // 最小化时主动断开 stream，节约网络和 CPU 资源
+                                // 恢复最大化时会重新连接，从关键帧开始，避免马赛克
+                                eprintln!("[Viewer] Window minimized, aborting session to save resources");
+                                stream_disconnected = true;
+                                // abort 当前 session task，停止收发数据
+                                if let Some(handle) = session_abort_handle.take() {
+                                    handle.abort();
+                                }
+                                drain_channel(&mut rx, &mut frame_count, &mut bytes_received,
+                                    &mut video_start, &mut output_file,
+                                    player.as_mut());
+                                drain_audio_channel(&mut audio_rx, &mut audio_count,
+                                    audio_player.as_mut());
+                            }
+                        }
+                    }
+                    RenderAction::WindowRestored => {
+                        #[cfg(feature = "player")]
+                        {
+                            window_minimized = false;
+                            if stream_disconnected {
+                                eprintln!("[Viewer] Window restored, reconnecting...");
+                                // 先消费残留帧，再 flush 解码器
+                                // 顺序很重要：如果先 flush 再 drain，残留帧中的 VPS/SPS/PPS
+                                // 会清除 waiting_for_keyframe，导致新 session 的 P/B 帧被错误解码
+                                reset_stats(&mut frame_count, &mut bytes_received, &mut video_start);
+                                drain_channel(&mut rx, &mut frame_count, &mut bytes_received,
+                                    &mut video_start, &mut output_file,
+                                    player.as_mut());
+                                drain_audio_channel(&mut audio_rx, &mut audio_count,
+                                    audio_player.as_mut());
+                                // drain 完成后再 flush 解码器，设置 waiting_for_keyframe
+                                if let Some(p) = player.as_mut() {
+                                    p.reset_decoder();
+                                }
+                                session_abort_handle = Some(spawn_session(
+                                    relay_addrs.clone(),
+                                    device_cam_str.clone(),
+                                    no_audio,
+                                    udp_port,
+                                    enable_mdns,
+                                    stream_type.clone(),
+                                    tx.clone(),
+                                    audio_tx.clone(),
+                                    session_tx.clone(),
+                                ));
+                                stream_disconnected = false;
+                            }
+                        }
+                    }
+                    RenderAction::Continue => {}
                 }
             }
 
@@ -289,6 +472,49 @@ async fn main() -> Result<()> {
                     if audio_count % 250 == 0 {
                         println!("[Viewer] Audio: {} frames, last {} bytes, ts={}",
                             audio_count, packet.data.len(), packet.timestamp_ms);
+                    }
+                }
+            }
+
+            // 最小化时定期轮询 SDL 事件，检测窗口恢复
+            // 因为最小化后 session 被 abort，没有新帧进来，
+            // rx.recv() 会阻塞，导致 SDL 事件无法被轮询
+            _ = tokio::time::sleep(std::time::Duration::from_millis(100)), if window_minimized => {
+                #[cfg(feature = "player")]
+                {
+                    let action = player.as_mut().map(|p| p.poll_events());
+                    match action {
+                        Some(RenderAction::WindowRestored) => {
+                            window_minimized = false;
+                            if stream_disconnected {
+                                eprintln!("[Viewer] Window restored (poll), reconnecting...");
+                                // 先消费残留帧，再 flush 解码器
+                                reset_stats(&mut frame_count, &mut bytes_received, &mut video_start);
+                                drain_channel(&mut rx, &mut frame_count, &mut bytes_received,
+                                    &mut video_start, &mut output_file,
+                                    player.as_mut());
+                                drain_audio_channel(&mut audio_rx, &mut audio_count,
+                                    audio_player.as_mut());
+                                // drain 完成后再 flush 解码器，设置 waiting_for_keyframe
+                                if let Some(p) = player.as_mut() {
+                                    p.reset_decoder();
+                                }
+                                session_abort_handle = Some(spawn_session(
+                                    relay_addrs.clone(),
+                                    device_cam_str.clone(),
+                                    no_audio,
+                                    udp_port,
+                                    enable_mdns,
+                                    stream_type.clone(),
+                                    tx.clone(),
+                                    audio_tx.clone(),
+                                    session_tx.clone(),
+                                ));
+                                stream_disconnected = false;
+                            }
+                        }
+                        Some(RenderAction::Quit) => break,
+                        _ => {}
                     }
                 }
             }
@@ -326,13 +552,15 @@ async fn main() -> Result<()> {
 enum SessionEvent {
     /// 连接断开，需要重连
     Disconnected { reason: String },
+    /// 流断开（EOF 或读错误），连接可能仍存活，窗口恢复时触发重连
+    StreamEOF { reason: String },
     /// 直连建立 (DCUtR 或局域网)
     DirectUpgraded { via_lan: bool },
     /// NAT 类型诊断更新
     NatDiagnosis { local_nat: NatType, remote_nat: Option<String> },
 }
 
-/// 在后台启动一个 viewer session
+/// 在后台启动一个 viewer session，返回 AbortHandle 用于取消 session
 fn spawn_session(
     relay_addrs: Vec<String>,
     device_cam_str: String,
@@ -343,7 +571,7 @@ fn spawn_session(
     video_tx: mpsc::Sender<MediaPacket>,
     audio_tx: mpsc::Sender<MediaPacket>,
     event_tx: mpsc::Sender<SessionEvent>,
-) {
+) -> tokio::task::AbortHandle {
     tokio::spawn(async move {
         let result = run_viewer_session(
             relay_addrs,
@@ -365,7 +593,14 @@ fn spawn_session(
                 }).await;
             }
         }
-    });
+    }).abort_handle()
+}
+
+/// 重置帧率统计，在重连时调用
+fn reset_stats(frame_count: &mut u64, bytes_received: &mut u64, video_start: &mut Option<std::time::Instant>) {
+    *frame_count = 0;
+    *bytes_received = 0;
+    *video_start = None;
 }
 
 /// 消费 channel 中所有残留视频帧
@@ -379,12 +614,13 @@ fn drain_channel(
     #[cfg(feature = "player")] mut player: Option<&mut player::VideoPlayer>,
 ) {
     while let Ok(packet) = rx.try_recv() {
-        if !process_video_frame(
+        match process_video_frame(
             packet, frame_count, bytes_received, video_start, output_file,
             #[cfg(feature = "player")]
             player.as_mut().map(|p| &mut **p),
         ) {
-            break;
+            RenderAction::Quit => break,
+            _ => {}
         }
     }
 }
@@ -613,6 +849,13 @@ async fn run_viewer_session(
             SwarmEvent::ConnectionEstablished { peer_id, .. } if *peer_id == device_cam
         ), "device-cam LAN direct connection", &mut local_ips, &mut local_quic_port, &mut pending_events).await?;
         println!("[Viewer] Connected to device-cam {device_cam} via LAN direct (mDNS)");
+
+        // LAN 直连已建立，关闭 relay 连接以阻止 DCUtR 继续尝试打洞
+        // DCUtR 打洞会干扰已正常工作的 LAN 直连，导致 stream 断开
+        if let Some((relay_peer_id, _)) = connected_relay {
+            tracing::info!("[Viewer] Closing relay connection to {relay_peer_id} after LAN direct established (prevents DCUtR interference)");
+            let _ = swarm.disconnect_peer_id(relay_peer_id);
+        }
     } else if let Some((_relay_peer_id, relay_addr)) = connected_relay {
         // 通过 Relay circuit 拨号 DeviceCam
         let circuit_addr = relay_addr
@@ -660,7 +903,7 @@ async fn run_viewer_session(
         match stream_control.open_stream(device_cam, stream_protocols::AUDIO_PROTOCOL).await {
             Ok(audio_stream) => {
                 println!("[Viewer] Audio stream opened");
-                let h = tokio::spawn(receive_frames(device_cam, audio_stream, audio_tx.clone()))
+                let h = tokio::spawn(receive_frames(device_cam, audio_stream, audio_tx.clone(), event_tx.clone()))
                     .abort_handle();
                 audio_abort_handle = Some(h);
             }
@@ -672,7 +915,7 @@ async fn run_viewer_session(
 
     // ---- 4. 启动视频接收任务 ----
     let mut video_abort_handle: Option<tokio::task::AbortHandle> =
-        Some(tokio::spawn(receive_frames(device_cam, video_stream, video_tx.clone())).abort_handle());
+        Some(tokio::spawn(receive_frames(device_cam, video_stream, video_tx.clone(), event_tx.clone())).abort_handle());
 
     let mut direct_upgraded = !initial_is_relay; // 初始直连时无需再升级
     let mut lan_direct_attempted = false;
@@ -726,7 +969,7 @@ async fn run_viewer_session(
                 match stream_control.open_stream(device_cam, upgrade_protocol).await {
                     Ok(new_stream) => {
                         if let Some(h) = video_abort_handle.take() { h.abort(); }
-                        let handle = tokio::spawn(receive_frames(device_cam, new_stream, video_tx.clone())).abort_handle();
+                        let handle = tokio::spawn(receive_frames(device_cam, new_stream, video_tx.clone(), event_tx.clone())).abort_handle();
                         video_abort_handle = Some(handle);
                         direct_upgraded = true;
                         let _ = event_tx.send(SessionEvent::DirectUpgraded { via_lan: is_lan }).await;
@@ -751,7 +994,7 @@ async fn run_viewer_session(
                     match stream_control.open_stream(device_cam, stream_protocols::AUDIO_PROTOCOL).await {
                         Ok(new_stream) => {
                             if let Some(h) = audio_abort_handle.take() { h.abort(); }
-                            let handle = tokio::spawn(receive_frames(device_cam, new_stream, audio_tx.clone())).abort_handle();
+                            let handle = tokio::spawn(receive_frames(device_cam, new_stream, audio_tx.clone(), event_tx.clone())).abort_handle();
                             audio_abort_handle = Some(handle);
                             println!("[Viewer] Audio stream upgraded to direct connection");
                         }
@@ -965,7 +1208,7 @@ async fn run_viewer_session(
     }
 }
 
-/// 处理单个视频帧，返回 false 表示需要退出
+/// 处理单个视频帧，返回 RenderAction 表示渲染结果和窗口状态
 #[allow(unused_variables)]
 fn process_video_frame(
     packet: MediaPacket,
@@ -974,7 +1217,7 @@ fn process_video_frame(
     video_start: &mut Option<std::time::Instant>,
     output_file: &mut Option<std::fs::File>,
     #[cfg(feature = "player")] player: Option<&mut player::VideoPlayer>,
-) -> bool {
+) -> RenderAction {
     *frame_count += 1;
     *bytes_received += packet.data.len() as u64;
 
@@ -983,28 +1226,7 @@ fn process_video_frame(
         *video_start = Some(std::time::Instant::now());
     }
 
-    if let Some(file) = output_file {
-        use std::io::Write;
-        if file.write_all(&packet.data).is_err() {
-            return false;
-        }
-        let _ = file.flush();
-    }
-
-    #[cfg(feature = "player")]
-    if let Some(p) = player {
-        match p.render(&packet.data) {
-            Ok(false) => {
-                println!("[Viewer] Player window closed, stopping...");
-                return false;
-            }
-            Ok(true) => {}
-            Err(e) => {
-                tracing::error!("[Viewer] Player error: {e}");
-            }
-        }
-    }
-
+    // 帧率统计（在渲染之前输出，确保不受渲染返回值影响）
     if *frame_count % 100 == 0 {
         if let Some(start) = video_start {
             let elapsed = start.elapsed().as_secs_f64();
@@ -1018,7 +1240,25 @@ fn process_video_frame(
         }
     }
 
-    true
+    if let Some(file) = output_file {
+        use std::io::Write;
+        if file.write_all(&packet.data).is_err() {
+            return RenderAction::Quit;
+        }
+        let _ = file.flush();
+    }
+
+    #[cfg(feature = "player")]
+    if let Some(p) = player {
+        match p.render(&packet.data) {
+            Ok(action) => return action,
+            Err(e) => {
+                tracing::error!("[Viewer] Player error: {e}");
+            }
+        }
+    }
+
+    RenderAction::Continue
 }
 
 /// 从 stream 持续读取帧
@@ -1026,6 +1266,7 @@ async fn receive_frames(
     peer_id: PeerId,
     mut stream: libp2p::swarm::Stream,
     sender: mpsc::Sender<MediaPacket>,
+    event_tx: mpsc::Sender<SessionEvent>,
 ) {
     let mut buf = BytesMut::with_capacity(STREAM_READ_BUF);
     let mut read_buf = vec![0u8; STREAM_READ_BUF];
@@ -1034,6 +1275,9 @@ async fn receive_frames(
         match stream.read(&mut read_buf).await {
             Ok(0) => {
                 println!("[Viewer] Stream EOF from {peer_id}");
+                let _ = event_tx.send(SessionEvent::StreamEOF {
+                    reason: format!("Stream EOF from {peer_id}"),
+                }).await;
                 break;
             }
             Ok(n) => {
@@ -1046,6 +1290,9 @@ async fn receive_frames(
             }
             Err(e) => {
                 tracing::warn!("[Viewer] Stream read error: {e}");
+                let _ = event_tx.send(SessionEvent::StreamEOF {
+                    reason: format!("Stream read error: {e}"),
+                }).await;
                 break;
             }
         }
@@ -1135,11 +1382,50 @@ async fn wait_for_event_collecting(
 
 // ---- SDL Player (player feature) ----
 
+/// VideoPlayer::render() / process_video_frame() 的返回动作
+enum RenderAction {
+    /// 正常渲染，继续主循环
+    Continue,
+    /// 窗口已最小化
+    WindowMinimized,
+    /// 窗口已恢复（从最小化）
+    WindowRestored,
+    /// 用户关闭窗口，退出主循环
+    Quit,
+}
+
 #[cfg(feature = "player")]
 mod player {
+    use super::RenderAction;
     use anyhow::{Context, Result};
     use ffmpeg_next as ffmpeg;
     use sdl2::event::Event;
+    use sdl2::event::WindowEvent;
+
+    /// 从 HEVC access unit 数据中判断是否包含 IDR 帧
+    fn is_hevc_idr(au: &[u8]) -> bool {
+        let mut i = 0;
+        while i + 4 < au.len() {
+            if au[i] == 0 && au[i + 1] == 0 {
+                let sc_len = if i + 3 < au.len() && au[i + 2] == 0 && au[i + 3] == 1 {
+                    4
+                } else if au[i + 2] == 1 {
+                    3
+                } else {
+                    i += 1;
+                    continue;
+                };
+                let nal_type = (au[i + sc_len] >> 1) & 0x3F;
+                if nal_type == 19 || nal_type == 20 {
+                    return true;
+                }
+                i += sc_len + 1;
+            } else {
+                i += 1;
+            }
+        }
+        false
+    }
     use sdl2::keyboard::Keycode;
     use sdl2::pixels::PixelFormatEnum;
     use sdl2::rect::Rect;
@@ -1163,9 +1449,49 @@ mod player {
         width: u32,
         height: u32,
         frame_count: u64,
+        /// 窗口是否最小化：最小化时跳过解码和渲染，避免 SDL 阻塞导致 stream EOF 延迟检测
+        minimized: bool,
+        /// 解码器 flush 后等待关键帧：跳过非关键帧，避免 POC 错误导致花屏
+        waiting_for_keyframe: bool,
     }
 
     impl VideoPlayer {
+        /// 重置解码器状态，在重连后调用以清除旧的参考帧缓冲区
+        /// 避免旧参考帧导致马赛克
+        pub fn reset_decoder(&mut self) {
+            // 使用 avcodec_flush_buffers 清除解码器内部缓冲区
+            // 这会重置解码器状态，使下一帧必须从关键帧开始
+            self.decoder.flush();
+            self.waiting_for_keyframe = true;
+            eprintln!("[Player] Decoder flushed, waiting for keyframe");
+        }
+
+        /// 仅轮询 SDL 事件，不做解码/渲染
+        /// 用于最小化期间检测窗口恢复事件
+        pub fn poll_events(&mut self) -> RenderAction {
+            for event in self.event_pump.poll_iter() {
+                match event {
+                    Event::Quit { .. }
+                    | Event::KeyDown {
+                        keycode: Some(Keycode::Escape),
+                        ..
+                    } => return RenderAction::Quit,
+                    Event::Window { win_event, .. } => {
+                        match win_event {
+                            WindowEvent::Restored => {
+                                eprintln!("[Player] SDL window event (poll): Restored");
+                                self.minimized = false;
+                                return RenderAction::WindowRestored;
+                            }
+                            _ => {}
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            RenderAction::Continue
+        }
+
         pub fn new() -> Result<Self> {
             ffmpeg::init()?;
 
@@ -1204,20 +1530,51 @@ mod player {
                 width: 0,
                 height: 0,
                 frame_count: 0,
+                minimized: false,
+                waiting_for_keyframe: false,
             })
         }
 
-        /// 渲染一个 H.265 access unit, 返回 false 表示用户关闭窗口
-        pub fn render(&mut self, au: &[u8]) -> Result<bool> {
+        /// 渲染一个 H.265 access unit, 返回 RenderAction 表示渲染结果和窗口状态
+        pub fn render(&mut self, au: &[u8]) -> Result<RenderAction> {
             for event in self.event_pump.poll_iter() {
                 match event {
                     Event::Quit { .. }
                     | Event::KeyDown {
                         keycode: Some(Keycode::Escape),
                         ..
-                    } => return Ok(false),
+                    } => return Ok(RenderAction::Quit),
+                    Event::Window { win_event, .. } => {
+                        match win_event {
+                            WindowEvent::Minimized => {
+                                eprintln!("[Player] SDL window event: Minimized");
+                                self.minimized = true;
+                                return Ok(RenderAction::WindowMinimized);
+                            }
+                            WindowEvent::Restored => {
+                                eprintln!("[Player] SDL window event: Restored");
+                                self.minimized = false;
+                                return Ok(RenderAction::WindowRestored);
+                            }
+                            _ => {}
+                        }
+                    }
                     _ => {}
                 }
+            }
+
+            // 窗口最小化时跳过 SDL 渲染
+            // 最小化时 session 已被 abort，不会有新帧进来，此处仅作防御性处理
+            let skip_render = self.minimized;
+
+            // 解码器 flush 后等待关键帧：从 NAL 数据判断是否为 IDR，跳过非关键帧避免花屏
+            if self.waiting_for_keyframe {
+                let is_idr = is_hevc_idr(au);
+                if !is_idr {
+                    return Ok(RenderAction::Continue);
+                }
+                self.waiting_for_keyframe = false;
+                eprintln!("[Player] Keyframe received, resuming decode");
             }
 
             let mut packet = ffmpeg::Packet::new(au.len());
@@ -1229,12 +1586,16 @@ mod player {
             let mut frame = ffmpeg::frame::Video::empty();
             loop {
                 match self.decoder.receive_frame(&mut frame) {
-                    Ok(()) => self.render_frame(&frame)?,
+                    Ok(()) => {
+                        if !skip_render {
+                            self.render_frame(&frame)?;
+                        }
+                    }
                     Err(_) => break,
                 }
             }
 
-            Ok(true)
+            Ok(RenderAction::Continue)
         }
 
         fn render_frame(&mut self, frame: &ffmpeg::frame::Video) -> Result<()> {
@@ -1258,13 +1619,20 @@ mod player {
                 println!("[Player] Video: {w}x{h} ({:?})", frame.format());
             }
 
-            let (y, ys, u, us, v, vs) = if frame.format() == Pixel::YUV420P {
-                (
-                    frame.data(0).to_vec(), frame.stride(0) as usize,
-                    frame.data(1).to_vec(), frame.stride(1) as usize,
-                    frame.data(2).to_vec(), frame.stride(2) as usize,
-                )
+            // YUVJ420P 与 YUV420P 数据布局相同（仅色彩范围不同），可直接使用
+            // 避免 scaler 转换和 to_vec() 内存拷贝
+            if frame.format() == Pixel::YUV420P || frame.format() == Pixel::YUVJ420P {
+                let y = frame.data(0);
+                let u = frame.data(1);
+                let v = frame.data(2);
+                let ys = frame.stride(0) as usize;
+                let us = frame.stride(1) as usize;
+                let vs = frame.stride(2) as usize;
+                if let Some(tex) = &mut self.texture {
+                    map_sdl(tex.update_yuv(None, y, ys, u, us, v, vs), "update_yuv")?;
+                }
             } else {
+                // 其他格式需要 scaler 转换
                 if self.scaler.is_none() {
                     self.scaler = Some(
                         ffmpeg::software::scaling::context::Context::get(
@@ -1280,16 +1648,17 @@ mod player {
                     let scaler = self.scaler.as_mut().unwrap();
                     scaler.run(frame, &mut self.yuv_frame)?;
                 }
-                (
-                    self.yuv_frame.data(0).to_vec(), self.yuv_frame.stride(0) as usize,
-                    self.yuv_frame.data(1).to_vec(), self.yuv_frame.stride(1) as usize,
-                    self.yuv_frame.data(2).to_vec(), self.yuv_frame.stride(2) as usize,
-                )
-            };
-
-            if let Some(tex) = &mut self.texture {
-                map_sdl(tex.update_yuv(None, &y, ys, &u, us, &v, vs), "update_yuv")?;
+                let y = self.yuv_frame.data(0);
+                let u = self.yuv_frame.data(1);
+                let v = self.yuv_frame.data(2);
+                let ys = self.yuv_frame.stride(0) as usize;
+                let us = self.yuv_frame.stride(1) as usize;
+                let vs = self.yuv_frame.stride(2) as usize;
+                if let Some(tex) = &mut self.texture {
+                    map_sdl(tex.update_yuv(None, y, ys, u, us, v, vs), "update_yuv")?;
+                }
             }
+
             self.canvas.clear();
             map_sdl(
                 self.canvas.copy(

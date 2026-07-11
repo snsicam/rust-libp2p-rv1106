@@ -85,6 +85,12 @@ impl AvJitterBuffer {
         self.video.last_played_ts.is_some()
             || self.video.buffered_duration() >= self.video.target_delay
     }
+
+    /// 清空所有缓冲帧，重放播放状态（重连时使用）
+    pub fn clear(&mut self) {
+        self.video.clear();
+        self.audio.clear();
+    }
 }
 
 impl TrackBuffer {
@@ -144,5 +150,10 @@ impl TrackBuffer {
         let first = self.frames.front().unwrap().packet.timestamp_ms;
         let last = self.frames.back().unwrap().packet.timestamp_ms;
         Duration::from_millis(last - first)
+    }
+
+    fn clear(&mut self) {
+        self.frames.clear();
+        self.last_played_ts = None;
     }
 }

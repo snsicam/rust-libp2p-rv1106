@@ -21,7 +21,7 @@ use jni::{
 use serde::Serialize;
 use tokio::runtime::Runtime;
 
-use crate::viewer::MediaPlayer;
+use crate::viewer::{MediaPlayer, MediaPlayerEvent};
 use proto::media_packet::MediaPacket;
 
 // ── Event 类型 ──
@@ -149,18 +149,22 @@ pub extern "system" fn Java_com_p2pcamera_mediaplayer_RustBridge_nativeCreate(
             // audio_tx 用 Option 包装，no_audio 时 take() 关闭发送端
             let mut audio_tx = Some(audio_tx);
 
+            // 保存 device_id 用于重连时发送事件
+            let mut device_id = String::new();
+
             // 等待连接命令
             match cmd_rx.recv() {
-                Ok(Cmd::Connect { relays, device_id, enable_mdns, stream_type, no_audio }) => {
+                Ok(Cmd::Connect { relays, device_id: did, enable_mdns, stream_type, no_audio }) => {
+                    device_id = did.clone();
                     let _ = event_tx.send(ViewerEvent::Connecting);
                     let relay_strs: Vec<String> = relays.clone();
                     match viewer
-                        .connect(&relay_strs, &device_id, enable_mdns, &stream_type)
+                        .connect(&relay_strs, &did, enable_mdns, &stream_type)
                         .await
                     {
                         Ok(()) => {
                             let _ = event_tx.send(ViewerEvent::Connected {
-                                peer_id: device_id.clone(),
+                                peer_id: did,
                                 connection_type: "relay".into(),
                             });
                             let _ = event_tx.send(ViewerEvent::StreamReady);
@@ -181,7 +185,7 @@ pub extern "system" fn Java_com_p2pcamera_mediaplayer_RustBridge_nativeCreate(
                 Err(_) => return, // channel closed
             }
 
-            // 主事件循环: 驱动 swarm + 轮询帧
+            // 主事件循环: 驱动 swarm + 轮询帧 + 检测断连 + 自动重连
             loop {
                 tokio::select! {
                     _ = viewer.poll_swarm() => {
@@ -206,6 +210,41 @@ pub extern "system" fn Java_com_p2pcamera_mediaplayer_RustBridge_nativeCreate(
                         } else {
                             // no_audio 模式：丢弃音频帧
                             while viewer.poll_audio_frame().is_some() {}
+                        }
+
+                        // 检测 MediaPlayer 内部事件（断连/直连升级）
+                        while let Some(event) = viewer.poll_event() {
+                            match event {
+                                MediaPlayerEvent::Disconnected { reason } => {
+                                    tracing::warn!("[JNI] Disconnected: {reason}");
+                                    let _ = event_tx.send(ViewerEvent::Disconnected);
+
+                                    // 自动重连
+                                    tracing::info!("[JNI] Auto-reconnecting...");
+                                    let _ = event_tx.send(ViewerEvent::Connecting);
+                                    match viewer.reconnect().await {
+                                        Ok(()) => {
+                                            let _ = event_tx.send(ViewerEvent::Connected {
+                                                peer_id: device_id.clone(),
+                                                connection_type: "relay".into(),
+                                            });
+                                            let _ = event_tx.send(ViewerEvent::StreamReady);
+                                            tracing::info!("[JNI] Reconnected successfully");
+                                        }
+                                        Err(e) => {
+                                            tracing::error!("[JNI] Reconnect failed: {e}");
+                                            let _ = event_tx.send(ViewerEvent::Error {
+                                                message: format!("reconnect failed: {e}"),
+                                            });
+                                            return;
+                                        }
+                                    }
+                                }
+                                MediaPlayerEvent::DirectUpgraded { via_lan } => {
+                                    let conn_type = if via_lan { "LAN direct" } else { "DCUtR" };
+                                    tracing::info!("[JNI] Direct upgraded: {conn_type}");
+                                }
+                            }
                         }
                     }
                 }
