@@ -151,31 +151,54 @@ static GLOBAL_START_TIMES: [Mutex<Option<Instant>>; MAX_CHN] = [
 /// chn_id: 0=main, 1=sub, 2=third
 extern "C" fn on_frame(
     chn_id: std::ffi::c_int, data: *const u8, len: u32,
-    pts_us: u64, is_keyframe: std::ffi::c_int,
+    pts_us: u64, _is_keyframe_c: std::ffi::c_int,
 ) {
     let chn = chn_id as usize;
     if chn >= MAX_CHN { return; }
 
     let slice = unsafe { std::slice::from_raw_parts(data, len as usize) };
+    let first_byte = slice.first().copied().unwrap_or(0);
 
-    // 查找 NAL type 并缓存参数集
-    let nal_type = slice.first().map(|b| (b >> 1) & 0x3F).unwrap_or(0);
-    if nal_type == 32 || nal_type == 33 || nal_type == 34 {
-        // VPS(32) / SPS(33) / PPS(34) for H.265
-        // SPS(7) / PPS(8) for H.264
+    // 提取 NAL unit type:
+    //   H.265: (b >> 1) & 0x3F → 6-bit type [0..63]
+    //   H.264: b & 0x1F        → 5-bit type [0..31]
+    // 区分方法: H.265 的 param set 类型为 32-34、H.264 为 7-8;
+    //           H.265 IDR 类型为 19, H.264 IDR 为 5
+    let h265_nal = ((first_byte >> 1) & 0x3F) as u8;
+    let h264_nal = (first_byte & 0x1F) as u8;
+
+    // 通过 NAL type 判断编码类型
+    // H.265: VPS=32, SPS=33, PPS=34, IDR≥16;  H.264: 所有类型 ≤ 15 (h265_nal ← (b>>1)&0x3F)
+    let is_h265 = h265_nal >= 16;
+    let nal_type = if is_h265 { h265_nal } else { h264_nal };
+
+    // 从帧数据直接判断关键帧 (不依赖 C 参数, 更可靠)
+    let is_keyframe = if is_h265 {
+        // H.265 IRAP: BLA(16-18), IDR(19-20), CRA(21)
+        nal_type >= 16 && nal_type <= 21
+    } else {
+        // H.264 IDR: type 5
+        nal_type == 5
+    };
+
+    // 缓存参数集 (区分 H.265/H.264 的 param set NAL type)
+    let is_param_set = if is_h265 {
+        nal_type == 32 || nal_type == 33 || nal_type == 34 // VPS/SPS/PPS
+    } else {
+        nal_type == 7 || nal_type == 8 // SPS/PPS
+    };
+    if is_param_set {
         if let Ok(mut all) = GLOBAL_PARAM_SETS.lock() {
             while all.len() <= chn { all.push(Vec::new()); }
             let ps = &mut all[chn];
-            ps.retain(|n| n.first().map(|b| (b >> 1) & 0x3F).unwrap_or(0) != nal_type);
-            ps.push(slice.to_vec());
-        }
-    }
-    // Also cache H.264 param sets (nal_type 7=SPS, 8=PPS)
-    if nal_type == 7 || nal_type == 8 {
-        if let Ok(mut all) = GLOBAL_PARAM_SETS.lock() {
-            while all.len() <= chn { all.push(Vec::new()); }
-            let ps = &mut all[chn];
-            ps.retain(|n| n.first().map(|b| (b >> 1) & 0x3F).unwrap_or(0) != nal_type);
+            ps.retain(|n| {
+                let b = n.first().copied().unwrap_or(0);
+                if is_h265 {
+                    ((b >> 1) & 0x3F) as u8 != nal_type
+                } else {
+                    (b & 0x1F) as u8 != nal_type
+                }
+            });
             ps.push(slice.to_vec());
         }
     }
@@ -187,7 +210,7 @@ extern "C" fn on_frame(
 
     let packet = MediaPacket::video(
         timestamp_ms,
-        is_keyframe != 0,
+        is_keyframe,
         Bytes::copy_from_slice(slice),
     );
 
