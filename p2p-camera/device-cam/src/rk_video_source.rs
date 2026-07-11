@@ -205,23 +205,23 @@ extern "C" fn on_frame(
 
     let first_byte = slice.first().copied().unwrap_or(0);
 
-    // 从帧数据直接判断关键帧 (不依赖 C 参数, 更可靠)
-    // 需要遍历所有 NAL：关键帧可能包含 VPS/SPS/PPS 等多个 NAL，IDR 不一定是第一个
-    let is_keyframe = if is_h265 {
-        // H.265 IRAP: BLA(16-18), IDR(19-20), CRA(21)
-        nals.iter().any(|&b| {
+    // 提取其中的 IRAP NAL type（即触发 is_keyframe 的 NAL）
+    let irap_types: Vec<u8> = nals.iter().filter_map(|&b| {
+        if is_h265 {
             let t = ((b >> 1) & 0x3F) as u8;
-            t >= 16 && t <= 21
-        })
-    } else {
-        // H.264 IDR: type 5
-        nals.iter().any(|&b| (b & 0x1F) as u8 == 5)
-    };
+            if t >= 16 && t <= 21 { Some(t) } else { None }
+        } else {
+            let t = (b & 0x1F) as u8;
+            if t == 5 { Some(t) } else { None }
+        }
+    }).collect();
+    let is_keyframe = !irap_types.is_empty();
 
-    if is_keyframe || _is_keyframe_c != 0 {
+    if is_keyframe {
+        let types_str: Vec<String> = irap_types.iter().map(|t| format!("{}", t)).collect();
         tracing::info!(
-            "[rk_video] keyframe: chn={}, is_keyframe_c={}, is_keyframe_rs=true, nal_type={}, is_h265={}, first_byte=0x{:02x}, nals_in_frame={}, len={}",
-            chn, _is_keyframe_c, nal_type, is_h265, first_byte, nals.len(), len
+            "[rk_video] keyframe: chn={}, is_keyframe_c={}, irap_types=[{}], is_h265={}, len={}",
+            chn, _is_keyframe_c, types_str.join(","), is_h265, len
         );
     }
 
