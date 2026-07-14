@@ -1405,6 +1405,9 @@ mod player {
     use sdl2::event::Event;
     use sdl2::event::WindowEvent;
 
+    /// 判断 access unit 是否为 IDR 帧 (支持 H.264 / H.265)
+    /// 扫描 Annex B buffer 中所有 NAL unit，查找 IDR
+    /// H.265 IDR: type 19 (IDR_W_RADL) 或 20 (IDR_N_LP)
     use sdl2::keyboard::Keycode;
     use sdl2::pixels::PixelFormatEnum;
     use sdl2::rect::Rect;
@@ -1547,13 +1550,13 @@ mod player {
             // 最小化时 session 已被 abort，不会有新帧进来，此处仅作防御性处理
             let skip_render = self.minimized;
 
-            // 解码器 flush 后等待 IDR 关键帧
+            // 解码器 flush 后等待关键帧
             if self.waiting_for_keyframe {
                 if !is_keyframe {
                     return Ok(RenderAction::Continue);
                 }
                 self.waiting_for_keyframe = false;
-                eprintln!("[Player] IDR received, resuming decode");
+                eprintln!("[Player] keyframe received, resuming decode");
             }
 
             let mut packet = ffmpeg::Packet::new(au.len());

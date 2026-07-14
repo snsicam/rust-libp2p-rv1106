@@ -439,7 +439,7 @@ static int venc_init_single(int chn_id, int width, int height,
 
 // ---- VENC 取流线程 (每个通道一个) ----
 
-// 从 Annex B raw buffer 扫描 H.265 IDR
+// 从 Annex B raw buffer 扫描 H.265 IRAP NAL
 static int is_keyframe_h265(const uint8_t *data, uint32_t len) {
     uint32_t i = 0;
     while (i + 4 < len) {
@@ -447,7 +447,7 @@ static int is_keyframe_h265(const uint8_t *data, uint32_t len) {
         if (data[i] == 0 && data[i+1] == 0 && data[i+2] == 0 && data[i+3] == 1) {
             if (i + 4 < len) {
                 int nal_type = (data[i+4] >> 1) & 0x3F;
-                if (nal_type == 19 || nal_type == 20) return 1;
+                if (nal_type >= 16 && nal_type <= 21) return 1;
             }
             i += 5;
         }
@@ -455,7 +455,7 @@ static int is_keyframe_h265(const uint8_t *data, uint32_t len) {
         else if (data[i] == 0 && data[i+1] == 0 && data[i+2] == 1) {
             if (i + 3 < len) {
                 int nal_type = (data[i+3] >> 1) & 0x3F;
-                if (nal_type == 19 || nal_type == 20) return 1;
+                if (nal_type >= 16 && nal_type <= 21) return 1;
             }
             i += 4;
         } else {
