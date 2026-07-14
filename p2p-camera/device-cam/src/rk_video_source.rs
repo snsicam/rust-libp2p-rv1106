@@ -192,7 +192,7 @@ extern "C" fn on_frame(
     };
 
     if is_keyframe {
-        tracing::info!(
+        tracing::debug!(
             "[rk_video] keyframe: chn={}, is_h265={}, len={}",
             chn, is_h265, len
         );

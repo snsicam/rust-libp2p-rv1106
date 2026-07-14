@@ -45,7 +45,7 @@ echo "  Ctrl+C to stop"
 echo "============================================"
 echo ""
 
-export RUST_LOG=debug
+export RUST_LOG=info
 
 # 前台运行, 输出到终端同时写日志
 # 透传所有命令行参数 (如 --port, --public-ip 等)

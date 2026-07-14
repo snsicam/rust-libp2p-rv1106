@@ -71,7 +71,7 @@ echo "  ESC / Close window to quit"
 echo "============================================"
 echo ""
 
-export RUST_LOG=debug
+export RUST_LOG=info
 
 # 检测是否支持 --play (需要 --features player 编译)
 if "$VIEWER_BIN" --help 2>&1 | grep -q -- '--play'; then
