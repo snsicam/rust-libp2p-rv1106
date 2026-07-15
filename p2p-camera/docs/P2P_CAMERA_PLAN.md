@@ -853,7 +853,7 @@ p2p-camera/
 │   │   ├── net_diag.rs        # NAT 诊断 + ConnectionType
 │   │   └── stream_protocols.rs # 协议常量
 │   └── examples/
-│       └── media_viewer.rs      # PC 端 Viewer (含 TOML 配置支持)
+│       └── media_viewer.rs    # PC 端 Media Viewer (含 TOML 配置支持)
 │
 ├── mobile-android/            # Android APP
 │   ├── app/

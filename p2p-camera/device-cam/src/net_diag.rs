@@ -9,7 +9,6 @@ use std::net::Ipv4Addr;
 use libp2p::core::multiaddr::{Multiaddr, Protocol};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum NatType {
     FullCone,
     RestrictedCone,
@@ -45,7 +44,6 @@ impl NatType {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct NatDiagnosis {
     pub nat_type: NatType,
     pub observed_addresses: Vec<Multiaddr>,
@@ -58,7 +56,6 @@ pub struct NatDiagnosis {
 
 /// DCUtR 尝试前的预测结果
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct DcutrPrediction {
     pub likely_success: bool,
     pub is_4g: bool,
@@ -85,7 +82,6 @@ impl NatDiagnostic {
         self.observed_history.push(addr.clone());
     }
 
-    #[allow(dead_code)]
     pub fn observed_history_is_empty(&self) -> bool {
         self.observed_history.is_empty()
     }

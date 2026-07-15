@@ -332,7 +332,6 @@ impl Config {
     }
 
     /// 返回所有启用码流的配置列表
-    #[allow(dead_code)]
     pub fn enabled_streams(&self) -> Vec<(StreamType, &StreamConfig)> {
         let mut streams = Vec::new();
         if self.video.main.enabled {
@@ -350,7 +349,6 @@ impl Config {
 
 /// 码流类型枚举
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[allow(dead_code)]
 pub enum StreamType {
     Main = 0,
     Sub = 1,
@@ -358,7 +356,6 @@ pub enum StreamType {
 }
 
 impl StreamType {
-    #[allow(dead_code)]
     pub fn from_chn_id(chn_id: u8) -> Option<Self> {
         match chn_id {
             0 => Some(StreamType::Main),
@@ -368,7 +365,6 @@ impl StreamType {
         }
     }
 
-    #[allow(dead_code)]
     pub fn name(&self) -> &'static str {
         match self {
             StreamType::Main => "main",

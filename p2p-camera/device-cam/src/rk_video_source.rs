@@ -45,7 +45,6 @@ extern "C" {
     ) -> std::ffi::c_int;
     fn rk_camera_set_callback(cb: FrameCallback);
     fn rk_camera_request_idr(chn_id: std::ffi::c_int) -> std::ffi::c_int;
-    #[allow(dead_code)]
     fn rk_camera_request_idr_all() -> std::ffi::c_int;
     fn rk_camera_deinit();
 
@@ -115,7 +114,6 @@ pub fn request_idr(chn_id: u8) {
 }
 
 /// 请求所有通道的 IDR
-#[allow(dead_code)]
 pub fn request_idr_all() {
     unsafe { rk_camera_request_idr_all(); }
 }
@@ -127,7 +125,6 @@ pub fn get_param_sets(chn_id: usize) -> Vec<Vec<u8>> {
 }
 
 /// 获取所有通道的参数集
-#[allow(dead_code)]
 pub fn get_all_param_sets() -> Vec<Vec<Vec<u8>>> {
     GLOBAL_PARAM_SETS.lock().unwrap().clone()
 }
@@ -150,28 +147,8 @@ static GLOBAL_START_TIMES: [Mutex<Option<Instant>>; MAX_CHN] = [
     Mutex::new(None),
 ];
 
-/// 解析第一个 NAL header byte（用于判断编码类型）
-fn first_nal_header(data: &[u8]) -> Option<u8> {
-    let len = data.len();
-    let mut i = 0;
-    while i + 3 < len {
-        let step = if i + 4 <= len && data[i] == 0 && data[i+1] == 0 && data[i+2] == 0 && data[i+3] == 1 {
-            4
-        } else if data[i] == 0 && data[i+1] == 0 && data[i+2] == 1 {
-            3
-        } else {
-            i += 1;
-            continue;
-        };
-        let pos = i + step;
-        return if pos < len { Some(data[pos]) } else { None };
-    }
-    None
-}
-
 /// C 帧回调 — 在 VENC 取流线程中调用
 /// chn_id: 0=main, 1=sub, 2=third
-/// data 格式: Annex B (start code + NAL) 或 AVCC (4B len prefix + NAL)
 extern "C" fn on_frame(
     chn_id: std::ffi::c_int, data: *const u8, len: u32,
     pts_us: u64, _is_keyframe_c: std::ffi::c_int,
@@ -180,23 +157,29 @@ extern "C" fn on_frame(
     if chn >= MAX_CHN { return; }
 
     let slice = unsafe { std::slice::from_raw_parts(data, len as usize) };
-    let is_keyframe = _is_keyframe_c != 0;
+    let first_byte = slice.first().copied().unwrap_or(0);
 
-    // 从第一个 NAL header 判断编码类型
-    let (is_h265, nal_type) = match first_nal_header(slice) {
-        Some(b) => {
-            let t = ((b >> 1) & 0x3F) as u8;
-            if t >= 16 { (true, t) } else { (false, (b & 0x1F) as u8) }
-        }
-        None => return,
+    // 提取 NAL unit type:
+    //   H.265: (b >> 1) & 0x3F → 6-bit type [0..63]
+    //   H.264: b & 0x1F        → 5-bit type [0..31]
+    // 区分方法: H.265 的 param set 类型为 32-34、H.264 为 7-8;
+    //           H.265 IDR 类型为 19, H.264 IDR 为 5
+    let h265_nal = ((first_byte >> 1) & 0x3F) as u8;
+    let h264_nal = (first_byte & 0x1F) as u8;
+
+    // 通过 NAL type 判断编码类型
+    // H.265: VPS=32, SPS=33, PPS=34, IDR≥16;  H.264: 所有类型 ≤ 15 (h265_nal ← (b>>1)&0x3F)
+    let is_h265 = h265_nal >= 16;
+    let nal_type = if is_h265 { h265_nal } else { h264_nal };
+
+    // 从帧数据直接判断关键帧 (不依赖 C 参数, 更可靠)
+    let is_keyframe = if is_h265 {
+        // H.265 IRAP: BLA(16-18), IDR(19-20), CRA(21)
+        nal_type >= 16 && nal_type <= 21
+    } else {
+        // H.264 IDR: type 5
+        nal_type == 5
     };
-
-    if is_keyframe {
-        tracing::debug!(
-            "[rk_video] keyframe: chn={}, is_h265={}, len={}",
-            chn, is_h265, len
-        );
-    }
 
     // 缓存参数集 (区分 H.265/H.264 的 param set NAL type)
     let is_param_set = if is_h265 {

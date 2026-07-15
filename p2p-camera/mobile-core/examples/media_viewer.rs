@@ -1253,7 +1253,7 @@ fn process_video_frame(
 
     #[cfg(feature = "player")]
     if let Some(p) = player {
-        match p.render(&packet.data, packet.is_keyframe()) {
+        match p.render(&packet.data) {
             Ok(action) => return action,
             Err(e) => {
                 tracing::error!("[Viewer] Player error: {e}");
@@ -1405,9 +1405,30 @@ mod player {
     use sdl2::event::Event;
     use sdl2::event::WindowEvent;
 
-    /// 判断 access unit 是否为 IDR 帧 (支持 H.264 / H.265)
-    /// 扫描 Annex B buffer 中所有 NAL unit，查找 IDR
-    /// H.265 IDR: type 19 (IDR_W_RADL) 或 20 (IDR_N_LP)
+    /// 从 HEVC access unit 数据中判断是否包含 IDR 帧
+    fn is_hevc_idr(au: &[u8]) -> bool {
+        let mut i = 0;
+        while i + 4 < au.len() {
+            if au[i] == 0 && au[i + 1] == 0 {
+                let sc_len = if i + 3 < au.len() && au[i + 2] == 0 && au[i + 3] == 1 {
+                    4
+                } else if au[i + 2] == 1 {
+                    3
+                } else {
+                    i += 1;
+                    continue;
+                };
+                let nal_type = (au[i + sc_len] >> 1) & 0x3F;
+                if nal_type == 19 || nal_type == 20 {
+                    return true;
+                }
+                i += sc_len + 1;
+            } else {
+                i += 1;
+            }
+        }
+        false
+    }
     use sdl2::keyboard::Keycode;
     use sdl2::pixels::PixelFormatEnum;
     use sdl2::rect::Rect;
@@ -1477,8 +1498,7 @@ mod player {
         pub fn new() -> Result<Self> {
             ffmpeg::init()?;
 
-            let codec_id = ffmpeg::codec::Id::HEVC;
-            let codec = ffmpeg::decoder::find(codec_id)
+            let codec = ffmpeg::decoder::find(ffmpeg::codec::Id::HEVC)
                 .context("HEVC decoder not found (install libavcodec-dev / libavcodec-extra)")?;
             let decoder = ffmpeg::codec::Context::new()
                 .decoder()
@@ -1519,7 +1539,7 @@ mod player {
         }
 
         /// 渲染一个 H.265 access unit, 返回 RenderAction 表示渲染结果和窗口状态
-        pub fn render(&mut self, au: &[u8], is_keyframe: bool) -> Result<RenderAction> {
+        pub fn render(&mut self, au: &[u8]) -> Result<RenderAction> {
             for event in self.event_pump.poll_iter() {
                 match event {
                     Event::Quit { .. }
@@ -1550,13 +1570,14 @@ mod player {
             // 最小化时 session 已被 abort，不会有新帧进来，此处仅作防御性处理
             let skip_render = self.minimized;
 
-            // 解码器 flush 后等待关键帧
+            // 解码器 flush 后等待关键帧：从 NAL 数据判断是否为 IDR，跳过非关键帧避免花屏
             if self.waiting_for_keyframe {
-                if !is_keyframe {
+                let is_idr = is_hevc_idr(au);
+                if !is_idr {
                     return Ok(RenderAction::Continue);
                 }
                 self.waiting_for_keyframe = false;
-                eprintln!("[Player] keyframe received, resuming decode");
+                eprintln!("[Player] Keyframe received, resuming decode");
             }
 
             let mut packet = ffmpeg::Packet::new(au.len());
@@ -1741,7 +1762,6 @@ struct ViewerBehaviour {
 }
 
 impl ViewerBehaviour {
-    #[allow(dead_code)]
     fn new(
         local_public_key: libp2p::identity::PublicKey,
         relay_client: relay::client::Behaviour,
