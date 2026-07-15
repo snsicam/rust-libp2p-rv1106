@@ -181,6 +181,13 @@ extern "C" fn on_frame(
         nal_type == 5
     };
 
+    if is_keyframe {
+        tracing::info!(
+            "[rk_video] keyframe: chn={}, is_h265={}, len={}, _is_keyframe_c={}",
+            chn, is_h265, len,_is_keyframe_c
+        );
+    }
+
     // 缓存参数集 (区分 H.265/H.264 的 param set NAL type)
     let is_param_set = if is_h265 {
         nal_type == 32 || nal_type == 33 || nal_type == 34 // VPS/SPS/PPS
