@@ -210,7 +210,7 @@ static int vi_dev_init() {
     return 0;
 }
 
-static int vi_chn_init(int width, int height, int fps) {
+static int vi_chn_init(int width, int height, int fps, int sensor_fps) {
     VI_CHN_ATTR_S vi_chn_attr;
     memset(&vi_chn_attr, 0, sizeof(vi_chn_attr));
     vi_chn_attr.stIspOpt.u32BufCount = 3;
@@ -220,9 +220,13 @@ static int vi_chn_init(int width, int height, int fps) {
     vi_chn_attr.enPixelFormat = RK_FMT_YUV420SP;
     vi_chn_attr.enCompressMode = COMPRESS_MODE_NONE;
     vi_chn_attr.u32Depth = 0;
-    // VI 帧率: src = dst = sensor 帧率, 由 VENC 各通道独立控制编码帧率
-    vi_chn_attr.stFrameRate.s32SrcFrameRate = fps;
+    // VI 帧率: src=sensor_fps, dst=target_fps, 由 VI 做整数丢帧
+    // (对标 rkipc: 整数帧率时 VI 层丢帧更高效，减少编码器压力)
+    if (sensor_fps <= 0) sensor_fps = fps;  // 回退: sensor_fps 未知时使用 target fps
+    vi_chn_attr.stFrameRate.s32SrcFrameRate = sensor_fps;
     vi_chn_attr.stFrameRate.s32DstFrameRate = fps;
+
+    printf("[rk_camera] VI chn: %dx%d src_fps=%d dst_fps=%d\n", width, height, sensor_fps, fps);
 
     int ret = RK_MPI_VI_SetChnAttr(VI_DEV_ID, VI_CHN_ID, &vi_chn_attr);
     ret |= RK_MPI_VI_EnableChn(VI_DEV_ID, VI_CHN_ID);
@@ -233,8 +237,7 @@ static int vi_chn_init(int width, int height, int fps) {
 
 static int vpss_init(int main_w, int main_h,
                      int sub_w, int sub_h,
-                     int third_w, int third_h,
-                     int fps_num, int fps_den) {
+                     int third_w, int third_h) {
     int ret;
     VPSS_GRP_ATTR_S stGrpAttr;
     VPSS_CHN_ATTR_S stChnAttr;
@@ -246,8 +249,9 @@ static int vpss_init(int main_w, int main_h,
     stGrpAttr.u32MaxW = 4096;
     stGrpAttr.u32MaxH = 4096;
     stGrpAttr.enPixelFormat = RK_FMT_YUV420SP;
-    stGrpAttr.stFrameRate.s32SrcFrameRate = fps_num;
-    stGrpAttr.stFrameRate.s32DstFrameRate = fps_num;
+    // VPSS 不做帧率控制, 全速透传 (对标 rkipc: 由 VI 和 VENC 各自控制帧率)
+    stGrpAttr.stFrameRate.s32SrcFrameRate = -1;
+    stGrpAttr.stFrameRate.s32DstFrameRate = -1;
     stGrpAttr.enCompressMode = COMPRESS_MODE_NONE;
 
     ret = RK_MPI_VPSS_CreateGrp(VPSS_GRP_ID, &stGrpAttr);
@@ -269,8 +273,9 @@ static int vpss_init(int main_w, int main_h,
         stChnAttr.enChnMode = VPSS_CHN_MODE_USER;
         stChnAttr.enDynamicRange = DYNAMIC_RANGE_SDR8;
         stChnAttr.enPixelFormat = RK_FMT_YUV420SP;
-        stChnAttr.stFrameRate.s32SrcFrameRate = fps_num;
-        stChnAttr.stFrameRate.s32DstFrameRate = fps_num;
+        // VPSS 通道不做帧率控制, 全速透传
+        stChnAttr.stFrameRate.s32SrcFrameRate = -1;
+        stChnAttr.stFrameRate.s32DstFrameRate = -1;
         stChnAttr.u32Width = widths[i];
         stChnAttr.u32Height = heights[i];
         stChnAttr.enCompressMode = COMPRESS_MODE_NONE;
@@ -349,7 +354,8 @@ static int get_mirror(const char *m_str) {
 }
 
 static int venc_init_single(int chn_id, int width, int height,
-                             int fps_num, int fps_den, int bitrate_kbps, int gop,
+                             int fps_num, int fps_den, int sensor_fps,
+                             int bitrate_kbps, int gop,
                              int codec, int rc_mode, int rc_quality,
                              int profile, int gop_mode, int mirror,
                              int smartp_viridrlen, int stream_buf_cnt) {
@@ -376,13 +382,32 @@ static int venc_init_single(int chn_id, int width, int height,
     // 设置帧率/GOP/码率 (根据编码类型和RC模式设置对应 union 字段)
     int is_vbr = (rc_mode == VENC_RC_MODE_H264VBR || rc_mode == VENC_RC_MODE_H265VBR);
 
+    // 帧率控制双路径 (对标 rkipc video.c rk_video_set_frame_rate):
+    //   整数帧率 (den==1): VENC src=dst=target_fps, 由 VI 层做整数丢帧
+    //   非整数帧率 (den!=1): VENC src=sensor_fps, dst=target_fps, 由编码器做分数帧率控制
+    int venc_src_num, venc_src_den, venc_dst_num, venc_dst_den;
+    if (fps_den == 1) {
+        // 整数帧率: 编码器帧率与 VI 输出一致
+        venc_src_num = fps_num;
+        venc_src_den = 1;
+        venc_dst_num = fps_num;
+        venc_dst_den = 1;
+    } else {
+        // 非整数帧率: 编码器做分数帧率控制
+        int s_fps = (sensor_fps > 0) ? sensor_fps : fps_num;
+        venc_src_num = s_fps;
+        venc_src_den = 1;
+        venc_dst_num = fps_num;
+        venc_dst_den = fps_den;
+    }
+
     if (codec == RK_VIDEO_ID_AVC) {
         // H264: GOP + 帧率 (CBR/VBR 字段布局相同, base 通用)
         pRcAttr->stH264Cbr.u32Gop = gop;
-        pRcAttr->stH264Cbr.u32SrcFrameRateNum = fps_num;
-        pRcAttr->stH264Cbr.u32SrcFrameRateDen = fps_den;
-        pRcAttr->stH264Cbr.fr32DstFrameRateNum = fps_num;
-        pRcAttr->stH264Cbr.fr32DstFrameRateDen = fps_den;
+        pRcAttr->stH264Cbr.u32SrcFrameRateNum = venc_src_num;
+        pRcAttr->stH264Cbr.u32SrcFrameRateDen = venc_src_den;
+        pRcAttr->stH264Cbr.fr32DstFrameRateNum = venc_dst_num;
+        pRcAttr->stH264Cbr.fr32DstFrameRateDen = venc_dst_den;
         if (is_vbr) {
             pRcAttr->stH264Vbr.u32BitRate = bitrate_kbps;
             pRcAttr->stH264Vbr.u32MaxBitRate = bitrate_kbps * 3 / 2;
@@ -393,10 +418,10 @@ static int venc_init_single(int chn_id, int width, int height,
     } else {
         // H265: GOP + 帧率
         pRcAttr->stH265Cbr.u32Gop = gop;
-        pRcAttr->stH265Cbr.u32SrcFrameRateNum = fps_num;
-        pRcAttr->stH265Cbr.u32SrcFrameRateDen = fps_den;
-        pRcAttr->stH265Cbr.fr32DstFrameRateNum = fps_num;
-        pRcAttr->stH265Cbr.fr32DstFrameRateDen = fps_den;
+        pRcAttr->stH265Cbr.u32SrcFrameRateNum = venc_src_num;
+        pRcAttr->stH265Cbr.u32SrcFrameRateDen = venc_src_den;
+        pRcAttr->stH265Cbr.fr32DstFrameRateNum = venc_dst_num;
+        pRcAttr->stH265Cbr.fr32DstFrameRateDen = venc_dst_den;
         if (is_vbr) {
             pRcAttr->stH265Vbr.u32BitRate = bitrate_kbps;
             pRcAttr->stH265Vbr.u32MaxBitRate = bitrate_kbps * 3 / 2;
@@ -557,10 +582,12 @@ static int bind_vpss_to_venc(int vpss_chn, int venc_chn) {
 // rk_camera_init: 三码流模式初始化
 // 参数 main_w/h 仅用于 VI 捕获分辨率 (必须 >= 所有码流的最大分辨率)
 // 每个码流的具体参数通过 rk_camera_set_chn_config 提前设置
-int rk_camera_init(int main_w, int main_h, int fps, int bitrate) {
+int rk_camera_init(int main_w, int main_h, int fps, int bitrate, int sensor_fps) {
     if (g_initialized) return 0;
 
-    printf("[rk_camera] init: VI=%dx%d @%dfps\n", main_w, main_h, fps);
+    if (sensor_fps <= 0) sensor_fps = fps;  // 回退: sensor_fps 未知时使用 target fps
+
+    printf("[rk_camera] init: VI=%dx%d @%dfps sensor_fps=%d\n", main_w, main_h, fps, sensor_fps);
 
     if (ensure_sys_init() != 0) return -1;
 
@@ -569,7 +596,7 @@ int rk_camera_init(int main_w, int main_h, int fps, int bitrate) {
     // 1. VI 初始化 (捕获主码流分辨率)
     int ret = vi_dev_init();
     if (ret != 0) { printf("[rk_camera] vi_dev_init failed\n"); return -1; }
-    ret = vi_chn_init(main_w, main_h, fps);
+    ret = vi_chn_init(main_w, main_h, fps, sensor_fps);
     if (ret != 0) { printf("[rk_camera] vi_chn_init failed\n"); return -1; }
 
     // 2. VPSS 初始化 — 从 g_chn_attr 读取每通道的分辨率
@@ -582,7 +609,7 @@ int rk_camera_init(int main_w, int main_h, int fps, int bitrate) {
         printf("[rk_camera] VPSS: main=%dx%d sub=%dx%d third=%dx%d\n",
                main_w, main_h, sub_w, sub_h, third_w, third_h);
 
-        ret = vpss_init(main_w, main_h, sub_w, sub_h, third_w, third_h, fps, 1);
+        ret = vpss_init(main_w, main_h, sub_w, sub_h, third_w, third_h);
         if (ret != 0) { printf("[rk_camera] vpss_init failed\n"); return -1; }
     }
 
@@ -617,6 +644,7 @@ int rk_camera_init(int main_w, int main_h, int fps, int bitrate) {
             venc_chns[i],
             a->width, a->height,
             a->dst_fps_num, a->dst_fps_den > 0 ? a->dst_fps_den : 1,
+            sensor_fps,
             ch_br, ch_gop,
             a->codec ? a->codec : RK_VIDEO_ID_HEVC,
             a->rc_mode,
@@ -888,7 +916,8 @@ static void *aenc_get_stream_thread(void *arg) {
 // ---- Audio init helper: configure AI device ----
 
 static int audio_ai_init(int sample_rate, const char *card_name,
-                          int channels, int frame_size, const char *format) {
+                          int channels, int frame_size, const char *format,
+                          int volume) {
     AIO_ATTR_S aiAttr;
     AI_CHN_PARAM_S pstParams;
     int ret;
@@ -909,7 +938,8 @@ static int audio_ai_init(int sample_rate, const char *card_name,
     }
 
     aiAttr.enSamplerate = (AUDIO_SAMPLE_RATE_E)sample_rate;
-    aiAttr.enSoundmode = AUDIO_SOUND_MODE_MONO;
+    // 声道模式: 根据 channels 动态选择 (对标 rkipc audio.c)
+    aiAttr.enSoundmode = (channels == 2) ? AUDIO_SOUND_MODE_STEREO : AUDIO_SOUND_MODE_MONO;
     aiAttr.u32PtNumPerFrm = frame_size;
     aiAttr.u32FrmNum = 4;
     aiAttr.u32EXFlag = 0;
@@ -939,6 +969,24 @@ static int audio_ai_init(int sample_rate, const char *card_name,
     if (ret != RK_SUCCESS) {
         printf("[rk_camera] RK_MPI_AI_EnableChn failed: %x\n", ret);
         return -1;
+    }
+
+    // 设置硬件音量 (对标 rkipc audio.c: RK_MPI_AI_SetVolume)
+    if (volume >= 0 && volume <= 100) {
+        ret = RK_MPI_AI_SetVolume(AI_DEV_ID, volume);
+        if (ret != RK_SUCCESS) {
+            printf("[rk_camera] WARN: RK_MPI_AI_SetVolume(%d) failed: %x\n", volume, ret);
+        } else {
+            printf("[rk_camera] AI volume set to %d\n", volume);
+        }
+    }
+
+    // 单声道时设置 TrackMode (对标 rkipc audio.c: RK_MPI_AI_SetTrackMode)
+    if (channels == 1) {
+        ret = RK_MPI_AI_SetTrackMode(AI_DEV_ID, AUDIO_TRACK_FRONT_LEFT);
+        if (ret != RK_SUCCESS) {
+            printf("[rk_camera] WARN: RK_MPI_AI_SetTrackMode(FRONT_LEFT) failed: %x\n", ret);
+        }
     }
 
     return 0;
@@ -999,7 +1047,7 @@ int rk_audio_init(int sample_rate, const char *card_name, int channels, int fram
     if (ensure_sys_init() != 0) return -1;
 
     // Step 1: AI device init (common for PCM and AENC modes)
-    int ret = audio_ai_init(sample_rate, card_name, channels, frame_size, format);
+    int ret = audio_ai_init(sample_rate, card_name, channels, frame_size, format, volume);
     if (ret != 0) return -1;
 
     // Step 2: VQE (if enabled, before AENC binding)

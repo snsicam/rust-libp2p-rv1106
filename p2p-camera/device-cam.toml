@@ -48,7 +48,7 @@ volume = 50
 # 编码类型: "PCM" (不编码) | "G711A" | "G711U" | "MP2"
 encode_type = "PCM"
 # 编码码率 (bps): G711A = 64000@8kHz, 128000@16kHz; MP2 = 64000+
-bit_rate = 16000
+bit_rate = 128000
 # VQE 语音质量增强 (依赖 vqe_cfg 配置文件)
 enable_vqe = false
 vqe_cfg = "/oem/usr/share/vqefiles/config_aivqe.json"

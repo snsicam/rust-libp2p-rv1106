@@ -42,6 +42,7 @@ extern "C" {
     fn rk_camera_init(
         main_w: std::ffi::c_int, main_h: std::ffi::c_int,
         fps: std::ffi::c_int, bitrate_kbps: std::ffi::c_int,
+        sensor_fps: std::ffi::c_int,
     ) -> std::ffi::c_int;
     fn rk_camera_set_callback(cb: FrameCallback);
     fn rk_camera_request_idr(chn_id: std::ffi::c_int) -> std::ffi::c_int;
@@ -381,10 +382,12 @@ impl RkVideoSource {
 
             // 初始化摄像头硬件
             let main_fps = main.dst_fps_num / main.dst_fps_den.max(1);
+            let sensor_fps = main.src_fps_num / main.src_fps_den.max(1);
             let ret = unsafe {
                 rk_camera_init(
                     main.width as i32, main.height as i32,
                     main_fps as i32, main.bitrate_kbps as i32,
+                    sensor_fps as i32,
                 )
             };
             if ret != 0 {
@@ -504,7 +507,7 @@ impl RkAudioSource {
             let sample_rate = self.sample_rate;
             let channels = self.channels as i32;
             let frame_size = self.frame_size as i32;
-            let _volume = self.volume as i32;
+            let volume = self.volume as i32;
             let bit_rate = self.bit_rate as i32;
             let enable_vqe = self.enable_vqe as i32;
             let encode_type_str = self.encode_type.clone();
@@ -528,7 +531,7 @@ impl RkAudioSource {
                     card_name_c.as_ptr(),
                     channels,
                     frame_size,
-                    _volume,
+                    volume,
                     encode_type_c.as_ptr(),
                     format_c.as_ptr(),
                     bit_rate,
