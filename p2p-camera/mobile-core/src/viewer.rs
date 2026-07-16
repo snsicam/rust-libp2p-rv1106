@@ -27,7 +27,7 @@ use proto::{
 use tokio::sync::mpsc;
 
 use crate::jitter_buffer::AvJitterBuffer;
-use crate::net_diag::{ConnectionQuality, ConnectionType, NatDiagnostic, NatDiagnosis};
+use crate::net_diag::{ConnectionQuality, ConnectionStrategy, ConnectionType, NatDiagnostic, NatDiagnosis};
 
 const STREAM_READ_BUF: usize = 65536; // 64KB
 const MDNS_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -532,6 +532,9 @@ impl MediaPlayer {
                         } else {
                             tracing::warn!("[Viewer] DCUtR prediction: likely FAIL - {}", prediction.reason);
                         }
+                        // 连接策略日志
+                        let (strategy, reason) = self.nat_diagnostic.connection_strategy();
+                        tracing::info!("[Viewer] Connection strategy: {} - {}", strategy.name(), reason);
                     } else if addr.iter().any(|p| matches!(p, Protocol::QuicV1)) {
                         let is_lan = addr.iter().any(|p| {
                             if let Protocol::Ip4(ip) = p { ip.is_private() } else { false }
@@ -615,6 +618,11 @@ impl MediaPlayer {
 
     pub fn connection_quality(&self) -> &ConnectionQuality {
         &self.connection_quality
+    }
+
+    /// 设置 4G 网络标志（4G 模块的 IP 可能是 RFC1918 私有地址，无法通过 IP 启发式检测）
+    pub fn set_force_4g(&mut self, force: bool) {
+        self.nat_diagnostic.set_force_4g(force);
     }
 
     /// 轮询内部事件（非阻塞），供上层检测断连/直连升级等

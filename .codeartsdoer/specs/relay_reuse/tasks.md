@@ -1,6 +1,8 @@
 # 实现任务清单
 
-## 任务1：修改 `create_socket` 方法，添加 SO_REUSEADDR 和 SO_REUSEPORT 设置
+> **状态: 已完成** (2026-07-16)
+
+## 任务1：修改 `create_socket` 方法，添加 SO_REUSEADDR 和 SO_REUSEPORT 设置 ✅
 
 **文件**：`transports/quic/src/transport.rs:183-196`
 
@@ -18,7 +20,7 @@
 
 ---
 
-## 任务2：修改 `bound_socket` 方法，使用 socket2 创建 socket 并添加 reuse 设置
+## 任务2：修改 `bound_socket` 方法，使用 socket2 创建 socket 并添加 reuse 设置 ✅
 
 **文件**：`transports/quic/src/transport.rs:198-211`
 
@@ -39,7 +41,7 @@
 
 ---
 
-## 任务3：编译验证
+## 任务3：编译验证 ✅
 
 **操作**：运行 `cargo check` 验证修改后的代码编译通过
 

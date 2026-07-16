@@ -43,7 +43,7 @@ use libp2p::{
     tcp,
     PeerId,
 };
-use net_diag::{NatDiagnostic, NatType};
+use net_diag::{ConnectionStrategy, NatDiagnostic, NatType};
 use proto::{
     media_packet::MediaPacket,
     stream_protocols,
@@ -378,6 +378,11 @@ async fn main() -> Result<()> {
                             if let Some(ref diag) = nat_diagnostic {
                                 let result = diag.diagnose();
                                 tracing::warn!("[DeviceCam] Suggestion: {}", result.dcutr_suggestion);
+                                // 连接策略结果日志
+                                let (strategy, _) = diag.connection_strategy();
+                                if matches!(strategy, ConnectionStrategy::SkipDcutr) {
+                                    tracing::info!("[DeviceCam] Connection strategy result: DCUtR failed as predicted (Symmetric NAT/4G), fallback to Relay Circuit");
+                                }
                             } else {
                                 let err_str = err.to_string();
                                 if err_str.contains("timeout") {
@@ -551,6 +556,10 @@ async fn main() -> Result<()> {
                                     } else {
                                         tracing::warn!("[DeviceCam] DCUtR prediction: likely FAIL - {}", prediction.reason);
                                     }
+
+                                    // 连接策略日志：输出本端 NAT 类型和 DCUtR 策略
+                                    let (strategy, reason) = diag.connection_strategy();
+                                    tracing::info!("[DeviceCam] Connection strategy: {} - {}", strategy.name(), reason);
                                 }
                             }
                         }

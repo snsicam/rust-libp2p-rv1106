@@ -41,7 +41,7 @@ use libp2p::{
     tcp, StreamProtocol, PeerId,
 };
 use libp2p_stream;
-use mobile_core::net_diag::{NatDiagnostic, NatType};
+use mobile_core::net_diag::{ConnectionStrategy, NatDiagnostic, NatType};
 use proto::{media_packet::MediaPacket, stream_protocols};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -187,6 +187,7 @@ async fn main() -> Result<()> {
     let udp_port = cfg.udp_port;
     let enable_mdns = cfg.enable_mdns;
     let stream_type = cfg.stream.clone();
+    let network_type = cfg.network_type.clone();
 
     let mut frame_count: u64 = 0;
     let mut bytes_received: u64 = 0;
@@ -210,6 +211,7 @@ async fn main() -> Result<()> {
         udp_port,
         enable_mdns,
         stream_type.clone(),
+        network_type.clone(),
         tx.clone(),
         audio_tx.clone(),
         session_tx.clone(),
@@ -288,6 +290,7 @@ async fn main() -> Result<()> {
                                     udp_port,
                                     enable_mdns,
                                     stream_type.clone(),
+                                    network_type.clone(),
                                     tx.clone(),
                                     audio_tx.clone(),
                                     session_tx.clone(),
@@ -362,6 +365,7 @@ async fn main() -> Result<()> {
                                     udp_port,
                                     enable_mdns,
                                     stream_type.clone(),
+                                    network_type.clone(),
                                     tx.clone(),
                                     audio_tx.clone(),
                                     session_tx.clone(),
@@ -448,6 +452,7 @@ async fn main() -> Result<()> {
                                     udp_port,
                                     enable_mdns,
                                     stream_type.clone(),
+                                    network_type.clone(),
                                     tx.clone(),
                                     audio_tx.clone(),
                                     session_tx.clone(),
@@ -509,6 +514,7 @@ async fn main() -> Result<()> {
                                     udp_port,
                                     enable_mdns,
                                     stream_type.clone(),
+                                    network_type.clone(),
                                     tx.clone(),
                                     audio_tx.clone(),
                                     session_tx.clone(),
@@ -571,6 +577,7 @@ fn spawn_session(
     udp_port: Option<u16>,
     enable_mdns: bool,
     stream_type: String,
+    network_type: String,
     video_tx: mpsc::Sender<MediaPacket>,
     audio_tx: mpsc::Sender<MediaPacket>,
     event_tx: mpsc::Sender<SessionEvent>,
@@ -583,6 +590,7 @@ fn spawn_session(
             udp_port,
             enable_mdns,
             stream_type,
+            network_type,
             video_tx,
             audio_tx,
             event_tx.clone(),
@@ -660,6 +668,7 @@ async fn run_viewer_session(
     udp_port: Option<u16>,
     enable_mdns: bool,
     stream_type: String,
+    network_type: String,
     video_tx: mpsc::Sender<MediaPacket>,
     audio_tx: mpsc::Sender<MediaPacket>,
     event_tx: mpsc::Sender<SessionEvent>,
@@ -859,7 +868,7 @@ async fn run_viewer_session(
             tracing::info!("[Viewer] Closing relay connection to {relay_peer_id} after LAN direct established (prevents DCUtR interference)");
             let _ = swarm.disconnect_peer_id(relay_peer_id);
         }
-    } else if let Some((_relay_peer_id, relay_addr)) = connected_relay {
+    } else if let Some((relay_peer_id, relay_addr)) = connected_relay {
         // 通过 Relay circuit 拨号 DeviceCam
         let circuit_addr = relay_addr
             .with(Protocol::P2pCircuit)
@@ -872,20 +881,23 @@ async fn run_viewer_session(
         ), "device-cam circuit connection", &mut local_ips, &mut local_quic_port, &mut pending_events).await?;
         println!("[Viewer] Connected to device-cam {device_cam} via relay circuit");
         initial_is_relay = true;
-    } else {
-        anyhow::bail!("Failed to connect: no relay connection established and no mDNS discovery");
-    }
 
-    // DCUtR 尝试前预测：在 circuit 连接建立后立即输出 NAT 上下文
-    if let Some(ref diag) = nat_diagnostic {
-        let prediction = diag.dcutr_prediction();
-        if prediction.likely_success {
-            tracing::info!("[Viewer] DCUtR prediction: likely SUCCESS - {}", prediction.reason);
+        // DCUtR 尝试前预测：在 circuit 连接建立后立即输出 NAT 上下文
+        if let Some(ref diag) = nat_diagnostic {
+            let prediction = diag.dcutr_prediction();
+            if prediction.likely_success {
+                tracing::info!("[Viewer] DCUtR prediction: likely SUCCESS - {}", prediction.reason);
+            } else {
+                tracing::warn!("[Viewer] DCUtR prediction: likely FAIL - {}", prediction.reason);
+            }
+            // 连接策略日志
+            let (strategy, reason) = diag.connection_strategy();
+            tracing::info!("[Viewer] Connection strategy: {} - {}", strategy.name(), reason);
         } else {
-            tracing::warn!("[Viewer] DCUtR prediction: likely FAIL - {}", prediction.reason);
+            tracing::info!("[Viewer] DCUtR will be attempted (NAT diagnostic not yet available)");
         }
     } else {
-        tracing::info!("[Viewer] DCUtR will be attempted (NAT diagnostic not yet available)");
+        anyhow::bail!("Failed to connect: no relay connection established and no mDNS discovery");
     }
 
     // ---- 3. 打开 video stream ----
@@ -926,7 +938,12 @@ async fn run_viewer_session(
 
     // 初始化 NAT 诊断（如果 wait_for_event 期间已收集到 local_ips）
     if nat_diagnostic.is_none() && local_quic_port != 0 && !local_ips.is_empty() {
-        nat_diagnostic = Some(NatDiagnostic::new(local_quic_port, local_ips.clone()));
+        let mut diag = NatDiagnostic::new(local_quic_port, local_ips.clone());
+        if network_type == "4g" {
+            diag.set_force_4g(true);
+            tracing::info!("[Viewer] Network type: 4G (forced by config)");
+        }
+        nat_diagnostic = Some(diag);
         tracing::info!("[Viewer] NAT diagnostic initialized: port={}, ips={:?}", local_quic_port, local_ips);
     }
 
@@ -1183,7 +1200,11 @@ async fn run_viewer_session(
                             }
                             // 延迟初始化 NatDiagnostic（需要端口和 IP）
                             if nat_diagnostic.is_none() && local_quic_port != 0 {
-                                nat_diagnostic = Some(NatDiagnostic::new(local_quic_port, local_ips.clone()));
+                                let mut diag = NatDiagnostic::new(local_quic_port, local_ips.clone());
+                                if network_type == "4g" {
+                                    diag.set_force_4g(true);
+                                }
+                                nat_diagnostic = Some(diag);
                                 tracing::info!("[Viewer] NAT diagnostic initialized: port={}, ips={:?}", local_quic_port, local_ips);
                             }
                         }
@@ -1867,9 +1888,15 @@ struct ViewerConfig {
     play: bool,
     #[serde(default)]
     udp_port: Option<u16>,
+    /// 网络类型: "auto" | "4g" (默认 auto)
+    /// 4G 模块的 IP 可能是 RFC1918 私有地址（如 10.x.x.x），无法通过 IP 启发式检测
+    /// 设置为 "4g" 后，NAT 诊断会将 4G CGNAT 的端口映射视为不可预测，DCUtR 预测更准确
+    #[serde(default = "default_network_type")]
+    network_type: String,
 }
 
 fn default_stream() -> String { "auto".to_string() }
+fn default_network_type() -> String { "auto".to_string() }
 
 impl Default for ViewerConfig {
     fn default() -> Self {
@@ -1883,6 +1910,7 @@ impl Default for ViewerConfig {
             no_audio: false,
             play: false,
             udp_port: None,
+            network_type: default_network_type(),
         }
     }
 }

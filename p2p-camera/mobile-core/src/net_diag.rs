@@ -113,10 +113,31 @@ pub struct DcutrPrediction {
     pub reason: String,
 }
 
+/// 连接策略决策
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionStrategy {
+    /// 尝试 DCUtR 打洞
+    Dcutr,
+    /// 跳过 DCUtR，直接使用 Relay Circuit
+    SkipDcutr,
+}
+
+impl ConnectionStrategy {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Dcutr => "DCUtR",
+            Self::SkipDcutr => "SkipDcutr",
+        }
+    }
+}
+
 pub struct NatDiagnostic {
     observed_history: Vec<Multiaddr>,
     local_quic_port: u16,
     local_ips: Vec<Ipv4Addr>,
+    /// 用户手动指定为 4G 网络（配置文件或命令行参数）
+    /// 4G 模块的 IP 可能是 RFC1918 私有地址（如 10.x.x.x），无法通过 IP 启发式检测
+    force_4g: bool,
 }
 
 impl NatDiagnostic {
@@ -125,10 +146,31 @@ impl NatDiagnostic {
             observed_history: Vec::new(),
             local_quic_port,
             local_ips,
+            force_4g: false,
         }
     }
 
+    /// 设置用户手动指定的 4G 网络标志
+    pub fn set_force_4g(&mut self, force: bool) {
+        self.force_4g = force;
+    }
+
     pub fn record_observed(&mut self, addr: &Multiaddr) {
+        // 只保留最近一次 Relay 连接的观测地址
+        // 当 Relay 重连后，本地 QUIC 端口可能变化，混合不同连接的观测会导致误判 Symmetric NAT
+        let observed_port = extract_udp_port(addr);
+        let current_port_matches = observed_port
+            .map(|p| p == self.local_quic_port || self.observed_history.iter().any(|a| extract_udp_port(a) == Some(p)))
+            .unwrap_or(false);
+
+        if !current_port_matches && !self.observed_history.is_empty() {
+            // 新观测端口与历史不一致，可能是新连接（端口变了），清除旧观测
+            tracing::debug!(
+                "[NAT] New observed port {:?} differs from history, clearing old observations (likely relay reconnect with new local port)",
+                observed_port
+            );
+            self.observed_history.clear();
+        }
         self.observed_history.push(addr.clone());
     }
 
@@ -140,12 +182,53 @@ impl NatDiagnostic {
         &self.local_ips
     }
 
+    /// 判断是否应跳过 DCUtR 打洞
+    ///
+    /// 当本端为 Symmetric NAT 或 4G/CGNAT 网络时，DCUtR 打洞必然失败，
+    /// 应跳过以节省约 17 秒的超时等待。
+    pub fn should_skip_dcutr(&self) -> bool {
+        let is_4g = self.force_4g || self.local_ips.iter().any(|ip| is_4g_network(*ip));
+        let diag = self.diagnose();
+        
+        // Symmetric NAT 或 4G/CGNAT → 跳过 DCUtR
+        diag.nat_type == NatType::Symmetric || is_4g
+    }
+
+    /// 获取连接策略决策及原因
+    ///
+    /// 返回 (策略, 原因描述)
+    pub fn connection_strategy(&self) -> (ConnectionStrategy, String) {
+        let is_4g = self.force_4g || self.local_ips.iter().any(|ip| is_4g_network(*ip));
+        let diag = self.diagnose();
+
+        if diag.nat_type == NatType::Symmetric {
+            return (ConnectionStrategy::SkipDcutr, format!(
+                "Symmetric NAT: DCUtR will fail, port mapping is unpredictable. Saved ~17s timeout waiting."
+            ));
+        }
+
+        if is_4g {
+            return (ConnectionStrategy::SkipDcutr, format!(
+                "4G/CGNAT: DCUtR will fail, carrier-grade NAT blocks inbound UDP. Saved ~17s timeout waiting."
+            ));
+        }
+
+        if diag.nat_type.dcutr_feasible() {
+            return (ConnectionStrategy::Dcutr, format!(
+                "{} NAT: DCUtR should succeed", diag.nat_type.short_name()
+            ));
+        }
+
+        // Unknown → 保守策略，尝试 DCUtR
+        (ConnectionStrategy::Dcutr, "NAT type unknown: DCUtR will be attempted".to_string())
+    }
+
     /// 在 DCUtR 尝试前输出 NAT 上下文预测
     ///
     /// 在 circuit 连接建立后、DCUtR 自动触发前调用，
     /// 让用户提前知道打洞可能失败的原因。
     pub fn dcutr_prediction(&self) -> DcutrPrediction {
-        let is_4g = self.local_ips.iter().any(|ip| is_4g_network(*ip));
+        let is_4g = self.force_4g || self.local_ips.iter().any(|ip| is_4g_network(*ip));
         let diag = self.diagnose();
 
         let (likely_success, reason) = if is_4g && !diag.nat_type.dcutr_feasible() {
@@ -187,7 +270,7 @@ impl NatDiagnostic {
     }
 
     pub fn diagnose(&self) -> NatDiagnosis {
-        let is_4g = self.local_ips.iter().any(|ip| is_4g_network(*ip));
+        let is_4g = self.force_4g || self.local_ips.iter().any(|ip| is_4g_network(*ip));
 
         if self.observed_history.is_empty() {
             return NatDiagnosis {
@@ -223,13 +306,25 @@ impl NatDiagnostic {
         if valid_ports.len() == 1 {
             let port = valid_ports[0];
             if port == self.local_quic_port && self.local_quic_port != 0 {
-                let nat_type = NatType::FullCone;
+                // 4G/CGNAT 场景：单次观测端口一致不能判定为 Full Cone
+                // CGNAT 对不同目标可能分配不同端口（Symmetric 行为），
+                // 只有通过多个不同 Relay 观测端口一致才能确认是 Cone NAT
+                let nat_type = if is_4g {
+                    NatType::Unknown
+                } else {
+                    NatType::FullCone
+                };
+                let evidence = if is_4g {
+                    format!("Observed port {} matches local port {}, but 4G/CGNAT detected - cannot confirm Full Cone NAT from single observation (CGNAT may assign different ports to different destinations)", port, self.local_quic_port)
+                } else {
+                    format!("Observed port {} matches local port {} - no NAT or 1:1 NAT", port, self.local_quic_port)
+                };
                 return NatDiagnosis {
                     nat_type,
                     observed_addresses: self.observed_history.clone(),
                     local_port: self.local_quic_port,
-                    evidence: format!("Observed port {} matches local port {} - no NAT or 1:1 NAT", port, self.local_quic_port),
-                    dcutr_feasible: true,
+                    evidence,
+                    dcutr_feasible: !is_4g,
                     is_4g,
                     dcutr_suggestion: generate_suggestion(nat_type, is_4g),
                 };
@@ -248,13 +343,24 @@ impl NatDiagnostic {
 
         let all_same = valid_ports.iter().all(|&p| p == valid_ports[0]);
         if all_same {
-            let nat_type = NatType::PortRestrictedCone;
+            // 4G/CGNAT 场景：即使对同一 Relay 的端口映射一致，
+            // 也不能保证对 DCUtR 对端的映射一致（CGNAT 可能对不同目标分配不同端口）
+            let nat_type = if is_4g {
+                NatType::Unknown
+            } else {
+                NatType::PortRestrictedCone
+            };
+            let evidence = if is_4g {
+                format!("Observed port {} consistent across {} observations, but 4G/CGNAT detected - cannot confirm Cone NAT (CGNAT may assign different ports to different destinations)", valid_ports[0], valid_ports.len())
+            } else {
+                format!("Observed port {} consistent across {} observations - Cone NAT", valid_ports[0], valid_ports.len())
+            };
             NatDiagnosis {
                 nat_type,
                 observed_addresses: self.observed_history.clone(),
                 local_port: self.local_quic_port,
-                evidence: format!("Observed port {} consistent across {} observations - Cone NAT", valid_ports[0], valid_ports.len()),
-                dcutr_feasible: true,
+                evidence,
+                dcutr_feasible: !is_4g,
                 is_4g,
                 dcutr_suggestion: generate_suggestion(nat_type, is_4g),
             }
