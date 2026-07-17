@@ -184,19 +184,21 @@ impl NatDiagnostic {
 
     /// 判断是否应跳过 DCUtR 打洞
     ///
-    /// 当本端为 Symmetric NAT 或 4G/CGNAT 网络时，DCUtR 打洞必然失败，
-    /// 应跳过以节省约 17 秒的超时等待。
+    /// 仅当本端确认为 **Symmetric NAT** 时才跳过 DCUtR。
+    /// 4G/CGNAT 并不必然无法打洞：许多运营商对 UDP 实现 EIM（端口无关映射，
+    /// GSMA 为支持 WebRTC 所推荐），此类锥形 NAT 仍可打洞成功。
+    /// 因此不再以 `is_4g` 粗粒度禁用，而是依据实际探测到的 NAT 类型决策。
     pub fn should_skip_dcutr(&self) -> bool {
-        let is_4g = self.force_4g || self.local_ips.iter().any(|ip| is_4g_network(*ip));
         let diag = self.diagnose();
-        
-        // Symmetric NAT 或 4G/CGNAT → 跳过 DCUtR
-        diag.nat_type == NatType::Symmetric || is_4g
+        diag.nat_type == NatType::Symmetric
     }
 
     /// 获取连接策略决策及原因
     ///
     /// 返回 (策略, 原因描述)
+    ///
+    /// 策略：**仅 Symmetric NAT 才跳过 DCUtR**。4G/CGNAT 不再粗粒度禁用，
+    /// 因为锥形/EIM NAT（常见于 4G）仍可打洞。Unknown 时保守地尝试 DCUtR。
     pub fn connection_strategy(&self) -> (ConnectionStrategy, String) {
         let is_4g = self.force_4g || self.local_ips.iter().any(|ip| is_4g_network(*ip));
         let diag = self.diagnose();
@@ -207,20 +209,21 @@ impl NatDiagnostic {
             ));
         }
 
-        if is_4g {
-            return (ConnectionStrategy::SkipDcutr, format!(
-                "4G/CGNAT: DCUtR will fail, carrier-grade NAT blocks inbound UDP. Saved ~17s timeout waiting."
-            ));
-        }
-
         if diag.nat_type.dcutr_feasible() {
             return (ConnectionStrategy::Dcutr, format!(
                 "{} NAT: DCUtR should succeed", diag.nat_type.short_name()
             ));
         }
 
-        // Unknown → 保守策略，尝试 DCUtR
-        (ConnectionStrategy::Dcutr, "NAT type unknown: DCUtR will be attempted".to_string())
+        // Unknown（含 4G/CGNAT 单点观测无法确认）：保守地尝试 DCUtR
+        if is_4g {
+            (ConnectionStrategy::Dcutr, format!(
+                "4G/CGNAT detected ({}): DCUtR will be attempted. Success depends on remote peer's NAT type (Cone NAT on broadband may work). Relay circuit is the fallback.",
+                diag.nat_type.short_name()
+            ))
+        } else {
+            (ConnectionStrategy::Dcutr, "NAT type unknown: DCUtR will be attempted".to_string())
+        }
     }
 
     /// 在 DCUtR 尝试前输出 NAT 上下文预测
@@ -231,29 +234,18 @@ impl NatDiagnostic {
         let is_4g = self.force_4g || self.local_ips.iter().any(|ip| is_4g_network(*ip));
         let diag = self.diagnose();
 
-        let (likely_success, reason) = if is_4g && !diag.nat_type.dcutr_feasible() {
-            (false, format!(
-                "4G/CGNAT + {} NAT: DCUtR hole-punching will likely fail. \
-                 CGNAT does not allow inbound UDP from external addresses. \
-                 Relay circuit will be used.",
-                 diag.nat_type.short_name()
-            ))
-        } else if is_4g {
-            (false, format!(
-                "4G/CGNAT detected ({}): DCUtR may fail because CGNAT typically blocks inbound UDP. \
-                 Success depends on remote peer's NAT type (Cone NAT on broadband may work). \
-                 Relay circuit will be used as fallback.",
-                 diag.nat_type.short_name()
-            ))
-        } else if !diag.nat_type.dcutr_feasible() {
+        let (likely_success, reason) = if !diag.nat_type.dcutr_feasible() {
+            // Symmetric NAT（含 4G+Symmetric）：本端端口映射不可预测，打洞必然失败
             (false, format!(
                 "{} NAT: DCUtR hole-punching will not succeed. \
                  Relay circuit will be used.",
                  diag.nat_type.short_name()
             ))
         } else if diag.nat_type == NatType::Unknown {
+            // Unknown（含 4G/CGNAT 单点观测）：保守尝试，成败取决于对端 NAT
             (true, "NAT type unknown: DCUtR will be attempted, success depends on NAT compatibility of both peers.".to_string())
         } else {
+            // 锥形/EIM NAT（含 4G+锥形）：本端可接收入站 UDP，打洞应成功
             (true, format!(
                 "{} NAT: DCUtR hole-punching should succeed. \
                  If it fails, check firewall settings or port forwarding.",

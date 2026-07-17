@@ -46,7 +46,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let opt = Opt::parse();
 
     // ---- 加载配置文件 ----
-    let mut cfg = config::Config::load(&opt.config).unwrap_or_else(|e| {
+    let mut config = config::Config::load(&opt.config).unwrap_or_else(|e| {
         eprintln!("[Relay] {e}");
         std::process::exit(1);
     });
@@ -58,10 +58,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         port: opt.port,
         public_ip: opt.public_ip,
     };
-    cfg.apply_cli_overrides(&cli_overrides);
+    config.apply_cli_overrides(&cli_overrides);
 
     // 从文件加载固定身份密钥, 保证 PeerId 不变 (方便配置)
-    let keypair = load_or_create_keypair(&cfg.key_file)?;
+    let keypair = load_or_create_keypair(&config.key_file)?;
     let peer_id = keypair.public().to_peer_id();
 
     let mut swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
@@ -78,19 +78,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // ---- 监听 ----
     let tcp_addr = Multiaddr::empty()
-        .with(match cfg.use_ipv6 {
+        .with(match config.use_ipv6 {
             true => Protocol::from(Ipv6Addr::UNSPECIFIED),
             false => Protocol::from(Ipv4Addr::UNSPECIFIED),
         })
-        .with(Protocol::Tcp(cfg.port));
+        .with(Protocol::Tcp(config.port));
     swarm.listen_on(tcp_addr.clone())?;
 
     let quic_addr = Multiaddr::empty()
-        .with(match cfg.use_ipv6 {
+        .with(match config.use_ipv6 {
             true => Protocol::from(Ipv6Addr::UNSPECIFIED),
             false => Protocol::from(Ipv4Addr::UNSPECIFIED),
         })
-        .with(Protocol::Udp(cfg.port))
+        .with(Protocol::Udp(config.port))
         .with(Protocol::QuicV1);
     swarm.listen_on(quic_addr.clone())?;
 
@@ -100,15 +100,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!("╠══════════════════════════════════════════╣");
     println!("║ PeerId: {peer_id}");
     println!("║");
-    println!("║ TCP:  /ip4/<PUBLIC_IP>/tcp/{}/p2p/{peer_id}", cfg.port);
-    println!("║ QUIC: /ip4/<PUBLIC_IP>/udp/{}/quic-v1/p2p/{peer_id}", cfg.port);
+    println!("║ TCP:  /ip4/<PUBLIC_IP>/tcp/{}/p2p/{peer_id}", config.port);
+    println!("║ QUIC: /ip4/<PUBLIC_IP>/udp/{}/quic-v1/p2p/{peer_id}", config.port);
     println!("║");
     println!("║ Listening TCP:  {tcp_addr}");
     println!("║ Listening QUIC: {quic_addr}");
     println!("╚══════════════════════════════════════════╝");
 
     // ---- 手动添加公网外部地址（若指定） ----
-    if let Some(ref ip_str) = cfg.public_ip {
+    if let Some(ref ip_str) = config.public_ip {
         let ip: std::net::IpAddr = ip_str.parse()
             .map_err(|e| format!("Invalid public_ip '{}': {e}", ip_str))?;
         if let std::net::IpAddr::V4(v4) = ip {
@@ -118,17 +118,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
         }
         if ip.is_ipv4() {
-            let ext_tcp: Multiaddr = format!("/ip4/{}/tcp/{}", ip_str, cfg.port).parse()
+            let ext_tcp: Multiaddr = format!("/ip4/{}/tcp/{}", ip_str, config.port).parse()
                 .map_err(|e| format!("Invalid external TCP address: {e}"))?;
-            let ext_quic: Multiaddr = format!("/ip4/{}/udp/{}/quic-v1", ip_str, cfg.port).parse()
+            let ext_quic: Multiaddr = format!("/ip4/{}/udp/{}/quic-v1", ip_str, config.port).parse()
                 .map_err(|e| format!("Invalid external QUIC address: {e}"))?;
             swarm.add_external_address(ext_tcp);
             swarm.add_external_address(ext_quic);
             tracing::info!("[Relay] Added external addresses for public IP: {}", ip_str);
         } else {
-            let ext_tcp: Multiaddr = format!("/ip6/{}/tcp/{}", ip_str, cfg.port).parse()
+            let ext_tcp: Multiaddr = format!("/ip6/{}/tcp/{}", ip_str, config.port).parse()
                 .map_err(|e| format!("Invalid external TCP address: {e}"))?;
-            let ext_quic: Multiaddr = format!("/ip6/{}/udp/{}/quic-v1", ip_str, cfg.port).parse()
+            let ext_quic: Multiaddr = format!("/ip6/{}/udp/{}/quic-v1", ip_str, config.port).parse()
                 .map_err(|e| format!("Invalid external QUIC address: {e}"))?;
             swarm.add_external_address(ext_tcp);
             swarm.add_external_address(ext_quic);

@@ -512,6 +512,8 @@ static void *get_stream_thread(void *arg) {
     VENC_STREAM_S stFrame;
     stFrame.pstPack = (VENC_PACK_S *)malloc(sizeof(VENC_PACK_S));
     int loopCount = 0;
+    int first_logged = 0;
+    time_t last_hb = 0;
 
     printf("[rk_camera] stream thread[%d] started\n", chn_id);
 
@@ -536,9 +538,22 @@ static void *get_stream_thread(void *arg) {
                 g_callback(chn_id, (const uint8_t *)pData, u32Len, u64PTS, is_kf);
             }
 
-            if (loopCount%(30*10) == 0) {
+            // 首帧只打印一次 (符合"first frame"语义)；之后用正确命名的周期性心跳。
+            // 心跳以 300 帧为触发条件，但再加最小时间间隔闸门(5s)，使日志频率与帧率解耦：
+            // 正常帧率(10~30fps)下仍"每 300 帧"打一次；若 GetStream 高速 busy-loop
+            // (无真实视频源时常见) 导致 loopCount 毫秒级暴涨，也不会洪水式打印。
+            if (!first_logged) {
                 printf("[rk_camera] first frame[%d]: len=%u pts=%llu keyframe=%d\n",
                        chn_id, u32Len, (unsigned long long)u64PTS, is_kf);
+                first_logged = 1;
+                last_hb = time(NULL);
+            } else if (loopCount % (30 * 10) == 0) {
+                time_t now = time(NULL);
+                if (now - last_hb >= 5) {
+                    printf("[rk_camera] heartbeat[%d]: len=%u pts=%llu keyframe=%d frames=%d\n",
+                           chn_id, u32Len, (unsigned long long)u64PTS, is_kf, loopCount);
+                    last_hb = now;
+                }
             }
             loopCount++;
 

@@ -38,7 +38,7 @@ impl FileVideoSource {
                     32 => vps += 1,
                     33 => sps += 1,
                     34 => pps += 1,
-                    19 | 20 => idr += 1,
+                    16..=21 => idr += 1,
                     _ => other += 1,
                 }
             }
@@ -95,7 +95,9 @@ impl FileVideoSource {
                 // 从 AU 的第一个 NAL 判断类型
                 let first_nal = first_nal_in_au(&data).unwrap_or(&[]);
                 let nal_t = nal_type(first_nal);
-                let is_keyframe = nal_t == 19 || nal_t == 20;
+                // H.265 IRAP: BLA(16-18), IDR(19-20), CRA(21) — 与 rk_video_source 一致。
+                // 仅标记 IDR(19/20) 会漏掉 CRA(21)，导致 viewer 端误判首个关键帧为非关键帧而永久丢弃。
+                let is_keyframe = nal_t >= 16 && nal_t <= 21;
 
                 // 缓存 VPS/SPS/PPS (新 viewer 连接时需要)
                 if nal_t == 32 || nal_t == 33 || nal_t == 34 {

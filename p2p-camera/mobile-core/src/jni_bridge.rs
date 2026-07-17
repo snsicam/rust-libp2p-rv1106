@@ -50,6 +50,7 @@ enum Cmd {
         enable_mdns: bool,
         stream_type: String,
         no_audio: bool,
+        network_type: String,
     },
 }
 
@@ -135,25 +136,33 @@ pub extern "system" fn Java_com_p2pcamera_mediaplayer_RustBridge_nativeCreate(
         };
 
         rt.block_on(async {
-            // 创建 viewer
-            let mut viewer = match MediaPlayer::new().await {
-                Ok(v) => v,
-                Err(e) => {
-                    let _ = event_tx.send(ViewerEvent::Error {
-                        message: format!("create viewer: {e}"),
-                    });
-                    return;
-                }
-            };
-
             // audio_tx 用 Option 包装，no_audio 时 take() 关闭发送端
             let mut audio_tx = Some(audio_tx);
 
+            // 创建 viewer（是否启用 DCUtR 取决于网络类型：4G/CGNAT 下禁用）
+            let mut viewer;
+
             // 等待连接命令
             let device_id;
+            let network_type;
             match cmd_rx.recv() {
-                Ok(Cmd::Connect { relays, device_id: did, enable_mdns, stream_type, no_audio }) => {
+                Ok(Cmd::Connect { relays, device_id: did, enable_mdns, stream_type, no_audio, network_type: nt }) => {
                     device_id = did.clone();
+                    network_type = nt;
+                    // 默认启用 DCUtR 打洞：锥形/EIM NAT（含多数 4G）可打洞成功，省中继带宽。
+                    // 仅当连接后 net_diag 确认为 Symmetric NAT 时，才在重连时禁用
+                    // （viewer.rs 会重建 Swarm 并去掉 dcutr 行为），避免每次重连都无效打洞 ~17s。
+                    let enable_dcutr = true;
+                    println!("[Viewer] DCUtR enabled (network_type={}, will auto-disable on reconnect if Symmetric NAT detected)", network_type);
+                    viewer = match MediaPlayer::new(enable_dcutr).await {
+                        Ok(v) => v,
+                        Err(e) => {
+                            let _ = event_tx.send(ViewerEvent::Error {
+                                message: format!("create viewer: {e}"),
+                            });
+                            return;
+                        }
+                    };
                     let _ = event_tx.send(ViewerEvent::Connecting);
                     let relay_strs: Vec<String> = relays.clone();
                     match viewer
@@ -317,6 +326,11 @@ pub extern "system" fn Java_com_p2pcamera_mediaplayer_RustBridge_nativeConnect(
 
     let no_audio = config["no_audio"].as_bool().unwrap_or(false);
 
+    let network_type = config["network_type"]
+        .as_str()
+        .unwrap_or("auto")
+        .to_string();
+
     if relays.is_empty() || device_id.is_empty() {
         let _ = env.throw_new(
             "java/lang/IllegalArgumentException",
@@ -329,7 +343,7 @@ pub extern "system" fn Java_com_p2pcamera_mediaplayer_RustBridge_nativeConnect(
         handles
             .get(idx)
             .and_then(|h| h.as_ref())
-            .map(|h| h.cmd_tx.send(Cmd::Connect { relays, device_id, enable_mdns, stream_type, no_audio }).is_ok())
+            .map(|h| h.cmd_tx.send(Cmd::Connect { relays, device_id, enable_mdns, stream_type, no_audio, network_type }).is_ok())
             .unwrap_or(false)
     });
 

@@ -40,9 +40,10 @@ use libp2p::{
     swarm::{NetworkBehaviour, SwarmEvent},
     tcp, StreamProtocol, PeerId,
 };
+use libp2p::swarm::behaviour::toggle::Toggle;
 use libp2p_stream;
-use mobile_core::net_diag::{ConnectionStrategy, NatDiagnostic, NatType};
-use proto::{media_packet::MediaPacket, stream_protocols};
+use mobile_core::net_diag::{NatDiagnostic, NatType};
+use proto::{media_packet::{MediaPacket, MediaTrack}, stream_protocols};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
@@ -94,38 +95,38 @@ async fn main() -> Result<()> {
     let opt = Opt::parse();
 
     // ---- 加载配置文件 ----
-    let mut cfg = ViewerConfig::load(&opt.config).unwrap_or_else(|e| {
+    let mut config = ViewerConfig::load(&opt.config).unwrap_or_else(|e| {
         eprintln!("[Viewer] {e}");
         std::process::exit(1);
     });
 
     // 命令行参数覆盖配置文件
-    if !opt.relays.is_empty() { cfg.relays = opt.relays.clone(); }
-    if let Some(ref camera) = opt.camera { cfg.camera = camera.clone(); }
-    if let Some(ref output) = opt.output { cfg.output = Some(output.clone()); }
-    if opt.no_audio { cfg.no_audio = true; }
+    if !opt.relays.is_empty() { config.relays = opt.relays.clone(); }
+    if let Some(ref camera) = opt.camera { config.camera = camera.clone(); }
+    if let Some(ref output) = opt.output { config.output = Some(output.clone()); }
+    if opt.no_audio { config.no_audio = true; }
     #[cfg(feature = "player")]
-    if opt.play { cfg.play = true; }
-    if let Some(udp_port) = opt.udp_port { cfg.udp_port = Some(udp_port); }
-    if let Some(enable_mdns) = opt.enable_mdns { cfg.enable_mdns = enable_mdns; }
+    if opt.play { config.play = true; }
+    if let Some(udp_port) = opt.udp_port { config.udp_port = Some(udp_port); }
+    if let Some(enable_mdns) = opt.enable_mdns { config.enable_mdns = enable_mdns; }
     // stream CLI arg always overrides config (unless it's the default "auto")
-    if opt.stream != "auto" { cfg.stream = opt.stream.clone(); }
+    if opt.stream != "auto" { config.stream = opt.stream.clone(); }
 
     // 解析 relays (兼容旧格式 relay 字段)
-    cfg.resolve_relays();
+    config.resolve_relays();
 
     // ---- 参数校验 ----
-    if cfg.relays.is_empty() && !cfg.enable_mdns {
+    if config.relays.is_empty() && !config.enable_mdns {
         eprintln!("[Viewer] Error: no relay addresses and mDNS is disabled. Edit {} or use --relay / --enable-mdns", opt.config.display());
         std::process::exit(1);
     }
-    if cfg.camera.is_empty() {
+    if config.camera.is_empty() {
         eprintln!("[Viewer] Error: camera PeerId is empty. Edit {} or use --camera", opt.config.display());
         std::process::exit(1);
     }
     {
-        for (i, relay_str) in cfg.relays.iter().enumerate() {
-            let label = if cfg.relays.len() == 1 { "Relay".to_string() } else { format!("Relay #{}", i + 1) };
+        for (i, relay_str) in config.relays.iter().enumerate() {
+            let label = if config.relays.len() == 1 { "Relay".to_string() } else { format!("Relay #{}", i + 1) };
             if relay_str.contains("/tcp/") && !relay_str.contains("/quic-v1") {
                 tracing::warn!("[Viewer] WARNING: {label} using TCP - DCUtR will only produce TCP candidates, hole punching unlikely to succeed. Use /udp/<port>/quic-v1 instead");
             } else if relay_str.contains("/quic-v1") {
@@ -133,14 +134,14 @@ async fn main() -> Result<()> {
             }
         }
 
-        if let Some(port) = cfg.udp_port {
+        if let Some(port) = config.udp_port {
             if port == 0 {
                 tracing::warn!("[Viewer] WARNING: Using random UDP port - cannot configure port forwarding for DCUtR");
             }
         }
     }
 
-    if cfg.enable_mdns {
+    if config.enable_mdns {
         tracing::info!("[Viewer] mDNS enabled - LAN discovery active");
     } else {
         tracing::info!("[Viewer] mDNS disabled");
@@ -148,7 +149,7 @@ async fn main() -> Result<()> {
 
     // ---- 初始化播放器/输出 (独立于 P2P 连接，重连期间不中断) ----
     #[cfg(feature = "player")]
-    let mut player = if cfg.play {
+    let mut player = if config.play {
         println!("[Viewer] Initializing SDL player...");
         Some(player::VideoPlayer::new()?)
     } else {
@@ -156,7 +157,7 @@ async fn main() -> Result<()> {
     };
 
     #[cfg(feature = "player")]
-    let mut audio_player = if cfg.play && !cfg.no_audio {
+    let mut audio_player = if config.play && !config.no_audio {
         match player::AudioPlayer::new(16000) {
             Ok(p) => Some(p),
             Err(e) => {
@@ -168,7 +169,7 @@ async fn main() -> Result<()> {
         None
     };
 
-    let mut output_file = if let Some(path) = &cfg.output {
+    let mut output_file = if let Some(path) = &config.output {
         Some(std::fs::File::create(path).context("Failed to create output file")?)
     } else {
         None
@@ -181,13 +182,13 @@ async fn main() -> Result<()> {
     // 用于与后台 session 通信
     let (session_tx, mut session_rx) = mpsc::channel::<SessionEvent>(1);
 
-    let relay_addrs = cfg.relays.clone();
-    let device_cam_str = cfg.camera.clone();
-    let no_audio = cfg.no_audio;
-    let udp_port = cfg.udp_port;
-    let enable_mdns = cfg.enable_mdns;
-    let stream_type = cfg.stream.clone();
-    let network_type = cfg.network_type.clone();
+    let relay_addrs = config.relays.clone();
+    let device_cam_str = config.camera.clone();
+    let no_audio = config.no_audio;
+    let udp_port = config.udp_port;
+    let enable_mdns = config.enable_mdns;
+    let stream_type = config.stream.clone();
+    let network_type = config.network_type.clone();
 
     let mut frame_count: u64 = 0;
     let mut bytes_received: u64 = 0;
@@ -198,10 +199,16 @@ async fn main() -> Result<()> {
     let mut remote_nat_hint: Option<String> = None;
     let mut video_start: Option<std::time::Instant> = None;
     let mut stream_disconnected = false;
-    #[cfg(feature = "player")]
     let mut window_minimized = false;
     #[allow(unused_assignments)]
     let mut session_abort_handle: Option<tokio::task::AbortHandle> = None;
+    // DCUtR 是否启用：默认启用（锥形/EIM NAT 可打洞成功，省中继带宽）。
+    // 一旦会话内 net_diag 确认为 Symmetric NAT，后续重连传入 false 以跳过无效打洞。
+    let mut enable_dcutr = true;
+
+    // 持久化密钥对：重连时复用，保证 PeerId 不变（与生产 lib 侧 MediaPlayer 行为一致）
+    let keypair = libp2p::identity::Keypair::generate_ed25519();
+    println!("[Viewer] Local PeerId: {}", keypair.public().to_peer_id());
 
     // 启动初始 session (后台任务)
     session_abort_handle = Some(spawn_session(
@@ -212,6 +219,8 @@ async fn main() -> Result<()> {
         enable_mdns,
         stream_type.clone(),
         network_type.clone(),
+        enable_dcutr,
+        keypair.clone(),
         tx.clone(),
         audio_tx.clone(),
         session_tx.clone(),
@@ -251,6 +260,9 @@ async fn main() -> Result<()> {
                                 udp_port,
                                 enable_mdns,
                                 stream_type.clone(),
+                                network_type.clone(),
+                                enable_dcutr,
+                                keypair.clone(),
                                 tx.clone(),
                                 audio_tx.clone(),
                                 session_tx.clone(),
@@ -291,6 +303,8 @@ async fn main() -> Result<()> {
                                     enable_mdns,
                                     stream_type.clone(),
                                     network_type.clone(),
+                                    enable_dcutr,
+                                    keypair.clone(),
                                     tx.clone(),
                                     audio_tx.clone(),
                                     session_tx.clone(),
@@ -327,6 +341,9 @@ async fn main() -> Result<()> {
                                 udp_port,
                                 enable_mdns,
                                 stream_type.clone(),
+                                network_type.clone(),
+                                enable_dcutr,
+                                keypair.clone(),
                                 tx.clone(),
                                 audio_tx.clone(),
                                 session_tx.clone(),
@@ -366,6 +383,8 @@ async fn main() -> Result<()> {
                                     enable_mdns,
                                     stream_type.clone(),
                                     network_type.clone(),
+                                    enable_dcutr,
+                                    keypair.clone(),
                                     tx.clone(),
                                     audio_tx.clone(),
                                     session_tx.clone(),
@@ -387,6 +406,13 @@ async fn main() -> Result<()> {
                         if remote_nat.is_some() {
                             remote_nat_hint = remote_nat;
                         }
+                        // 对称型 NAT → 后续重连禁用 DCUtR（跳过无效打洞 ~17s）
+                        enable_dcutr = local_nat != NatType::Symmetric;
+                        tracing::info!(
+                            "[Viewer] NAT type updated: {} → DCUtR {} for next reconnect",
+                            local_nat.short_name(),
+                            if enable_dcutr { "ENABLED" } else { "DISABLED" }
+                        );
                     }
                     None => break, // channel 关闭 → 退出
                 }
@@ -453,6 +479,8 @@ async fn main() -> Result<()> {
                                     enable_mdns,
                                     stream_type.clone(),
                                     network_type.clone(),
+                                    enable_dcutr,
+                                    keypair.clone(),
                                     tx.clone(),
                                     audio_tx.clone(),
                                     session_tx.clone(),
@@ -515,6 +543,8 @@ async fn main() -> Result<()> {
                                     enable_mdns,
                                     stream_type.clone(),
                                     network_type.clone(),
+                                    enable_dcutr,
+                                    keypair.clone(),
                                     tx.clone(),
                                     audio_tx.clone(),
                                     session_tx.clone(),
@@ -578,6 +608,8 @@ fn spawn_session(
     enable_mdns: bool,
     stream_type: String,
     network_type: String,
+    enable_dcutr: bool,
+    keypair: libp2p::identity::Keypair,
     video_tx: mpsc::Sender<MediaPacket>,
     audio_tx: mpsc::Sender<MediaPacket>,
     event_tx: mpsc::Sender<SessionEvent>,
@@ -591,6 +623,8 @@ fn spawn_session(
             enable_mdns,
             stream_type,
             network_type,
+            enable_dcutr,
+            keypair,
             video_tx,
             audio_tx,
             event_tx.clone(),
@@ -669,6 +703,8 @@ async fn run_viewer_session(
     enable_mdns: bool,
     stream_type: String,
     network_type: String,
+    enable_dcutr: bool,
+    keypair: libp2p::identity::Keypair,
     video_tx: mpsc::Sender<MediaPacket>,
     audio_tx: mpsc::Sender<MediaPacket>,
     event_tx: mpsc::Sender<SessionEvent>,
@@ -682,11 +718,18 @@ async fn run_viewer_session(
         .collect::<std::result::Result<Vec<_>, _>>()
         .context("Invalid relay address")?;
 
-    let keypair = libp2p::identity::Keypair::generate_ed25519();
     let local_peer_id = keypair.public().to_peer_id();
     println!("[Viewer] PeerId: {local_peer_id}");
 
     // ---- 构建 Swarm ----
+    // DCUtR 默认启用（锥形/EIM NAT 含多数 4G 可打洞成功，省中继带宽）。
+    // 仅当本端确认为 Symmetric NAT 时（由上层在重连时传入 enable_dcutr=false）
+    // 才禁用 dcutr 行为，跳过无效打洞 ~17s。
+    if !enable_dcutr {
+        tracing::info!(
+            "[Viewer] DCUtR disabled (Symmetric NAT) - using Relay Circuit only"
+        );
+    }
     let mut swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
         .with_tcp(
@@ -707,6 +750,7 @@ async fn run_viewer_session(
                 key.public().clone(),
                 relay_client,
                 identify_config,
+                enable_dcutr,
             )
         })?
         // idle timeout 120s: DCUtR handler 在重试期间需要 keep-alive，0 会导致连接被意外关闭
@@ -1089,6 +1133,14 @@ async fn run_viewer_session(
                         tracing::info!("[Viewer] 4G/CGNAT network detected");
                     }
                     tracing::info!("[Viewer] DCUtR suggestion: {}", result.dcutr_suggestion);
+                    let dcutr_currently_enabled = swarm.behaviour().dcutr.is_enabled();
+                    tracing::info!(
+                        "[Viewer] === NAT type: {} ({}) | DCUtR currently {} | will skip on reconnect: {} ===",
+                        result.nat_type.short_name(),
+                        if result.is_4g { "4G/CGNAT" } else { "broadband" },
+                        if dcutr_currently_enabled { "enabled" } else { "DISABLED" },
+                        result.nat_type == NatType::Symmetric
+                    );
                     local_nat_type = Some(result.nat_type);
                     let _ = event_tx.send(SessionEvent::NatDiagnosis {
                         local_nat: result.nat_type,
@@ -1286,6 +1338,34 @@ fn process_video_frame(
 }
 
 /// 从 stream 持续读取帧
+/// 从 HEVC access unit 判断是否包含可随机访问的关键帧 (IRAP)。
+/// 不依赖对端 `is_keyframe` 标记（FileVideoSource 仅标记 IDR 19/20，漏 CRA 21），
+/// 直接解析 NAL type: BLA(16-18), IDR(19-20), CRA(21)。
+fn is_hevc_irap(au: &[u8]) -> bool {
+    let n = au.len();
+    let mut i = 0;
+    while i + 4 < n {
+        let b0 = au.get(i).copied().unwrap_or(0);
+        let b1 = au.get(i + 1).copied().unwrap_or(0);
+        let b2 = au.get(i + 2).copied().unwrap_or(0);
+        let b3 = au.get(i + 3).copied().unwrap_or(0);
+        let (_sc_len, nal_pos) = if b0 == 0 && b1 == 0 && b2 == 0 && b3 == 1 {
+            (4usize, i + 4)
+        } else if b0 == 0 && b1 == 0 && b2 == 1 {
+            (3usize, i + 3)
+        } else {
+            i += 1;
+            continue;
+        };
+        let nal_type = (au.get(nal_pos).copied().unwrap_or(0) >> 1) & 0x3F;
+        if (16..=21).contains(&nal_type) {
+            return true;
+        }
+        i = nal_pos + 1;
+    }
+    false
+}
+
 async fn receive_frames(
     peer_id: PeerId,
     mut stream: libp2p::swarm::Stream,
@@ -1294,6 +1374,10 @@ async fn receive_frames(
 ) {
     let mut buf = BytesMut::with_capacity(STREAM_READ_BUF);
     let mut read_buf = vec![0u8; STREAM_READ_BUF];
+    // HEVC 初始帧容错：丢弃首个 IDR 前的非关键帧，避免解码器缺少参考帧导致
+    // "Player error" (ffmpeg 无法从无参考的 P/B 帧开始解码)。
+    // 收到第一个关键帧后恢复正常转发。
+    let mut got_first_idr = false;
 
     loop {
         match stream.read(&mut read_buf).await {
@@ -1307,6 +1391,28 @@ async fn receive_frames(
             Ok(n) => {
                 buf.extend_from_slice(&read_buf[..n]);
                 while let Some(packet) = MediaPacket::try_decode(&mut buf) {
+                    // 仅对视频流做 IDR 容错；音频始终透传
+                    if packet.track == MediaTrack::Video {
+                        // 关键帧判定：优先用对端标记，并兜底解析 NAL type。
+                        // FileVideoSource 的 is_keyframe 仅标记 IDR(19/20)，漏 CRA(21)，
+                        // 直接信任标记会导致首个关键帧（CRA）被误判为非关键帧而永久丢弃。
+                        let is_key = packet.is_keyframe() || is_hevc_irap(packet.data.as_ref());
+                        if is_key {
+                            if !got_first_idr {
+                                got_first_idr = true;
+                                tracing::info!(
+                                    "[Viewer] First IDR received, video decode started (dropped pre-IDR non-keyframes)"
+                                );
+                            }
+                        } else if !got_first_idr {
+                            // 首个 IDR 前的非关键帧：解码器无参考帧，直接丢弃
+                            tracing::debug!(
+                                "[Viewer] Drop pre-IDR non-keyframe ({} bytes) to avoid decode error",
+                                packet.data.len()
+                            );
+                            continue;
+                        }
+                    }
                     if sender.send(packet).await.is_err() {
                         return;
                     }
@@ -1426,7 +1532,11 @@ mod player {
     use sdl2::event::Event;
     use sdl2::event::WindowEvent;
 
-    /// 从 HEVC access unit 数据中判断是否包含 IDR 帧
+    /// 从 HEVC access unit 数据中判断是否包含可随机访问的关键帧 (IRAP)
+    ///
+    /// IRAP 类型: BLA(16-18), IDR(19-20), CRA(21) — 均可作为解码起点。
+    /// 与 `MediaPacket::is_keyframe()` 的判定范围 (16-21) 保持一致，
+    /// 避免把 CRA 等关键帧误判为非关键帧而跳过。
     fn is_hevc_idr(au: &[u8]) -> bool {
         let mut i = 0;
         while i + 4 < au.len() {
@@ -1440,7 +1550,7 @@ mod player {
                     continue;
                 };
                 let nal_type = (au[i + sc_len] >> 1) & 0x3F;
-                if nal_type == 19 || nal_type == 20 {
+                if (16..=21).contains(&nal_type) {
                     return true;
                 }
                 i += sc_len + 1;
@@ -1775,7 +1885,9 @@ mod player {
 #[derive(NetworkBehaviour)]
 struct ViewerBehaviour {
     relay_client: relay::client::Behaviour,
-    dcutr: dcutr::Behaviour,
+    /// DCUtR 直连打洞行为。4G/CGNAT 网络下打洞必然失败，用 Toggle 禁用以避免
+    /// 约 17 秒的无谓超时等待和转发链路上的写阻塞。
+    dcutr: Toggle<dcutr::Behaviour>,
     identify: identify::Behaviour,
     ping: ping::Behaviour,
     stream: libp2p_stream::Behaviour,
@@ -1786,23 +1898,29 @@ impl ViewerBehaviour {
     fn new(
         local_public_key: libp2p::identity::PublicKey,
         relay_client: relay::client::Behaviour,
+        enable_dcutr: bool,
     ) -> Self {
         let identify_config = identify::Config::new(
             "/p2p-camera-viewer/1.0.0".to_string(),
             local_public_key.clone(),
         );
-        Self::new_with_identify_config(local_public_key, relay_client, identify_config)
+        Self::new_with_identify_config(local_public_key, relay_client, identify_config, enable_dcutr)
     }
 
     fn new_with_identify_config(
         local_public_key: libp2p::identity::PublicKey,
         relay_client: relay::client::Behaviour,
         identify_config: identify::Config,
+        enable_dcutr: bool,
     ) -> Self {
         let peer_id = local_public_key.to_peer_id();
         Self {
             relay_client,
-            dcutr: dcutr::Behaviour::new(peer_id),
+            dcutr: Toggle::from(if enable_dcutr {
+                Some(dcutr::Behaviour::new(peer_id))
+            } else {
+                None
+            }),
             identify: identify::Behaviour::new(identify_config),
             ping: ping::Behaviour::new(
                 ping::Config::new()

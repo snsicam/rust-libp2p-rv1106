@@ -19,15 +19,16 @@ use libp2p::{
     swarm::{NetworkBehaviour, SwarmEvent},
     tcp, StreamProtocol, Swarm, PeerId,
 };
+use libp2p::swarm::behaviour::toggle::Toggle;
 use libp2p_stream::{self, Control};
 use proto::{
-    media_packet::MediaPacket,
+    media_packet::{MediaPacket, MediaTrack},
     stream_protocols,
 };
 use tokio::sync::mpsc;
 
 use crate::jitter_buffer::AvJitterBuffer;
-use crate::net_diag::{ConnectionQuality, ConnectionStrategy, ConnectionType, NatDiagnostic, NatDiagnosis};
+use crate::net_diag::{ConnectionQuality, ConnectionType, NatDiagnostic, NatDiagnosis, NatType};
 
 const STREAM_READ_BUF: usize = 65536; // 64KB
 const MDNS_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -127,6 +128,11 @@ pub struct MediaPlayer {
     /// 保存连接参数用于重连
     connect_params: Option<ConnectParams>,
     pub connected: bool,
+    /// 对称型 NAT 检测标志：连接后由 net_diag 判定。
+    /// 一旦确认为 Symmetric，重连时禁用 DCUtR（重建 Swarm）。
+    symmetric_detected: bool,
+    /// 保存密钥对，重连重建 Swarm 时复用，保证 PeerId 不变
+    keypair: libp2p::identity::Keypair,
 }
 
 /// 保存连接参数，用于断连后自动重连
@@ -140,25 +146,15 @@ struct ConnectParams {
 
 impl MediaPlayer {
     /// 创建新的 Viewer 实例
-    pub async fn new() -> Result<Self> {
+    ///
+    /// `enable_dcutr`: 是否启用 DCUtR 直连打洞。
+    /// 默认应传 `true`：锥形/EIM NAT（含多数 4G）可打洞成功，能省下中继带宽。
+    /// 仅当本端确认为 **Symmetric NAT** 时才传 `false`（或保持默认 `true`，
+    /// 由 `poll_swarm` 在连接后检测，重连时通过重建 Swarm 自动禁用 DCUtR）。
+    /// 不再以粗粒度的 `4g` 标志禁用，避免误杀可打洞的锥形 4G。
+    pub async fn new(enable_dcutr: bool) -> Result<Self> {
         let keypair = libp2p::identity::Keypair::generate_ed25519();
-
-        let swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
-            .with_tokio()
-            .with_tcp(
-                tcp::Config::default().nodelay(true),
-                noise::Config::new,
-                libp2p::yamux::Config::default,
-            )?
-            .with_quic()
-            .with_relay_client(noise::Config::new, libp2p::yamux::Config::default)?
-            .with_behaviour(|key, relay_client| {
-                ViewerBehaviour::new(key.public(), relay_client)
-            })?
-            // idle timeout 120s: DCUtR handler 在重试期间需要 keep-alive，0 会导致连接被意外关闭
-        .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(120)))
-            .build();
-
+        let swarm = Self::build_swarm(&keypair, enable_dcutr)?;
         let stream_control = swarm.behaviour().stream.new_control();
 
         let (video_sender, video_receiver) = mpsc::channel::<MediaPacket>(60);
@@ -188,7 +184,36 @@ impl MediaPlayer {
             relay_connection_id: None,
             connect_params: None,
             connected: false,
+            symmetric_detected: false,
+            keypair,
         })
+    }
+
+    /// 构建 Swarm（含可选的 DCUtR 行为）
+    ///
+    /// `enable_dcutr = false` 时通过 `Toggle::from(None)` 禁用 DCUtR 行为，
+    /// 用于本端确认为 Symmetric NAT 后的重连（避免每次重连都无效打洞 ~17s）。
+    /// 复用传入的 `keypair` 以保证 PeerId 在重连前后一致。
+    fn build_swarm(
+        keypair: &libp2p::identity::Keypair,
+        enable_dcutr: bool,
+    ) -> Result<Swarm<ViewerBehaviour>> {
+        let swarm = libp2p::SwarmBuilder::with_existing_identity(keypair.clone())
+            .with_tokio()
+            .with_tcp(
+                tcp::Config::default().nodelay(true),
+                noise::Config::new,
+                libp2p::yamux::Config::default,
+            )?
+            .with_quic()
+            .with_relay_client(noise::Config::new, libp2p::yamux::Config::default)?
+            .with_behaviour(|key, relay_client| {
+                ViewerBehaviour::new(key.public(), relay_client, enable_dcutr)
+            })?
+            // idle timeout 120s: DCUtR handler 在重试期间需要 keep-alive，0 会导致连接被意外关闭
+            .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(120)))
+            .build();
+        Ok(swarm)
     }
 
     /// 连接 Relay 并通过 Circuit 拨号 DeviceCam
@@ -473,6 +498,26 @@ impl MediaPlayer {
                     }
                     tracing::info!("[Viewer] DCUtR suggestion: {}", diag.dcutr_suggestion);
 
+                    // 对称型 NAT 检测：一旦确认，重连时禁用 DCUtR（重建 Swarm），
+                    // 避免每次重连都进行 ~17s 的无效打洞。
+                    if diag.nat_type == NatType::Symmetric && !self.symmetric_detected {
+                        self.symmetric_detected = true;
+                        tracing::warn!(
+                            "[Viewer] Symmetric NAT confirmed → DCUtR will be DISABLED on next reconnect (Swarm rebuilt without dcutr)"
+                        );
+                    }
+                    // 汇总日志：本端 NAT 类型 + 当前 DCUtR 实际状态
+                    // 注意：symmetric_detected=true 只能说明"下次重连会禁用"，当前连接的 DCUtR
+                    // 仍然活跃（因为 Swarm 创建时已确定）。另外检查当前 swarm 中 dcutr 是否真被禁用。
+                    let dcutr_currently_enabled = self.swarm.behaviour().dcutr.is_enabled();
+                    tracing::info!(
+                        "[Viewer] === NAT type: {} ({}) | DCUtR currently {} | will skip on reconnect: {} ===",
+                        diag.nat_type.short_name(),
+                        if diag.is_4g { "4G/CGNAT" } else { "broadband" },
+                        if dcutr_currently_enabled { "enabled" } else { "DISABLED" },
+                        self.symmetric_detected
+                    );
+
                     // 局域网直连检测：检查对端 listen_addrs 中是否有与本地 IP 同子网的 QUIC 地址
                     if let Some(device_cam) = self.device_cam_peer_id {
                         if identify_peer_id == device_cam
@@ -641,6 +686,16 @@ impl MediaPlayer {
         tracing::info!("[Viewer] Reconnecting in {}s...", RECONNECT_DELAY.as_secs());
         tokio::time::sleep(RECONNECT_DELAY).await;
 
+        // 若已确认 Symmetric NAT，重建 Swarm 并禁用 DCUtR，
+        // 避免每次重连都进行 ~17s 的无效打洞（Toggle 无法运行时切换，只能重建）。
+        if self.symmetric_detected {
+            tracing::info!("[Viewer] Rebuilding Swarm with DCUtR DISABLED (Symmetric NAT confirmed)");
+            self.swarm = Self::build_swarm(&self.keypair, false)?;
+            self.stream_control = self.swarm.behaviour().stream.new_control();
+            // 重置 NAT 诊断状态：新 Swarm 需要重新通过 Identify 观测地址
+            self.nat_diagnostic = NatDiagnostic::new(0, Vec::new());
+        }
+
         // 停止旧的接收任务
         if let Some(h) = self.video_abort_handle.take() { h.abort(); }
         if let Some(h) = self.audio_abort_handle.take() { h.abort(); }
@@ -700,6 +755,34 @@ impl MediaPlayer {
         }
     }
 
+    /// 从 HEVC access unit 判断是否包含可随机访问的关键帧 (IRAP)。
+    /// 不依赖对端 `is_keyframe` 标记（FileVideoSource 仅标记 IDR 19/20，漏 CRA 21），
+    /// 直接解析 NAL type: BLA(16-18), IDR(19-20), CRA(21)。
+    fn is_hevc_irap(au: &[u8]) -> bool {
+        let n = au.len();
+        let mut i = 0;
+        while i + 4 < n {
+            let b0 = au.get(i).copied().unwrap_or(0);
+            let b1 = au.get(i + 1).copied().unwrap_or(0);
+            let b2 = au.get(i + 2).copied().unwrap_or(0);
+            let b3 = au.get(i + 3).copied().unwrap_or(0);
+            let (_sc_len, nal_pos) = if b0 == 0 && b1 == 0 && b2 == 0 && b3 == 1 {
+                (4usize, i + 4)
+            } else if b0 == 0 && b1 == 0 && b2 == 1 {
+                (3usize, i + 3)
+            } else {
+                i += 1;
+                continue;
+            };
+            let nal_type = (au.get(nal_pos).copied().unwrap_or(0) >> 1) & 0x3F;
+            if (16..=21).contains(&nal_type) {
+                return true;
+            }
+            i = nal_pos + 1;
+        }
+        false
+    }
+
     /// 从 stream 持续读取帧，送入 channel
     /// EOF 或读错误时通过 event_sender 发送 Disconnected 通知
     async fn receive_frames(
@@ -710,6 +793,10 @@ impl MediaPlayer {
     ) {
         let mut buf = bytes::BytesMut::with_capacity(STREAM_READ_BUF);
         let mut read_buf = vec![0u8; STREAM_READ_BUF];
+        // HEVC 初始帧容错：丢弃首个 IDR 前的非关键帧，避免解码器缺少参考帧导致
+        // "Player error" (Android MediaCodec / ffmpeg 均无法从无参考的 P/B 帧开始解码)。
+        // 收到第一个关键帧后恢复正常转发。
+        let mut got_first_idr = false;
 
         loop {
             match stream.read(&mut read_buf).await {
@@ -725,6 +812,28 @@ impl MediaPlayer {
 
                     // 尝试解码所有完整的包
                     while let Some(packet) = MediaPacket::try_decode(&mut buf) {
+                        // 仅对视频流做 IDR 容错；音频始终透传
+                        if packet.track == MediaTrack::Video {
+                            // 关键帧判定：优先用对端标记，并兜底解析 NAL type。
+                            // FileVideoSource 的 is_keyframe 仅标记 IDR(19/20)，漏 CRA(21)，
+                            // 直接信任标记会导致首个关键帧（CRA）被误判为非关键帧而永久丢弃。
+                            let is_key = packet.is_keyframe() || Self::is_hevc_irap(packet.data.as_ref());
+                            if is_key {
+                                if !got_first_idr {
+                                    got_first_idr = true;
+                                    tracing::info!(
+                                        "[Viewer] First IDR received, video decode started (dropped pre-IDR non-keyframes)"
+                                    );
+                                }
+                            } else if !got_first_idr {
+                                // 首个 IDR 前的非关键帧：解码器无参考帧，直接丢弃
+                                tracing::debug!(
+                                    "[Viewer] Drop pre-IDR non-keyframe ({} bytes) to avoid decode error",
+                                    packet.data.len()
+                                );
+                                continue;
+                            }
+                        }
                         if sender.send(packet).await.is_err() {
                             break; // 接收端已关闭
                         }
@@ -745,7 +854,9 @@ impl MediaPlayer {
 #[derive(NetworkBehaviour)]
 pub struct ViewerBehaviour {
     pub relay_client: relay::client::Behaviour,
-    pub dcutr: dcutr::Behaviour,
+    /// DCUtR 直连打洞行为。4G/CGNAT 网络下打洞必然失败，用 Toggle 禁用以避免
+    /// 约 17 秒的无谓超时等待和转发链路上的写阻塞。
+    pub dcutr: Toggle<dcutr::Behaviour>,
     pub identify: identify::Behaviour,
     pub ping: ping::Behaviour,
     pub stream: libp2p_stream::Behaviour,
@@ -756,11 +867,16 @@ impl ViewerBehaviour {
     pub fn new(
         local_public_key: libp2p::identity::PublicKey,
         relay_client: relay::client::Behaviour,
+        enable_dcutr: bool,
     ) -> Self {
         let peer_id = local_public_key.to_peer_id();
         Self {
             relay_client,
-            dcutr: dcutr::Behaviour::new(peer_id),
+            dcutr: Toggle::from(if enable_dcutr {
+                Some(dcutr::Behaviour::new(peer_id))
+            } else {
+                None
+            }),
             identify: identify::Behaviour::new(
                 identify::Config::new(
                     "/p2p-camera-viewer/1.0.0".to_string(),
@@ -785,11 +901,16 @@ impl ViewerBehaviour {
         local_public_key: libp2p::identity::PublicKey,
         relay_client: relay::client::Behaviour,
         identify_config: identify::Config,
+        enable_dcutr: bool,
     ) -> Self {
         let peer_id = local_public_key.to_peer_id();
         Self {
             relay_client,
-            dcutr: dcutr::Behaviour::new(peer_id),
+            dcutr: Toggle::from(if enable_dcutr {
+                Some(dcutr::Behaviour::new(peer_id))
+            } else {
+                None
+            }),
             identify: identify::Behaviour::new(identify_config),
             ping: ping::Behaviour::new(
                 ping::Config::new()

@@ -35,3 +35,4 @@
 - **yamux Config**: Use `libp2p::yamux::Config::default` function pointer, NOT Config instance
 - **Multi-relay**: `relays: Vec<String>` with `dial_pending: bool` to avoid duplicate dials
 - **Exponential backoff**: 3s → 6s → 12s → 24s → 48s → 60s (max)
+- **DCUtR 策略：仅 Symmetric NAT 才禁用（非粗粒度 4G 禁用）**: libp2p `dcutr::Behaviour` 在每次中继连接建立时自动打洞且运行时无法按 peer 关闭，故用 `Toggle<dcutr::Behaviour>`（`Toggle::from(Option)`）在初始化时包裹，事件类型不变。`Toggle` 在连接前就定好，但 NAT 类型需连接后（Identify 观测地址）才知，因此策略为：**默认启用 DCUtR（锥形/EIM NAT 含多数 4G 可打洞，省中继带宽）；连接后 `net_diag` 若确认 Symmetric，则在重连时禁用**。实现：lib 侧 `MediaPlayer` 存 `keypair` + `symmetric_detected`，`reconnect()` 时若确认 Symmetric 则 `build_swarm(keypair, false)` 重建 Swarm（PeerId 不变）；example 侧每次 session 新建 Swarm，重连时把 `enable_dcutr=false` 传入。NAT 类型在 Identify handler 与 summary 中均打印。注意：4G 并非都对称（GSMA 推荐 UDP EIM，WebRTC 通话即证），故不应以 `network_type=="4g"` 粗粒度禁用。`net_diag::should_skip_dcutr`/`connection_strategy`/`dcutr_prediction` 均已改为仅 Symmetric 才 skip。
