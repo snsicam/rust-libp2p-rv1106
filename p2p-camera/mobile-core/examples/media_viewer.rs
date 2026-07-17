@@ -36,31 +36,19 @@ use clap::Parser;
 use futures::{AsyncReadExt, StreamExt};
 use libp2p::{
     core::multiaddr::{Multiaddr, Protocol},
-    dcutr, identify, mdns, noise, ping, relay,
+    dcutr, identify, mdns, noise,
     swarm::{NetworkBehaviour, SwarmEvent},
     tcp, StreamProtocol, PeerId,
 };
-use libp2p::swarm::behaviour::toggle::Toggle;
-use libp2p_stream;
 use mobile_core::net_diag::{NatDiagnostic, NatType};
+use mobile_core::viewer::{
+    get_video_protocol, is_same_subnet, ViewerBehaviour, ViewerBehaviourEvent,
+    RECONNECT_DELAY, MDNS_DISCOVERY_TIMEOUT, STREAM_READ_BUF,
+};
 use proto::{media_packet::{MediaPacket, MediaTrack}, stream_protocols};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 use tracing_subscriber::EnvFilter;
-
-const STREAM_READ_BUF: usize = 65536;
-const RECONNECT_DELAY: Duration = Duration::from_secs(3);
-const MDNS_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// 将 stream 名称映射到对应的协议
-fn get_video_protocol(stream_type: &str) -> StreamProtocol {
-    match stream_type {
-        "sub" => stream_protocols::VIDEO_SUB_PROTOCOL,
-        "third" => stream_protocols::VIDEO_THIRD_PROTOCOL,
-        // "main" or anything else defaults to main (also backward compat with legacy)
-        _ => stream_protocols::VIDEO_MAIN_PROTOCOL,
-    }
-}
 
 /// 根据连接方式和 stream_type 参数决定使用哪个码流协议
 ///
@@ -1368,7 +1356,10 @@ fn process_video_frame(
 
     #[cfg(feature = "player")]
     if let Some(p) = player {
-        match p.render(&packet.data, packet.is_keyframe()) {
+        match p.render(
+            &packet.data,
+            packet.is_keyframe() || is_nal_keyframe(&packet.data),
+        ) {
             Ok(action) => return action,
             Err(e) => {
                 tracing::error!("[Viewer] Player error: {e}");
@@ -1377,6 +1368,44 @@ fn process_video_frame(
     }
 
     RenderAction::Continue
+}
+
+/// 等待首个关键帧的最长时间（最后安全网）。正常情况下门控由 `is_nal_keyframe` 扫描
+/// 字节流里的真实 IDR NAL 立即开门（cam 在 `request_idr` 后很快产出真 IDR），不会等到这里。
+/// 仅当字节扫描也异常时才兜底强制开门，避免 `!got_first_idr` 门控永久不开 → 黑屏。
+/// 3s 足够覆盖一个 GOP 周期（gop=50@25fps≈2s），正常绝不触发。
+const IDR_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// 从 Annex B 裸流扫描 NAL，判断是否为关键帧（IRAP）。
+/// H.265: IRAP NAL type 16..=21 (BLA/IDR/CRA)；H.264: IDR NAL type 5。
+/// 与 C 侧 `rk_camera.c` 的 `is_keyframe_h265/h264` 判定范围一致，但**在 viewer 侧独立扫描
+/// 字节**，不依赖对端 `is_keyframe()` 标志位。日志实证：cam 发的 IDR 数据字节里确有 IRAP
+/// NAL（ffmpeg 能据此恢复解码），但 `is_keyframe()` 标志常不可靠（8s 内检测不到），故必须用
+/// 本函数扫字节兜底——这是之前版本快速起播的关键，删掉它改用 `is_keyframe()` 正是本次变慢的根因。
+fn is_nal_keyframe(data: &[u8]) -> bool {
+    let len = data.len();
+    let mut i = 0;
+    while i + 4 < len {
+        let hdr_off = if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 0 && data[i + 3] == 1 {
+            i + 4
+        } else if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
+            i + 3
+        } else {
+            i += 1;
+            continue;
+        };
+        let b = data[hdr_off];
+        let h265_type = (b >> 1) & 0x3F;
+        if (16..=21).contains(&h265_type) {
+            return true;
+        }
+        let h264_type = b & 0x1F;
+        if h264_type == 5 {
+            return true;
+        }
+        i = hdr_off + 1;
+    }
+    false
 }
 
 async fn receive_frames(
@@ -1391,6 +1420,8 @@ async fn receive_frames(
     // "Player error" (ffmpeg 无法从无参考的 P/B 帧开始解码)。
     // 收到第一个关键帧后恢复正常转发。
     let mut got_first_idr = false;
+    // 收到首个视频包的时间，用于 IDR 等待超时兜底
+    let mut first_video_at: Option<std::time::Instant> = None;
 
     loop {
         match stream.read(&mut read_buf).await {
@@ -1405,16 +1436,30 @@ async fn receive_frames(
                 buf.extend_from_slice(&read_buf[..n]);
                 while let Some(packet) = MediaPacket::try_decode(&mut buf) {
                     // 仅对视频流做 IDR 容错；音频始终透传。
-                    // 真实设备流的 is_keyframe 来自 RK VENC 硬编码标记, 可靠;
-                    // 且每个 IDR 自带 VPS/SPS/PPS, 无需 viewer 侧再扫描 NAL 兜底。
+                    // 关键帧判定: `is_keyframe()`(对端标志, 实测常不可靠) || `is_nal_keyframe`(扫字节, 可靠)。
+                    // 之前版本用字节扫描起播很快; 后来误删字节扫描、改信 `is_keyframe()` 标志,
+                    // 导致门控等不到关键帧、卡满整个超时(8s)才强制开门 → 起播极慢。
                     // 收到首个 IDR 前的非关键帧直接丢弃(解码器无参考帧会报错),
                     // 收到首个 IDR 后恢复正常转发。
                     if packet.track == MediaTrack::Video && !got_first_idr {
-                        if packet.is_keyframe() {
+                        if first_video_at.is_none() {
+                            first_video_at = Some(std::time::Instant::now());
+                        }
+                        let is_kf =
+                            packet.is_keyframe() || is_nal_keyframe(&packet.data);
+                        let waited = first_video_at.map(|t| t.elapsed());
+                        if is_kf || waited.map_or(false, |w| w >= IDR_WAIT_TIMEOUT) {
                             got_first_idr = true;
-                            tracing::info!(
-                                "[Viewer] First IDR received, video decode started (dropped pre-IDR non-keyframes)"
-                            );
+                            if is_kf {
+                                tracing::info!(
+                                    "[Viewer] First IDR received, video decode started (dropped pre-IDR non-keyframes)"
+                                );
+                            } else {
+                                tracing::warn!(
+                                    "[Viewer] No IDR within {:?}, forwarding video anyway (cam keyframe flag may be unreliable)",
+                                    IDR_WAIT_TIMEOUT
+                                );
+                            }
                         } else {
                             // 首个 IDR 前的非关键帧：解码器无参考帧，直接丢弃
                             tracing::debug!(
@@ -1438,14 +1483,6 @@ async fn receive_frames(
             }
         }
     }
-}
-
-/// 检查两个 IPv4 地址是否在同一 /24 子网
-fn is_same_subnet(a: Ipv4Addr, b: Ipv4Addr) -> bool {
-    let a = u32::from(a);
-    let b = u32::from(b);
-    // /24 子网掩码: 前 24 位相同
-    (a & 0xFFFFFF00) == (b & 0xFFFFFF00)
 }
 
 /// 等待特定事件 (带超时)，同时收集 local_ips 和缓存 Identify/NewListenAddr 事件
@@ -1570,6 +1607,9 @@ mod player {
         minimized: bool,
         /// 解码器 flush 后等待关键帧：跳过非关键帧，避免 POC 错误导致花屏
         waiting_for_keyframe: bool,
+        /// 进入 waiting_for_keyframe 的时间，用于超时兜底（避免 cam 关键帧标记
+        /// 异常时播放器门控永久不开 → 黑屏）
+        waiting_since: Option<std::time::Instant>,
     }
 
     impl VideoPlayer {
@@ -1580,6 +1620,7 @@ mod player {
             // 这会重置解码器状态，使下一帧必须从关键帧开始
             self.decoder.flush();
             self.waiting_for_keyframe = true;
+            self.waiting_since = Some(std::time::Instant::now());
             eprintln!("[Player] Decoder flushed, waiting for keyframe");
         }
 
@@ -1654,6 +1695,7 @@ mod player {
                 // 会直接进空解码器，触发 "Could not find ref with POC" 花屏（马赛克一下）。
                 // 置 true 与重连后 reset_decoder() 行为一致：丢弃一切直到真 IDR。
                 waiting_for_keyframe: true,
+                waiting_since: Some(std::time::Instant::now()),
             })
         }
 
@@ -1693,11 +1735,20 @@ mod player {
 
             // 解码器 flush 后等待关键帧：跳过非关键帧避免花屏
             if self.waiting_for_keyframe {
-                if !is_keyframe {
+                let waited = self.waiting_since.map(|t| t.elapsed());
+                // 收到关键帧，或等待超时（cam 关键帧标记异常时强制开门，避免永久黑屏）
+                if !is_keyframe && !waited.map_or(false, |w| w >= crate::IDR_WAIT_TIMEOUT) {
                     return Ok(RenderAction::Continue);
                 }
                 self.waiting_for_keyframe = false;
-                eprintln!("[Player] Keyframe received, resuming decode");
+                if is_keyframe {
+                    eprintln!("[Player] Keyframe received, resuming decode");
+                } else {
+                    eprintln!(
+                        "[Player] No IDR within {:?}, resuming decode anyway (cam keyframe flag may be unreliable)",
+                        crate::IDR_WAIT_TIMEOUT
+                    );
+                }
             }
 
             let mut packet = ffmpeg::Packet::new(au.len());
@@ -1865,62 +1916,6 @@ mod player {
             while queue.buffer.len() > max_bytes {
                 queue.buffer.pop_front();
             }
-        }
-    }
-}
-
-// ---- NetworkBehaviour ----
-
-#[derive(NetworkBehaviour)]
-struct ViewerBehaviour {
-    relay_client: relay::client::Behaviour,
-    /// DCUtR 直连打洞行为。4G/CGNAT 网络下打洞必然失败，用 Toggle 禁用以避免
-    /// 约 17 秒的无谓超时等待和转发链路上的写阻塞。
-    dcutr: Toggle<dcutr::Behaviour>,
-    identify: identify::Behaviour,
-    ping: ping::Behaviour,
-    stream: libp2p_stream::Behaviour,
-    mdns: mdns::tokio::Behaviour,
-}
-
-impl ViewerBehaviour {
-    fn new(
-        local_public_key: libp2p::identity::PublicKey,
-        relay_client: relay::client::Behaviour,
-        enable_dcutr: bool,
-    ) -> Self {
-        let identify_config = identify::Config::new(
-            "/p2p-camera-viewer/1.0.0".to_string(),
-            local_public_key.clone(),
-        );
-        Self::new_with_identify_config(local_public_key, relay_client, identify_config, enable_dcutr)
-    }
-
-    fn new_with_identify_config(
-        local_public_key: libp2p::identity::PublicKey,
-        relay_client: relay::client::Behaviour,
-        identify_config: identify::Config,
-        enable_dcutr: bool,
-    ) -> Self {
-        let peer_id = local_public_key.to_peer_id();
-        Self {
-            relay_client,
-            dcutr: Toggle::from(if enable_dcutr {
-                Some(dcutr::Behaviour::new(peer_id))
-            } else {
-                None
-            }),
-            identify: identify::Behaviour::new(identify_config),
-            ping: ping::Behaviour::new(
-                ping::Config::new()
-                    .with_interval(Duration::from_secs(5)),
-            ),
-            stream: libp2p_stream::Behaviour::new(),
-            mdns: mdns::tokio::Behaviour::new(
-                mdns::Config::default(),
-                peer_id,
-            )
-            .expect("Failed to initialize mDNS"),
         }
     }
 }

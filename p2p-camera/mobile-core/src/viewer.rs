@@ -30,9 +30,9 @@ use tokio::sync::mpsc;
 use crate::jitter_buffer::AvJitterBuffer;
 use crate::net_diag::{ConnectionQuality, ConnectionType, NatDiagnostic, NatDiagnosis, NatType};
 
-const STREAM_READ_BUF: usize = 65536; // 64KB
-const MDNS_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
-const RECONNECT_DELAY: Duration = Duration::from_secs(3);
+pub const STREAM_READ_BUF: usize = 65536; // 64KB
+pub const MDNS_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
+pub const RECONNECT_DELAY: Duration = Duration::from_secs(3);
 
 /// MediaPlayer 内部事件，用于通知上层（JNI bridge）连接状态变化
 #[derive(Debug, Clone)]
@@ -44,7 +44,7 @@ pub enum MediaPlayerEvent {
 }
 
 /// 将 stream 名称映射到对应的协议
-fn get_video_protocol(stream_type: &str) -> StreamProtocol {
+pub fn get_video_protocol(stream_type: &str) -> StreamProtocol {
     match stream_type {
         "sub" => stream_protocols::VIDEO_SUB_PROTOCOL,
         "third" => stream_protocols::VIDEO_THIRD_PROTOCOL,
@@ -755,6 +755,45 @@ impl MediaPlayer {
         }
     }
 
+    /// 等待首个关键帧的最长时间（最后安全网）。正常情况下门控由 `is_nal_keyframe` 扫描
+    /// 字节流里的真实 IDR NAL 立即开门（cam 在 `request_idr` 后很快产出真 IDR），不会等到这里。
+    /// 仅当字节扫描也异常时才兜底强制开门，避免 `!got_first_idr` 门控永久不开 → 黑屏。
+    /// 3s 足够覆盖一个 GOP 周期（gop=50@25fps≈2s），正常绝不触发。
+    const IDR_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+    /// 从 Annex B 裸流扫描 NAL，判断是否为关键帧（IRAP）。
+    /// H.265: IRAP NAL type 16..=21 (BLA/IDR/CRA)；H.264: IDR NAL type 5。
+    /// 与 C 侧 `rk_camera.c` 的 `is_keyframe_h265/h264` 判定范围一致，但在 viewer 侧**独立扫描
+    /// 字节**，不依赖对端 `is_keyframe()` 标志位。日志实证：cam 发的 IDR 数据字节里确有 IRAP
+    /// NAL（ffmpeg 能据此恢复解码），但 `is_keyframe()` 标志常不可靠（8s 内检测不到），
+    /// 故必须用本函数扫字节兜底——这是之前版本快速起播的关键，删掉它改用 `is_keyframe()`
+    /// 正是起播变慢（卡满超时）的根因。
+    fn is_nal_keyframe(data: &[u8]) -> bool {
+        let len = data.len();
+        let mut i = 0;
+        while i + 4 < len {
+            let hdr_off = if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 0 && data[i + 3] == 1 {
+                i + 4
+            } else if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
+                i + 3
+            } else {
+                i += 1;
+                continue;
+            };
+            let b = data[hdr_off];
+            let h265_type = (b >> 1) & 0x3F;
+            if (16..=21).contains(&h265_type) {
+                return true;
+            }
+            let h264_type = b & 0x1F;
+            if h264_type == 5 {
+                return true;
+            }
+            i = hdr_off + 1;
+        }
+        false
+    }
+
     /// 从 stream 持续读取帧，送入 channel
     /// EOF 或读错误时通过 event_sender 发送 Disconnected 通知
     async fn receive_frames(
@@ -769,6 +808,8 @@ impl MediaPlayer {
         // "Player error" (Android MediaCodec / ffmpeg 均无法从无参考的 P/B 帧开始解码)。
         // 收到第一个关键帧后恢复正常转发。
         let mut got_first_idr = false;
+        // 收到首个视频包的时间，用于 IDR 等待超时兜底
+        let mut first_video_at: Option<std::time::Instant> = None;
 
         loop {
             match stream.read(&mut read_buf).await {
@@ -785,16 +826,30 @@ impl MediaPlayer {
                     // 尝试解码所有完整的包
                     while let Some(packet) = MediaPacket::try_decode(&mut buf) {
                         // 仅对视频流做 IDR 容错；音频始终透传。
-                        // 真实设备流的 is_keyframe 来自 RK VENC 硬编码标记, 可靠;
-                        // 且每个 IDR 自带 VPS/SPS/PPS, 无需 viewer 侧再扫描 NAL 兜底。
+                        // 关键帧判定: `is_keyframe()`(对端标志, 实测常不可靠) || `Self::is_nal_keyframe`(扫字节, 可靠)。
+                        // 之前版本用字节扫描起播很快; 后来误删字节扫描、改信 `is_keyframe()` 标志,
+                        // 导致门控等不到关键帧、卡满整个超时才强制开门 → 起播极慢。
                         // 收到首个 IDR 前的非关键帧直接丢弃(解码器无参考帧会报错),
                         // 收到首个 IDR 后恢复正常转发。
                         if packet.track == MediaTrack::Video && !got_first_idr {
-                            if packet.is_keyframe() {
+                            if first_video_at.is_none() {
+                                first_video_at = Some(std::time::Instant::now());
+                            }
+                            let is_kf =
+                                packet.is_keyframe() || Self::is_nal_keyframe(&packet.data);
+                            let waited = first_video_at.map(|t| t.elapsed());
+                            if is_kf || waited.map_or(false, |w| w >= Self::IDR_WAIT_TIMEOUT) {
                                 got_first_idr = true;
-                                tracing::info!(
-                                    "[Viewer] First IDR received, video decode started (dropped pre-IDR non-keyframes)"
-                                );
+                                if is_kf {
+                                    tracing::info!(
+                                        "[Viewer] First IDR received, video decode started (dropped pre-IDR non-keyframes)"
+                                    );
+                                } else {
+                                    tracing::warn!(
+                                        "[Viewer] No IDR within {:?}, forwarding video anyway (cam keyframe flag may be unreliable)",
+                                        Self::IDR_WAIT_TIMEOUT
+                                    );
+                                }
                             } else {
                                 // 首个 IDR 前的非关键帧：解码器无参考帧，直接丢弃
                                 tracing::debug!(
@@ -897,7 +952,7 @@ impl ViewerBehaviour {
 }
 
 /// 检查两个 IPv4 地址是否在同一 /24 子网
-fn is_same_subnet(a: Ipv4Addr, b: Ipv4Addr) -> bool {
+pub fn is_same_subnet(a: Ipv4Addr, b: Ipv4Addr) -> bool {
     let a = u32::from(a);
     let b = u32::from(b);
     (a & 0xFFFFFF00) == (b & 0xFFFFFF00)
