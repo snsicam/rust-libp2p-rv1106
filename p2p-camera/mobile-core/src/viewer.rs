@@ -755,34 +755,6 @@ impl MediaPlayer {
         }
     }
 
-    /// 从 HEVC access unit 判断是否包含可随机访问的关键帧 (IRAP)。
-    /// 不依赖对端 `is_keyframe` 标记（FileVideoSource 仅标记 IDR 19/20，漏 CRA 21），
-    /// 直接解析 NAL type: BLA(16-18), IDR(19-20), CRA(21)。
-    fn is_hevc_irap(au: &[u8]) -> bool {
-        let n = au.len();
-        let mut i = 0;
-        while i + 4 < n {
-            let b0 = au.get(i).copied().unwrap_or(0);
-            let b1 = au.get(i + 1).copied().unwrap_or(0);
-            let b2 = au.get(i + 2).copied().unwrap_or(0);
-            let b3 = au.get(i + 3).copied().unwrap_or(0);
-            let (_sc_len, nal_pos) = if b0 == 0 && b1 == 0 && b2 == 0 && b3 == 1 {
-                (4usize, i + 4)
-            } else if b0 == 0 && b1 == 0 && b2 == 1 {
-                (3usize, i + 3)
-            } else {
-                i += 1;
-                continue;
-            };
-            let nal_type = (au.get(nal_pos).copied().unwrap_or(0) >> 1) & 0x3F;
-            if (16..=21).contains(&nal_type) {
-                return true;
-            }
-            i = nal_pos + 1;
-        }
-        false
-    }
-
     /// 从 stream 持续读取帧，送入 channel
     /// EOF 或读错误时通过 event_sender 发送 Disconnected 通知
     async fn receive_frames(
@@ -812,20 +784,18 @@ impl MediaPlayer {
 
                     // 尝试解码所有完整的包
                     while let Some(packet) = MediaPacket::try_decode(&mut buf) {
-                        // 仅对视频流做 IDR 容错；音频始终透传
-                        if packet.track == MediaTrack::Video {
-                            // 关键帧判定：优先用对端标记，并兜底解析 NAL type。
-                            // FileVideoSource 的 is_keyframe 仅标记 IDR(19/20)，漏 CRA(21)，
-                            // 直接信任标记会导致首个关键帧（CRA）被误判为非关键帧而永久丢弃。
-                            let is_key = packet.is_keyframe() || Self::is_hevc_irap(packet.data.as_ref());
-                            if is_key {
-                                if !got_first_idr {
-                                    got_first_idr = true;
-                                    tracing::info!(
-                                        "[Viewer] First IDR received, video decode started (dropped pre-IDR non-keyframes)"
-                                    );
-                                }
-                            } else if !got_first_idr {
+                        // 仅对视频流做 IDR 容错；音频始终透传。
+                        // 真实设备流的 is_keyframe 来自 RK VENC 硬编码标记, 可靠;
+                        // 且每个 IDR 自带 VPS/SPS/PPS, 无需 viewer 侧再扫描 NAL 兜底。
+                        // 收到首个 IDR 前的非关键帧直接丢弃(解码器无参考帧会报错),
+                        // 收到首个 IDR 后恢复正常转发。
+                        if packet.track == MediaTrack::Video && !got_first_idr {
+                            if packet.is_keyframe() {
+                                got_first_idr = true;
+                                tracing::info!(
+                                    "[Viewer] First IDR received, video decode started (dropped pre-IDR non-keyframes)"
+                                );
+                            } else {
                                 // 首个 IDR 前的非关键帧：解码器无参考帧，直接丢弃
                                 tracing::debug!(
                                     "[Viewer] Drop pre-IDR non-keyframe ({} bytes) to avoid decode error",

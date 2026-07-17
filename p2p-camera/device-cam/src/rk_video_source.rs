@@ -135,36 +135,6 @@ static GLOBAL_START_TIMES: [Mutex<Option<Instant>>; MAX_CHN] = [
     Mutex::new(None),
 ];
 
-/// 将 Annex B raw buffer 按 start code (00 00 00 01 或 00 00 01) 切分为独立 NAL。
-/// 返回的切片不含起始码本身，便于直接判断 NAL type。
-fn split_nals(buf: &[u8]) -> Vec<&[u8]> {
-    let mut nals = Vec::new();
-    let mut start: Option<usize> = None;
-    let mut i = 0usize;
-    while i + 3 < buf.len() {
-        let sc_len = if buf[i] == 0 && buf[i + 1] == 0 && buf[i + 2] == 0 && buf[i + 3] == 1 {
-            Some(4)
-        } else if buf[i] == 0 && buf[i + 1] == 0 && buf[i + 2] == 1 {
-            Some(3)
-        } else {
-            None
-        };
-        if let Some(len) = sc_len {
-            if let Some(s) = start {
-                nals.push(&buf[s..i]);
-            }
-            start = Some(i + len);
-            i += len;
-        } else {
-            i += 1;
-        }
-    }
-    if let Some(s) = start {
-        nals.push(&buf[s..]);
-    }
-    nals
-}
-
 /// C 帧回调 — 在 VENC 取流线程中调用
 /// chn_id: 0=main, 1=sub, 2=third
 extern "C" fn on_frame(
@@ -186,26 +156,9 @@ extern "C" fn on_frame(
     // VPS/SPS/PPS(见 test-data/output.h265 分析), 新 viewer 等到首个 IDR 即可直接解码,
     // 无需额外补发 init_nals, 也避免了 init_nals 被误标关键帧导致的开屏花屏。
     let is_keyframe = is_keyframe_c == 1;
-    let nals = split_nals(slice);
-    let mut is_h265 = false;
-    for nal in &nals {
-        let h = match nal.first() {
-            Some(&b) => b,
-            None => continue,
-        };
-        // H.265: (b >> 1) & 0x3F → 6-bit type; 只要出现 H.265 的 param set/IRAP
-        // (type>=16) 即判定为 H.265 (用于日志)。
-        let h265_type = (h >> 1) & 0x3F;
-        if h265_type >= 16 {
-            is_h265 = true;
-        }
-    }
 
     if is_keyframe {
-        tracing::info!(
-            "[rk_video] keyframe: chn={}, is_h265={}, len={}",
-            chn, is_h265, len
-        );
+        tracing::debug!("[rk_video] keyframe: chn={}, len={}",chn, len);
     }
 
     let timestamp_ms = GLOBAL_START_TIMES[chn].lock()

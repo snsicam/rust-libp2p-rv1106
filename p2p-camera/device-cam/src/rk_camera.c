@@ -511,9 +511,6 @@ static void *get_stream_thread(void *arg) {
     int chn_id = (int)(intptr_t)arg;
     VENC_STREAM_S stFrame;
     stFrame.pstPack = (VENC_PACK_S *)malloc(sizeof(VENC_PACK_S));
-    int loopCount = 0;
-    int first_logged = 0;
-    time_t last_hb = 0;
 
     printf("[rk_camera] stream thread[%d] started\n", chn_id);
 
@@ -538,32 +535,12 @@ static void *get_stream_thread(void *arg) {
                 g_callback(chn_id, (const uint8_t *)pData, u32Len, u64PTS, is_kf);
             }
 
-            // 首帧只打印一次 (符合"first frame"语义)；之后用正确命名的周期性心跳。
-            // 心跳以 300 帧为触发条件，但再加最小时间间隔闸门(5s)，使日志频率与帧率解耦：
-            // 正常帧率(10~30fps)下仍"每 300 帧"打一次；若 GetStream 高速 busy-loop
-            // (无真实视频源时常见) 导致 loopCount 毫秒级暴涨，也不会洪水式打印。
-            if (!first_logged) {
-                printf("[rk_camera] first frame[%d]: len=%u pts=%llu keyframe=%d\n",
-                       chn_id, u32Len, (unsigned long long)u64PTS, is_kf);
-                first_logged = 1;
-                last_hb = time(NULL);
-            } else if (loopCount % (30 * 10) == 0) {
-                time_t now = time(NULL);
-                if (now - last_hb >= 5) {
-                    printf("[rk_camera] heartbeat[%d]: len=%u pts=%llu keyframe=%d frames=%d\n",
-                           chn_id, u32Len, (unsigned long long)u64PTS, is_kf, loopCount);
-                    last_hb = now;
-                }
-            }
-            loopCount++;
-
             RK_MPI_VENC_ReleaseStream(chn_id, &stFrame);
         } else {
             usleep(10 * 1000);
         }
     }
 
-    printf("[rk_camera] stream thread[%d] exit, total frames=%d\n", chn_id, loopCount);
     free(stFrame.pstPack);
     return NULL;
 }
@@ -864,7 +841,6 @@ static audio_callback_t g_audio_callback = NULL;
 static void *audio_get_stream_thread(void *arg) {
     (void)arg;
     AUDIO_FRAME_S frame;
-    int loopCount = 0;
 
     printf("[rk_camera] audio PCM thread started\n");
 
@@ -878,18 +854,12 @@ static void *audio_get_stream_thread(void *arg) {
                 g_audio_callback((const uint8_t *)pData, u32Len, 0);
             }
 
-            if (loopCount == 0) {
-                printf("[rk_camera] first audio PCM frame: len=%u\n", u32Len);
-            }
-            loopCount++;
-
             RK_MPI_AI_ReleaseFrame(AI_DEV_ID, AI_CHN_ID, &frame, RK_NULL);
         } else {
             usleep(10 * 1000);
         }
     }
 
-    printf("[rk_camera] audio PCM thread exit, total frames=%d\n", loopCount);
     return NULL;
 }
 
@@ -898,7 +868,6 @@ static void *audio_get_stream_thread(void *arg) {
 static void *aenc_get_stream_thread(void *arg) {
     (void)arg;
     AUDIO_STREAM_S stream;
-    int loopCount = 0;
 
     printf("[rk_camera] audio AENC thread started\n");
 
@@ -912,19 +881,12 @@ static void *aenc_get_stream_thread(void *arg) {
                 g_audio_callback((const uint8_t *)pData, u32Len, stream.u64TimeStamp);
             }
 
-            if (loopCount == 0) {
-                printf("[rk_camera] first audio AENC frame: len=%u pts=%llu\n",
-                       u32Len, (unsigned long long)stream.u64TimeStamp);
-            }
-            loopCount++;
-
             RK_MPI_AENC_ReleaseStream(AENC_CHN_ID, &stream);
         } else {
             usleep(10 * 1000);
         }
     }
 
-    printf("[rk_camera] audio AENC thread exit, total frames=%d\n", loopCount);
     return NULL;
 }
 

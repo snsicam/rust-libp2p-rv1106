@@ -1368,7 +1368,7 @@ fn process_video_frame(
 
     #[cfg(feature = "player")]
     if let Some(p) = player {
-        match p.render(&packet.data) {
+        match p.render(&packet.data, packet.is_keyframe()) {
             Ok(action) => return action,
             Err(e) => {
                 tracing::error!("[Viewer] Player error: {e}");
@@ -1377,35 +1377,6 @@ fn process_video_frame(
     }
 
     RenderAction::Continue
-}
-
-/// 从 stream 持续读取帧
-/// 从 HEVC access unit 判断是否包含可随机访问的关键帧 (IRAP)。
-/// 不依赖对端 `is_keyframe` 标记（FileVideoSource 仅标记 IDR 19/20，漏 CRA 21），
-/// 直接解析 NAL type: BLA(16-18), IDR(19-20), CRA(21)。
-fn is_hevc_irap(au: &[u8]) -> bool {
-    let n = au.len();
-    let mut i = 0;
-    while i + 4 < n {
-        let b0 = au.get(i).copied().unwrap_or(0);
-        let b1 = au.get(i + 1).copied().unwrap_or(0);
-        let b2 = au.get(i + 2).copied().unwrap_or(0);
-        let b3 = au.get(i + 3).copied().unwrap_or(0);
-        let (_sc_len, nal_pos) = if b0 == 0 && b1 == 0 && b2 == 0 && b3 == 1 {
-            (4usize, i + 4)
-        } else if b0 == 0 && b1 == 0 && b2 == 1 {
-            (3usize, i + 3)
-        } else {
-            i += 1;
-            continue;
-        };
-        let nal_type = (au.get(nal_pos).copied().unwrap_or(0) >> 1) & 0x3F;
-        if (16..=21).contains(&nal_type) {
-            return true;
-        }
-        i = nal_pos + 1;
-    }
-    false
 }
 
 async fn receive_frames(
@@ -1433,20 +1404,18 @@ async fn receive_frames(
             Ok(n) => {
                 buf.extend_from_slice(&read_buf[..n]);
                 while let Some(packet) = MediaPacket::try_decode(&mut buf) {
-                    // 仅对视频流做 IDR 容错；音频始终透传
-                    if packet.track == MediaTrack::Video {
-                        // 关键帧判定：优先用对端标记，并兜底解析 NAL type。
-                        // FileVideoSource 的 is_keyframe 仅标记 IDR(19/20)，漏 CRA(21)，
-                        // 直接信任标记会导致首个关键帧（CRA）被误判为非关键帧而永久丢弃。
-                        let is_key = packet.is_keyframe() || is_hevc_irap(packet.data.as_ref());
-                        if is_key {
-                            if !got_first_idr {
-                                got_first_idr = true;
-                                tracing::info!(
-                                    "[Viewer] First IDR received, video decode started (dropped pre-IDR non-keyframes)"
-                                );
-                            }
-                        } else if !got_first_idr {
+                    // 仅对视频流做 IDR 容错；音频始终透传。
+                    // 真实设备流的 is_keyframe 来自 RK VENC 硬编码标记, 可靠;
+                    // 且每个 IDR 自带 VPS/SPS/PPS, 无需 viewer 侧再扫描 NAL 兜底。
+                    // 收到首个 IDR 前的非关键帧直接丢弃(解码器无参考帧会报错),
+                    // 收到首个 IDR 后恢复正常转发。
+                    if packet.track == MediaTrack::Video && !got_first_idr {
+                        if packet.is_keyframe() {
+                            got_first_idr = true;
+                            tracing::info!(
+                                "[Viewer] First IDR received, video decode started (dropped pre-IDR non-keyframes)"
+                            );
+                        } else {
                             // 首个 IDR 前的非关键帧：解码器无参考帧，直接丢弃
                             tracing::debug!(
                                 "[Viewer] Drop pre-IDR non-keyframe ({} bytes) to avoid decode error",
@@ -1574,34 +1543,6 @@ mod player {
     use sdl2::event::Event;
     use sdl2::event::WindowEvent;
 
-    /// 从 HEVC access unit 数据中判断是否包含可随机访问的关键帧 (IRAP)
-    ///
-    /// IRAP 类型: BLA(16-18), IDR(19-20), CRA(21) — 均可作为解码起点。
-    /// 与 `MediaPacket::is_keyframe()` 的判定范围 (16-21) 保持一致，
-    /// 避免把 CRA 等关键帧误判为非关键帧而跳过。
-    fn is_hevc_idr(au: &[u8]) -> bool {
-        let mut i = 0;
-        while i + 4 < au.len() {
-            if au[i] == 0 && au[i + 1] == 0 {
-                let sc_len = if i + 3 < au.len() && au[i + 2] == 0 && au[i + 3] == 1 {
-                    4
-                } else if au[i + 2] == 1 {
-                    3
-                } else {
-                    i += 1;
-                    continue;
-                };
-                let nal_type = (au[i + sc_len] >> 1) & 0x3F;
-                if (16..=21).contains(&nal_type) {
-                    return true;
-                }
-                i += sc_len + 1;
-            } else {
-                i += 1;
-            }
-        }
-        false
-    }
     use sdl2::keyboard::Keycode;
     use sdl2::pixels::PixelFormatEnum;
     use sdl2::rect::Rect;
@@ -1716,8 +1657,10 @@ mod player {
             })
         }
 
-        /// 渲染一个 H.265 access unit, 返回 RenderAction 表示渲染结果和窗口状态
-        pub fn render(&mut self, au: &[u8]) -> Result<RenderAction> {
+        /// 渲染一个 H.265 access unit, 返回 RenderAction 表示渲染结果和窗口状态。
+        /// `is_keyframe` 由调用方从 MediaPacket 标志传入(RK VENC 硬编码, 可靠),
+        /// 无需播放器再扫描 NAL。
+        pub fn render(&mut self, au: &[u8], is_keyframe: bool) -> Result<RenderAction> {
             for event in self.event_pump.poll_iter() {
                 match event {
                     Event::Quit { .. }
@@ -1748,10 +1691,9 @@ mod player {
             // 最小化时 session 已被 abort，不会有新帧进来，此处仅作防御性处理
             let skip_render = self.minimized;
 
-            // 解码器 flush 后等待关键帧：从 NAL 数据判断是否为 IDR，跳过非关键帧避免花屏
+            // 解码器 flush 后等待关键帧：跳过非关键帧避免花屏
             if self.waiting_for_keyframe {
-                let is_idr = is_hevc_idr(au);
-                if !is_idr {
+                if !is_keyframe {
                     return Ok(RenderAction::Continue);
                 }
                 self.waiting_for_keyframe = false;
