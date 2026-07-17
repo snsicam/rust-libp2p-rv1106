@@ -238,10 +238,10 @@ extern "C" fn on_frame(
         }
     }
 
-    if is_keyframe {
+    if is_keyframe||_is_keyframe_c==1 {
         tracing::info!(
-            "[rk_video] keyframe: chn={}, is_h265={}, len={}, _is_keyframe_c={}",
-            chn, is_h265, len,_is_keyframe_c
+            "[rk_video] keyframe: chn={}, is_h265={}, len={}, _is_keyframe_c={} is_keyframe={}",
+            chn, is_h265, len,_is_keyframe_c,is_keyframe
         );
     }
 

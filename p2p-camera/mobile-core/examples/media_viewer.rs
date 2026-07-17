@@ -1707,7 +1707,12 @@ mod player {
                 height: 0,
                 frame_count: 0,
                 minimized: false,
-                waiting_for_keyframe: false,
+                // 首帧同样先等真正的 IDR 再解码：设备新流建立时会先发标了关键帧的
+                // VPS/SPS/PPS 独立包，并在 request_idr 后才产出真 IDR，其间 broadcast
+                // 里排队的 GOP 中段 P 帧会被转发过来。若此处不门控，这些无参考 P 帧
+                // 会直接进空解码器，触发 "Could not find ref with POC" 花屏（马赛克一下）。
+                // 置 true 与重连后 reset_decoder() 行为一致：丢弃一切直到真 IDR。
+                waiting_for_keyframe: true,
             })
         }
 
