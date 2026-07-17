@@ -148,6 +148,36 @@ static GLOBAL_START_TIMES: [Mutex<Option<Instant>>; MAX_CHN] = [
     Mutex::new(None),
 ];
 
+/// 将 Annex B raw buffer 按 start code (00 00 00 01 或 00 00 01) 切分为独立 NAL。
+/// 返回的切片不含起始码本身，便于直接判断 NAL type 与缓存参数集。
+fn split_nals(buf: &[u8]) -> Vec<&[u8]> {
+    let mut nals = Vec::new();
+    let mut start: Option<usize> = None;
+    let mut i = 0usize;
+    while i + 3 < buf.len() {
+        let sc_len = if buf[i] == 0 && buf[i + 1] == 0 && buf[i + 2] == 0 && buf[i + 3] == 1 {
+            Some(4)
+        } else if buf[i] == 0 && buf[i + 1] == 0 && buf[i + 2] == 1 {
+            Some(3)
+        } else {
+            None
+        };
+        if let Some(len) = sc_len {
+            if let Some(s) = start {
+                nals.push(&buf[s..i]);
+            }
+            start = Some(i + len);
+            i += len;
+        } else {
+            i += 1;
+        }
+    }
+    if let Some(s) = start {
+        nals.push(&buf[s..]);
+    }
+    nals
+}
+
 /// C 帧回调 — 在 VENC 取流线程中调用
 /// chn_id: 0=main, 1=sub, 2=third
 extern "C" fn on_frame(
@@ -158,57 +188,61 @@ extern "C" fn on_frame(
     if chn >= MAX_CHN { return; }
 
     let slice = unsafe { std::slice::from_raw_parts(data, len as usize) };
-    let first_byte = slice.first().copied().unwrap_or(0);
 
-    // 提取 NAL unit type:
-    //   H.265: (b >> 1) & 0x3F → 6-bit type [0..63]
-    //   H.264: b & 0x1F        → 5-bit type [0..31]
-    // 区分方法: H.265 的 param set 类型为 32-34、H.264 为 7-8;
-    //           H.265 IDR 类型为 19, H.264 IDR 为 5
-    let h265_nal = ((first_byte >> 1) & 0x3F) as u8;
-    let h264_nal = (first_byte & 0x1F) as u8;
-
-    // 通过 NAL type 判断编码类型
-    // H.265: VPS=32, SPS=33, PPS=34, IDR≥16;  H.264: 所有类型 ≤ 15 (h265_nal ← (b>>1)&0x3F)
-    let is_h265 = h265_nal >= 16;
-    let nal_type = if is_h265 { h265_nal } else { h264_nal };
-
-    // 从帧数据直接判断关键帧 (不依赖 C 参数, 更可靠)
-    let is_keyframe = if is_h265 {
-        // H.265 IRAP: BLA(16-18), IDR(19-20), CRA(21)
-        nal_type >= 16 && nal_type <= 21
-    } else {
-        // H.264 IDR: type 5
-        nal_type == 5
-    };
+    // VENC pack_mode=0 时, 一个 pack 内含多个 NAL (VPS/SPS/PPS/IDR...), 且每个 NAL 前带
+    // Annex B start code (00 00 00 01 或 00 00 01)。因此:
+    //   - 不能取 slice.first() 当 NAL header (那是 start code 的 0x00);
+    //   - 也不能只读第一个 NAL (H.265 IDR 帧的首个 NAL 是 VPS, 而非 IDR)。
+    // 正确做法: 切分 NAL, 逐 NAL 判断编码类型/关键帧, 并缓存参数集。
+    // (与 C 侧 rk_camera.c 的 is_keyframe_h265/h264 扫描逻辑一致)
+    let nals = split_nals(slice);
+    let mut is_h265 = false;
+    let mut is_keyframe = false;
+    for nal in &nals {
+        let h = match nal.first() {
+            Some(&b) => b,
+            None => continue,
+        };
+        // H.265: (b >> 1) & 0x3F → 6-bit type;  H.264: b & 0x1F → 5-bit type
+        let h265_type = (h >> 1) & 0x3F;
+        let h264_type = h & 0x1F;
+        // 只要出现 H.265 的 param set/IRAP (type>=16) 即判定为 H.265
+        if h265_type >= 16 {
+            is_h265 = true;
+        }
+        // 关键帧: H.265 IRAP(16-21) 或 H.264 IDR(5)
+        if (is_h265 && h265_type >= 16 && h265_type <= 21)
+           || (!is_h265 && h264_type == 5) {
+            is_keyframe = true;
+        }
+        // 缓存参数集 (逐 NAL, 去掉重复类型)
+        let is_param_set = if is_h265 {
+            h265_type == 32 || h265_type == 33 || h265_type == 34 // VPS/SPS/PPS
+        } else {
+            h264_type == 7 || h264_type == 8 // SPS/PPS
+        };
+        if is_param_set {
+            if let Ok(mut all) = GLOBAL_PARAM_SETS.lock() {
+                while all.len() <= chn { all.push(Vec::new()); }
+                let ps = &mut all[chn];
+                ps.retain(|n| {
+                    let b = n.first().copied().unwrap_or(0);
+                    if is_h265 {
+                        ((b >> 1) & 0x3F) as u8 != h265_type
+                    } else {
+                        (b & 0x1F) as u8 != h264_type
+                    }
+                });
+                ps.push(nal.to_vec());
+            }
+        }
+    }
 
     if is_keyframe {
         tracing::info!(
             "[rk_video] keyframe: chn={}, is_h265={}, len={}, _is_keyframe_c={}",
             chn, is_h265, len,_is_keyframe_c
         );
-    }
-
-    // 缓存参数集 (区分 H.265/H.264 的 param set NAL type)
-    let is_param_set = if is_h265 {
-        nal_type == 32 || nal_type == 33 || nal_type == 34 // VPS/SPS/PPS
-    } else {
-        nal_type == 7 || nal_type == 8 // SPS/PPS
-    };
-    if is_param_set {
-        if let Ok(mut all) = GLOBAL_PARAM_SETS.lock() {
-            while all.len() <= chn { all.push(Vec::new()); }
-            let ps = &mut all[chn];
-            ps.retain(|n| {
-                let b = n.first().copied().unwrap_or(0);
-                if is_h265 {
-                    ((b >> 1) & 0x3F) as u8 != nal_type
-                } else {
-                    (b & 0x1F) as u8 != nal_type
-                }
-            });
-            ps.push(slice.to_vec());
-        }
     }
 
     let timestamp_ms = GLOBAL_START_TIMES[chn].lock()

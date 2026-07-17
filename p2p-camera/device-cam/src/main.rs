@@ -345,6 +345,11 @@ async fn main() -> Result<()> {
     }
 
     // ---- 事件循环 ----
+    // 活跃视频/音频发送任务注册表: (PeerId, 流类型) -> 任务句柄
+    // 用于同 peer 同路流去重: viewer 最小化/重连可能重复打开同一路流,
+    // 若不及时 abort 旧任务, 会出现多路流同时推送 (两路视频流打架)。
+    let mut active_streams: HashMap<(PeerId, &str), tokio::task::JoinHandle<()>> = HashMap::new();
+
     loop {
         tokio::select! {
             // Swarm 事件 (与之前相同)
@@ -632,43 +637,72 @@ async fn main() -> Result<()> {
             // 主码流请求
             main_video = incoming_main.next() => {
                 if let Some((peer_id, stream)) = main_video {
-                    let rx = main_tx.subscribe();
                     let conn_type = peer_conn_type.get(&peer_id).map(|s| s.as_str()).unwrap_or("Unknown");
                     println!("[DeviceCam] New MAIN video viewer: {peer_id} via {conn_type}");
+                    // 同 peer 同路流去重: 新请求到达时先 abort 旧任务, 避免多路流打架
+                    let key = (peer_id, "main");
+                    match active_streams.get(&key).map(|h| h.is_finished()) {
+                        Some(true) => { active_streams.remove(&key); }
+                        Some(false) => { active_streams.get(&key).unwrap().abort(); }
+                        None => {}
+                    }
+                    let rx = main_tx.subscribe();
                     let init_nals = get_init_nals(0);
-                    tokio::spawn(stream_video_to_viewer(peer_id, stream, rx, init_nals, "main"));
+                    let handle = tokio::spawn(stream_video_to_viewer(peer_id, stream, rx, init_nals, "main"));
+                    active_streams.insert(key, handle);
                 }
             }
 
             // 子码流请求
             sub_video = incoming_sub.next() => {
                 if let Some((peer_id, stream)) = sub_video {
-                    let rx = sub_tx.subscribe();
                     let conn_type = peer_conn_type.get(&peer_id).map(|s| s.as_str()).unwrap_or("Unknown");
                     println!("[DeviceCam] New SUB video viewer: {peer_id} via {conn_type}");
+                    let key = (peer_id, "sub");
+                    match active_streams.get(&key).map(|h| h.is_finished()) {
+                        Some(true) => { active_streams.remove(&key); }
+                        Some(false) => { active_streams.get(&key).unwrap().abort(); }
+                        None => {}
+                    }
+                    let rx = sub_tx.subscribe();
                     let init_nals = get_init_nals(1);
-                    tokio::spawn(stream_video_to_viewer(peer_id, stream, rx, init_nals, "sub"));
+                    let handle = tokio::spawn(stream_video_to_viewer(peer_id, stream, rx, init_nals, "sub"));
+                    active_streams.insert(key, handle);
                 }
             }
 
             // 第三码流请求
             third_video = incoming_third.next() => {
                 if let Some((peer_id, stream)) = third_video {
-                    let rx = third_tx.subscribe();
                     let conn_type = peer_conn_type.get(&peer_id).map(|s| s.as_str()).unwrap_or("Unknown");
                     println!("[DeviceCam] New THIRD video viewer: {peer_id} via {conn_type}");
+                    let key = (peer_id, "third");
+                    match active_streams.get(&key).map(|h| h.is_finished()) {
+                        Some(true) => { active_streams.remove(&key); }
+                        Some(false) => { active_streams.get(&key).unwrap().abort(); }
+                        None => {}
+                    }
+                    let rx = third_tx.subscribe();
                     let init_nals = get_init_nals(2);
-                    tokio::spawn(stream_video_to_viewer(peer_id, stream, rx, init_nals, "third"));
+                    let handle = tokio::spawn(stream_video_to_viewer(peer_id, stream, rx, init_nals, "third"));
+                    active_streams.insert(key, handle);
                 }
             }
 
             // 音频
             audio = incoming_audio.next() => {
                 if let Some((peer_id, stream)) = audio {
-                    let rx = audio_tx.subscribe();
                     let conn_type = peer_conn_type.get(&peer_id).map(|s| s.as_str()).unwrap_or("Unknown");
                     println!("[DeviceCam] New audio viewer: {peer_id} via {conn_type}");
-                    tokio::spawn(stream_audio_to_viewer(peer_id, stream, rx));
+                    let key = (peer_id, "audio");
+                    match active_streams.get(&key).map(|h| h.is_finished()) {
+                        Some(true) => { active_streams.remove(&key); }
+                        Some(false) => { active_streams.get(&key).unwrap().abort(); }
+                        None => {}
+                    }
+                    let rx = audio_tx.subscribe();
+                    let handle = tokio::spawn(stream_audio_to_viewer(peer_id, stream, rx));
+                    active_streams.insert(key, handle);
                 } else {
                     tracing::error!("[DeviceCam] Audio stream accept channel closed");
                 }

@@ -45,7 +45,7 @@ use libp2p_stream;
 use mobile_core::net_diag::{NatDiagnostic, NatType};
 use proto::{media_packet::{MediaPacket, MediaTrack}, stream_protocols};
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tracing_subscriber::EnvFilter;
 
 const STREAM_READ_BUF: usize = 65536;
@@ -202,6 +202,8 @@ async fn main() -> Result<()> {
     let mut window_minimized = false;
     #[allow(unused_assignments)]
     let mut session_abort_handle: Option<tokio::task::AbortHandle> = None;
+    // 最小化时用于通知当前 session 优雅关闭连接的发送端
+    let mut session_shutdown_tx: Option<oneshot::Sender<()>> = None;
     // DCUtR 是否启用：默认启用（锥形/EIM NAT 可打洞成功，省中继带宽）。
     // 一旦会话内 net_diag 确认为 Symmetric NAT，后续重连传入 false 以跳过无效打洞。
     let mut enable_dcutr = true;
@@ -211,7 +213,7 @@ async fn main() -> Result<()> {
     println!("[Viewer] Local PeerId: {}", keypair.public().to_peer_id());
 
     // 启动初始 session (后台任务)
-    session_abort_handle = Some(spawn_session(
+    let (ah, stx) = spawn_session(
         relay_addrs.clone(),
         device_cam_str.clone(),
         no_audio,
@@ -224,7 +226,9 @@ async fn main() -> Result<()> {
         tx.clone(),
         audio_tx.clone(),
         session_tx.clone(),
-    ));
+    );
+    session_abort_handle = Some(ah);
+    session_shutdown_tx = Some(stx);
 
     println!("[Viewer] Receiving video frames... (Ctrl+C to stop)");
 
@@ -253,7 +257,7 @@ async fn main() -> Result<()> {
                             drain_audio_channel(&mut audio_rx, &mut audio_count,
                                 #[cfg(feature = "player")]
                                 audio_player.as_mut());
-                            session_abort_handle = Some(spawn_session(
+                            let (ah, stx) = spawn_session(
                                 relay_addrs.clone(),
                                 device_cam_str.clone(),
                                 no_audio,
@@ -266,7 +270,9 @@ async fn main() -> Result<()> {
                                 tx.clone(),
                                 audio_tx.clone(),
                                 session_tx.clone(),
-                            ));
+                            );
+                            session_abort_handle = Some(ah);
+                            session_shutdown_tx = Some(stx);
                             stream_disconnected = false;
                         }
                         #[cfg(feature = "player")]
@@ -295,7 +301,7 @@ async fn main() -> Result<()> {
                                 if let Some(p) = player.as_mut() {
                                     p.reset_decoder();
                                 }
-                                session_abort_handle = Some(spawn_session(
+                                let (ah, stx) = spawn_session(
                                     relay_addrs.clone(),
                                     device_cam_str.clone(),
                                     no_audio,
@@ -308,7 +314,9 @@ async fn main() -> Result<()> {
                                     tx.clone(),
                                     audio_tx.clone(),
                                     session_tx.clone(),
-                                ));
+                                );
+                                session_abort_handle = Some(ah);
+                                session_shutdown_tx = Some(stx);
                                 stream_disconnected = false;
                             } else {
                                 eprintln!("[Viewer] Window is minimized, will reconnect on restore");
@@ -334,7 +342,7 @@ async fn main() -> Result<()> {
                             drain_audio_channel(&mut audio_rx, &mut audio_count,
                                 #[cfg(feature = "player")]
                                 audio_player.as_mut());
-                            session_abort_handle = Some(spawn_session(
+                            let (ah, stx) = spawn_session(
                                 relay_addrs.clone(),
                                 device_cam_str.clone(),
                                 no_audio,
@@ -347,7 +355,9 @@ async fn main() -> Result<()> {
                                 tx.clone(),
                                 audio_tx.clone(),
                                 session_tx.clone(),
-                            ));
+                            );
+                            session_abort_handle = Some(ah);
+                            session_shutdown_tx = Some(stx);
                             stream_disconnected = false;
                         }
                         #[cfg(feature = "player")]
@@ -375,7 +385,7 @@ async fn main() -> Result<()> {
                                 if let Some(p) = player.as_mut() {
                                     p.reset_decoder();
                                 }
-                                session_abort_handle = Some(spawn_session(
+                                let (ah, stx) = spawn_session(
                                     relay_addrs.clone(),
                                     device_cam_str.clone(),
                                     no_audio,
@@ -388,7 +398,9 @@ async fn main() -> Result<()> {
                                     tx.clone(),
                                     audio_tx.clone(),
                                     session_tx.clone(),
-                                ));
+                                );
+                                session_abort_handle = Some(ah);
+                                session_shutdown_tx = Some(stx);
                                 stream_disconnected = false;
                             } else {
                                 eprintln!("[Viewer] Window is minimized, will reconnect on restore");
@@ -440,9 +452,15 @@ async fn main() -> Result<()> {
                                 // 恢复最大化时会重新连接，从关键帧开始，避免马赛克
                                 eprintln!("[Viewer] Window minimized, aborting session to save resources");
                                 stream_disconnected = true;
-                                // abort 当前 session task，停止收发数据
-                                if let Some(handle) = session_abort_handle.take() {
-                                    handle.abort();
+                                // 关键修复：仅 abort 会话任务(swarm)不够 —— receive_frames
+                                // 任务仍持有子流句柄，会导致 QUIC 连接处理任务不退出、
+                                // 连接不关闭，设备侧便持续推流（两路流打架）。
+                                // 故通过 shutdown 通道让 run_viewer_session 显式
+                                // abort receive_frames(释放子流) + disconnect_peer_id，
+                                // 真正关闭连接，使设备侧 stream_video_to_viewer 的
+                                // write_all 失败并停止推流。
+                                if let Some(tx) = session_shutdown_tx.take() {
+                                    let _ = tx.send(());
                                 }
                                 drain_channel(&mut rx, &mut frame_count, &mut bytes_received,
                                     &mut video_start, &mut output_file,
@@ -471,7 +489,7 @@ async fn main() -> Result<()> {
                                 if let Some(p) = player.as_mut() {
                                     p.reset_decoder();
                                 }
-                                session_abort_handle = Some(spawn_session(
+                                let (ah, stx) = spawn_session(
                                     relay_addrs.clone(),
                                     device_cam_str.clone(),
                                     no_audio,
@@ -484,7 +502,9 @@ async fn main() -> Result<()> {
                                     tx.clone(),
                                     audio_tx.clone(),
                                     session_tx.clone(),
-                                ));
+                                );
+                                session_abort_handle = Some(ah);
+                                session_shutdown_tx = Some(stx);
                                 stream_disconnected = false;
                             }
                         }
@@ -535,7 +555,7 @@ async fn main() -> Result<()> {
                                 if let Some(p) = player.as_mut() {
                                     p.reset_decoder();
                                 }
-                                session_abort_handle = Some(spawn_session(
+                                let (ah, stx) = spawn_session(
                                     relay_addrs.clone(),
                                     device_cam_str.clone(),
                                     no_audio,
@@ -548,7 +568,9 @@ async fn main() -> Result<()> {
                                     tx.clone(),
                                     audio_tx.clone(),
                                     session_tx.clone(),
-                                ));
+                                );
+                                session_abort_handle = Some(ah);
+                                session_shutdown_tx = Some(stx);
                                 stream_disconnected = false;
                             }
                         }
@@ -613,8 +635,10 @@ fn spawn_session(
     video_tx: mpsc::Sender<MediaPacket>,
     audio_tx: mpsc::Sender<MediaPacket>,
     event_tx: mpsc::Sender<SessionEvent>,
-) -> tokio::task::AbortHandle {
-    tokio::spawn(async move {
+) -> (tokio::task::AbortHandle, oneshot::Sender<()>) {
+    // 创建关闭信号通道：最小化时主循环发送 ()，run_viewer_session 据此优雅关流
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let handle = tokio::spawn(async move {
         let result = run_viewer_session(
             relay_addrs,
             &device_cam_str,
@@ -628,17 +652,19 @@ fn spawn_session(
             video_tx,
             audio_tx,
             event_tx.clone(),
+            shutdown_rx,
         ).await;
 
         match result {
-            Ok(()) => {} // 正常退出，event_tx drop 通知主循环
+            Ok(()) => {} // 正常退出（含最小化主动关闭），event_tx drop 通知主循环
             Err(e) => {
                 let _ = event_tx.send(SessionEvent::Disconnected {
                     reason: e.to_string(),
                 }).await;
             }
         }
-    }).abort_handle()
+    }).abort_handle();
+    (handle, shutdown_tx)
 }
 
 /// 重置帧率统计，在重连时调用
@@ -708,6 +734,11 @@ async fn run_viewer_session(
     video_tx: mpsc::Sender<MediaPacket>,
     audio_tx: mpsc::Sender<MediaPacket>,
     event_tx: mpsc::Sender<SessionEvent>,
+    // 最小化时主循环通过此通道通知 session 优雅关闭：
+    // 仅 abort 会话任务(swarm)不够 —— receive_frames 任务仍持有子流句柄，
+    // 会令 QUIC 连接处理任务不退出、连接不关闭，设备侧便持续推流。
+    // 必须显式 abort receive_frames(释放子流) 并 disconnect_peer_id 才能真正关流。
+    mut shutdown_rx: oneshot::Receiver<()>,
 ) -> Result<()> {
     let device_cam: PeerId = device_cam_str.parse()
         .context("Invalid camera PeerId")?;
@@ -1005,7 +1036,18 @@ async fn run_viewer_session(
         let event = if let Some(e) = event_queue.pop_front() {
             e
         } else {
-            swarm.select_next_some().await
+            tokio::select! {
+                // 最小化时主循环发来关闭信号：主动释放子流并断开连接，
+                // 让设备侧 stream_video_to_viewer 的 write_all 失败、停止推流。
+                _ = &mut shutdown_rx => {
+                    if let Some(h) = video_abort_handle.take() { h.abort(); }
+                    if let Some(h) = audio_abort_handle.take() { h.abort(); }
+                    let _ = swarm.disconnect_peer_id(device_cam);
+                    println!("[Viewer] Session shutdown (window minimized), closing connection to device");
+                    return Ok(());
+                }
+                ev = swarm.select_next_some() => ev,
+            }
         };
 
         match event {
