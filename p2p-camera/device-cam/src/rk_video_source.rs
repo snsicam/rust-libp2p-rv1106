@@ -119,17 +119,6 @@ pub fn request_idr_all() {
     unsafe { rk_camera_request_idr_all(); }
 }
 
-/// 获取指定通道缓存的 VPS/SPS/PPS
-pub fn get_param_sets(chn_id: usize) -> Vec<Vec<u8>> {
-    let all = GLOBAL_PARAM_SETS.lock().unwrap();
-    all.get(chn_id).cloned().unwrap_or_default()
-}
-
-/// 获取所有通道的参数集
-pub fn get_all_param_sets() -> Vec<Vec<Vec<u8>>> {
-    GLOBAL_PARAM_SETS.lock().unwrap().clone()
-}
-
 // ---- 全局状态 ----
 
 const MAX_CHN: usize = 3;
@@ -140,8 +129,6 @@ static GLOBAL_SENDERS: [Mutex<Option<Sender<MediaPacket>>>; MAX_CHN] = [
     Mutex::new(None),
     Mutex::new(None),
 ];
-/// 每通道缓存的 VPS/SPS/PPS
-static GLOBAL_PARAM_SETS: Mutex<Vec<Vec<Vec<u8>>>> = Mutex::new(Vec::new());
 static GLOBAL_START_TIMES: [Mutex<Option<Instant>>; MAX_CHN] = [
     Mutex::new(None),
     Mutex::new(None),
@@ -149,7 +136,7 @@ static GLOBAL_START_TIMES: [Mutex<Option<Instant>>; MAX_CHN] = [
 ];
 
 /// 将 Annex B raw buffer 按 start code (00 00 00 01 或 00 00 01) 切分为独立 NAL。
-/// 返回的切片不含起始码本身，便于直接判断 NAL type 与缓存参数集。
+/// 返回的切片不含起始码本身，便于直接判断 NAL type。
 fn split_nals(buf: &[u8]) -> Vec<&[u8]> {
     let mut nals = Vec::new();
     let mut start: Option<usize> = None;
@@ -182,7 +169,7 @@ fn split_nals(buf: &[u8]) -> Vec<&[u8]> {
 /// chn_id: 0=main, 1=sub, 2=third
 extern "C" fn on_frame(
     chn_id: std::ffi::c_int, data: *const u8, len: u32,
-    pts_us: u64, _is_keyframe_c: std::ffi::c_int,
+    pts_us: u64, is_keyframe_c: std::ffi::c_int,
 ) {
     let chn = chn_id as usize;
     if chn >= MAX_CHN { return; }
@@ -193,55 +180,31 @@ extern "C" fn on_frame(
     // Annex B start code (00 00 00 01 或 00 00 01)。因此:
     //   - 不能取 slice.first() 当 NAL header (那是 start code 的 0x00);
     //   - 也不能只读第一个 NAL (H.265 IDR 帧的首个 NAL 是 VPS, 而非 IDR)。
-    // 正确做法: 切分 NAL, 逐 NAL 判断编码类型/关键帧, 并缓存参数集。
-    // (与 C 侧 rk_camera.c 的 is_keyframe_h265/h264 扫描逻辑一致)
+    // 关键帧标志直接采用 C 回调传入的 is_keyframe_c(RK VENC 硬编码给出的判定,
+    // 实测与 Rust 侧扫描 NAL 结果始终一致且更权威)。
+    // 参数集(VPS/SPS/PPS)不再在此缓存: 实测 RK 编码器默认会在每个 IDR/CRA 前内联携带
+    // VPS/SPS/PPS(见 test-data/output.h265 分析), 新 viewer 等到首个 IDR 即可直接解码,
+    // 无需额外补发 init_nals, 也避免了 init_nals 被误标关键帧导致的开屏花屏。
+    let is_keyframe = is_keyframe_c == 1;
     let nals = split_nals(slice);
     let mut is_h265 = false;
-    let mut is_keyframe = false;
     for nal in &nals {
         let h = match nal.first() {
             Some(&b) => b,
             None => continue,
         };
-        // H.265: (b >> 1) & 0x3F → 6-bit type;  H.264: b & 0x1F → 5-bit type
+        // H.265: (b >> 1) & 0x3F → 6-bit type; 只要出现 H.265 的 param set/IRAP
+        // (type>=16) 即判定为 H.265 (用于日志)。
         let h265_type = (h >> 1) & 0x3F;
-        let h264_type = h & 0x1F;
-        // 只要出现 H.265 的 param set/IRAP (type>=16) 即判定为 H.265
         if h265_type >= 16 {
             is_h265 = true;
         }
-        // 关键帧: H.265 IRAP(16-21) 或 H.264 IDR(5)
-        if (is_h265 && h265_type >= 16 && h265_type <= 21)
-           || (!is_h265 && h264_type == 5) {
-            is_keyframe = true;
-        }
-        // 缓存参数集 (逐 NAL, 去掉重复类型)
-        let is_param_set = if is_h265 {
-            h265_type == 32 || h265_type == 33 || h265_type == 34 // VPS/SPS/PPS
-        } else {
-            h264_type == 7 || h264_type == 8 // SPS/PPS
-        };
-        if is_param_set {
-            if let Ok(mut all) = GLOBAL_PARAM_SETS.lock() {
-                while all.len() <= chn { all.push(Vec::new()); }
-                let ps = &mut all[chn];
-                ps.retain(|n| {
-                    let b = n.first().copied().unwrap_or(0);
-                    if is_h265 {
-                        ((b >> 1) & 0x3F) as u8 != h265_type
-                    } else {
-                        (b & 0x1F) as u8 != h264_type
-                    }
-                });
-                ps.push(nal.to_vec());
-            }
-        }
     }
 
-    if is_keyframe||_is_keyframe_c==1 {
+    if is_keyframe {
         tracing::info!(
-            "[rk_video] keyframe: chn={}, is_h265={}, len={}, _is_keyframe_c={} is_keyframe={}",
-            chn, is_h265, len,_is_keyframe_c,is_keyframe
+            "[rk_video] keyframe: chn={}, is_h265={}, len={}",
+            chn, is_h265, len
         );
     }
 
@@ -329,12 +292,6 @@ impl RkVideoSource {
             for i in 0..MAX_CHN {
                 let mut guard = GLOBAL_START_TIMES[i].lock().unwrap();
                 *guard = Some(Instant::now());
-            }
-
-            // 清除旧的 param_sets
-            {
-                let mut ps = GLOBAL_PARAM_SETS.lock().unwrap();
-                ps.clear();
             }
 
             // ---- 调用 C 侧 rk_camera_set_chn_config ----

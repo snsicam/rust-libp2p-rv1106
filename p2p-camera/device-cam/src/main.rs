@@ -32,7 +32,6 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use behaviour::Behaviour;
-use bytes::Bytes;
 use clap::Parser;
 use crossbeam_channel::Sender;
 use futures::{AsyncWriteExt, StreamExt};
@@ -647,8 +646,7 @@ async fn main() -> Result<()> {
                         None => {}
                     }
                     let rx = main_tx.subscribe();
-                    let init_nals = get_init_nals(0);
-                    let handle = tokio::spawn(stream_video_to_viewer(peer_id, stream, rx, init_nals, "main"));
+                    let handle = tokio::spawn(stream_video_to_viewer(peer_id, stream, rx, "main"));
                     active_streams.insert(key, handle);
                 }
             }
@@ -665,8 +663,7 @@ async fn main() -> Result<()> {
                         None => {}
                     }
                     let rx = sub_tx.subscribe();
-                    let init_nals = get_init_nals(1);
-                    let handle = tokio::spawn(stream_video_to_viewer(peer_id, stream, rx, init_nals, "sub"));
+                    let handle = tokio::spawn(stream_video_to_viewer(peer_id, stream, rx, "sub"));
                     active_streams.insert(key, handle);
                 }
             }
@@ -683,8 +680,7 @@ async fn main() -> Result<()> {
                         None => {}
                     }
                     let rx = third_tx.subscribe();
-                    let init_nals = get_init_nals(2);
-                    let handle = tokio::spawn(stream_video_to_viewer(peer_id, stream, rx, init_nals, "third"));
+                    let handle = tokio::spawn(stream_video_to_viewer(peer_id, stream, rx, "third"));
                     active_streams.insert(key, handle);
                 }
             }
@@ -747,19 +743,6 @@ async fn main() -> Result<()> {
     }
 }
 
-/// 获取初始化 NAL units (VPS/SPS/PPS)
-fn get_init_nals(chn_id: usize) -> Vec<Vec<u8>> {
-    #[cfg(feature = "rv1106")]
-    {
-        rk_video_source::get_param_sets(chn_id)
-    }
-    #[cfg(not(feature = "rv1106"))]
-    {
-        let _ = chn_id;
-        Vec::new()
-    }
-}
-
 /// 将 config::StreamConfig 转换为 rk_video_source::StreamParams
 #[cfg(feature = "rv1106")]
 fn stream_config_to_params(s: &config::StreamConfig) -> rk_video_source::StreamParams {
@@ -810,7 +793,6 @@ async fn stream_video_to_viewer(
     peer_id: PeerId,
     mut stream: libp2p::swarm::Stream,
     mut source: broadcast::Receiver<MediaPacket>,
-    init_nals: Vec<Vec<u8>>,
     stream_name: &str,
 ) {
     let mut frame_count: u64 = 0;
@@ -827,26 +809,6 @@ async fn stream_video_to_viewer(
     const WRITE_DCUTR_STALL_THRESHOLD_MS: u64 = 500;
     // write_all+flush 超过此时间则断开该 viewer（防止慢 viewer 阻塞帧发送）
     const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-
-    // 先发送 VPS/SPS/PPS
-    for nal in &init_nals {
-        let mut au_with_sc = Vec::with_capacity(4 + nal.len());
-        au_with_sc.extend_from_slice(&[0, 0, 0, 1]);
-        au_with_sc.extend_from_slice(nal);
-        let packet = MediaPacket::video(0, true, Bytes::from(au_with_sc));
-        let encoded = packet.encode();
-        if let Err(e) = stream.write_all(&encoded).await {
-            tracing::warn!("Init NAL write to {peer_id} failed: {e}");
-            return;
-        }
-    }
-    if !init_nals.is_empty() {
-        if let Err(e) = stream.flush().await {
-            tracing::warn!("Init flush to {peer_id} failed: {e}");
-            return;
-        }
-        println!("[DeviceCam] Sent {} init NALs to ..{peer_short} ({stream_name})", init_nals.len());
-    }
 
     // 新 Viewer 接入时主动请求一帧 IDR：
     // 若连接时编码器正处于 GOP 中段，broadcast 里先到的会是 P 帧，viewer
