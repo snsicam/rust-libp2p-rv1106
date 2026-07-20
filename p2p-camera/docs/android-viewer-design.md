@@ -482,7 +482,7 @@ Offset  Size  Field
 0       1     Track (0x01=Video, 0x02=Audio)
 1       8     Timestamp (ms, big-endian u64)
 9       1     Flags
-                Video: bit0=0→IDR关键帧, 1→非关键帧
+                Video: 保留 (置 0); 关键帧由接收端字节扫描判定, 不经此字段
                 Audio: bit0-1: 0→PCM16LE, 1→AAC, 2→G711A, 3→G711U
 10      4     DataLen (big-endian u32)
 14      N     Data (H.265 NAL units / audio samples)

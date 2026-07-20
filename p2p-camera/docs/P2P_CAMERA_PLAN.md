@@ -360,11 +360,11 @@ Track:
   0x03-0xFF = 保留 (未来扩展: 字幕、控制等)
 
 Flags (Track=0x01 视频):
-  bit 0: 0=IDR关键帧, 1=非关键帧
-  bit 1-7: 保留
+  保留 (置 0)。关键帧不再经此字段传递——接收端 (viewer) 自行扫描 NAL 字节判定
+  IDR (H.265 IRAP 16-21 / H.264 IDR 5), cam 侧不计算也不传该标志, JNI 桥也不转发。
 
 Flags (Track=0x02 音频):
-  bit 0-1: 音频格式 (0=PCM16LE, 1=AAC)
+  bit 0-1: 音频格式 (0=PCM16LE, 1=AAC, 2=G711A, 3=G711U)
   bit 2-7: 保留
 ```
 

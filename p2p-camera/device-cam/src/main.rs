@@ -864,9 +864,10 @@ async fn stream_video_to_viewer(
                                 let elapsed = start.elapsed().as_secs_f64();
                                 let fps = frame_count as f64 / elapsed;
                                 let kbps = (bytes_sent * 8) as f64 / elapsed / 1000.0;
-                                let keyframe = if packet.is_keyframe() { "[I]" } else { "   " };
+                                // 注意: cam 端已不再计算 keyframe 标志(见 rk_video_source.rs),
+                                // 关键帧判定改由 viewer 侧字节扫描完成, 故此处不再显示 [I] 标记。
                                 println!(
-                                    "[DeviceCam] {keyframe} frame #{} | {:.1} fps | {:.0} kbps | ts={} | ..{peer_short} {stream_name}",
+                                    "[DeviceCam] frame #{} | {:.1} fps | {:.0} kbps | ts={} | ..{peer_short} {stream_name}",
                                     frame_count, fps, kbps, packet.timestamp_ms
                                 );
                             }

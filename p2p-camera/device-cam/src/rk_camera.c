@@ -87,9 +87,11 @@ typedef struct {
 
 static ChnEncAttr g_chn_attr[VENC_MAX_CHN];
 
-// 帧回调: fn(chn_id, data, len, pts, is_keyframe)
+// 帧回调: fn(chn_id, data, len, pts)
+// 注意: 不再传 is_keyframe —— 关键帧判定改由 viewer 侧字节扫描完成,
+// cam 侧不计算(省 RV1106 每帧 CPU), 见 rk_video_source.rs。
 typedef void (*frame_callback_t)(int chn_id, const uint8_t *data, uint32_t len,
-                                  uint64_t pts, int is_keyframe);
+                                  uint64_t pts);
 static frame_callback_t g_callback = NULL;
 
 // ---- 辅助函数 ----
@@ -464,49 +466,6 @@ static int venc_init_single(int chn_id, int width, int height,
 
 // ---- VENC 取流线程 (每个通道一个) ----
 
-// 从 Annex B raw buffer 扫描 H.265 IRAP NAL
-static int is_keyframe_h265(const uint8_t *data, uint32_t len) {
-    uint32_t i = 0;
-    while (i + 4 < len) {
-        // 4-byte start code: 0x00 0x00 0x00 0x01
-        if (data[i] == 0 && data[i+1] == 0 && data[i+2] == 0 && data[i+3] == 1) {
-            if (i + 4 < len) {
-                int nal_type = (data[i+4] >> 1) & 0x3F;
-                if (nal_type >= 16 && nal_type <= 21) return 1;
-            }
-            i += 5;
-        }
-        // 3-byte start code: 0x00 0x00 0x01
-        else if (data[i] == 0 && data[i+1] == 0 && data[i+2] == 1) {
-            if (i + 3 < len) {
-                int nal_type = (data[i+3] >> 1) & 0x3F;
-                if (nal_type >= 16 && nal_type <= 21) return 1;
-            }
-            i += 4;
-        } else {
-            i++;
-        }
-    }
-    return 0;
-}
-
-// 从 Annex B raw buffer 扫描 H.264 IDR
-static int is_keyframe_h264(const uint8_t *data, uint32_t len) {
-    uint32_t i = 0;
-    while (i + 4 < len) {
-        if (data[i] == 0 && data[i+1] == 0 && data[i+2] == 0 && data[i+3] == 1) {
-            if (i + 4 < len && (data[i+4] & 0x1F) == 5) return 1;
-            i += 5;
-        } else if (data[i] == 0 && data[i+1] == 0 && data[i+2] == 1) {
-            if (i + 3 < len && (data[i+3] & 0x1F) == 5) return 1;
-            i += 4;
-        } else {
-            i++;
-        }
-    }
-    return 0;
-}
-
 static void *get_stream_thread(void *arg) {
     int chn_id = (int)(intptr_t)arg;
     VENC_STREAM_S stFrame;
@@ -521,18 +480,10 @@ static void *get_stream_thread(void *arg) {
             uint32_t u32Len = stFrame.pstPack->u32Len;
             uint64_t u64PTS = stFrame.pstPack->u64PTS;
 
-            // pack_mode=0 时所有 NAL 合并在一个 pack 中，DataType 只反映第一个 NAL 类型
-            // 因此从 raw buffer 扫描 NAL header 判断关键帧，不依赖 DataType
-            int is_kf = 0;
-            const uint8_t *buf = (const uint8_t *)pData;
-            if (g_chn_attr[chn_id].codec == RK_VIDEO_ID_HEVC) {
-                is_kf = is_keyframe_h265(buf, u32Len);
-            } else {
-                is_kf = is_keyframe_h264(buf, u32Len);
-            }
-
+            // 注意: 不再在此扫描 NAL 判断关键帧(cam 侧不计算, 省 RV1106 每帧 CPU),
+            // 关键帧判定改由 viewer 侧字节扫描完成。回调只透传裸数据与 PTS。
             if (g_callback && pData && u32Len > 0) {
-                g_callback(chn_id, (const uint8_t *)pData, u32Len, u64PTS, is_kf);
+                g_callback(chn_id, (const uint8_t *)pData, u32Len, u64PTS);
             }
 
             RK_MPI_VENC_ReleaseStream(chn_id, &stFrame);

@@ -92,12 +92,13 @@ impl FileVideoSource {
                 }
 
                 let timestamp_ms = start.elapsed().as_millis() as u64;
-                // 从 AU 的第一个 NAL 判断类型
+                // 从 AU 的第一个 NAL 判断类型 (仅用于参数集缓存, 见下方)
                 let first_nal = first_nal_in_au(&data).unwrap_or(&[]);
                 let nal_t = nal_type(first_nal);
-                // H.265 IRAP: BLA(16-18), IDR(19-20), CRA(21) — 与 rk_video_source 一致。
-                // 仅标记 IDR(19/20) 会漏掉 CRA(21)，导致 viewer 端误判首个关键帧为非关键帧而永久丢弃。
-                let is_keyframe = nal_t >= 16 && nal_t <= 21;
+                // 注意: 不再计算 is_keyframe 标志 —— 与真实 rk_video_source.rs 一致,
+                // 关键帧判定改由 viewer 侧字节扫描 `is_nal_keyframe` 完成
+                // (H.265 IRAP 16-21 / H.264 IDR 5), cam 侧不计算也不传该 flag。
+                // `MediaPacket::video` 也不再接收 is_keyframe 参数 (视频包 flags 保留置 0)。
 
                 // 缓存 VPS/SPS/PPS (新 viewer 连接时需要)
                 if nal_t == 32 || nal_t == 33 || nal_t == 34 {
@@ -108,7 +109,7 @@ impl FileVideoSource {
                     }
                 }
 
-                let packet = MediaPacket::video(timestamp_ms, is_keyframe, Bytes::from(data));
+                let packet = MediaPacket::video(timestamp_ms, Bytes::from(data));
                 if sender.send(packet).is_err() {
                     break; // 接收端已关闭
                 }

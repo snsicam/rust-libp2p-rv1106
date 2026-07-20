@@ -8,7 +8,7 @@
 //!             ├→ VENC_chn1 (子码流) → 回调 → crossbeam → broadcast[1]
 //!             └→ VENC_chn2 (第三码流) → 回调 → crossbeam → broadcast[2]
 //!
-//! 回调签名: fn(chn_id, data, len, pts_us, is_keyframe)
+//! 回调签名: fn(chn_id, data, len, pts_us)
 
 use bytes::Bytes;
 use crossbeam_channel::Sender;
@@ -18,8 +18,9 @@ use std::sync::Mutex;
 use std::thread;
 use std::time::Instant;
 
-/// C 侧的帧回调签名: fn(chn_id, data, len, pts_us, is_keyframe)
-type FrameCallback = extern "C" fn(std::ffi::c_int, *const u8, u32, u64, std::ffi::c_int);
+/// C 侧的帧回调签名: fn(chn_id, data, len, pts_us)
+/// 注意: 不再传 is_keyframe —— 关键帧判定改由 viewer 侧字节扫描完成。
+type FrameCallback = extern "C" fn(std::ffi::c_int, *const u8, u32, u64);
 type AudioCallback = extern "C" fn(*const u8, u32, u64);
 
 extern "C" {
@@ -139,7 +140,7 @@ static GLOBAL_START_TIMES: [Mutex<Option<Instant>>; MAX_CHN] = [
 /// chn_id: 0=main, 1=sub, 2=third
 extern "C" fn on_frame(
     chn_id: std::ffi::c_int, data: *const u8, len: u32,
-    pts_us: u64, is_keyframe_c: std::ffi::c_int,
+    pts_us: u64,
 ) {
     let chn = chn_id as usize;
     if chn >= MAX_CHN { return; }
@@ -150,16 +151,12 @@ extern "C" fn on_frame(
     // Annex B start code (00 00 00 01 或 00 00 01)。因此:
     //   - 不能取 slice.first() 当 NAL header (那是 start code 的 0x00);
     //   - 也不能只读第一个 NAL (H.265 IDR 帧的首个 NAL 是 VPS, 而非 IDR)。
-    // 关键帧标志直接采用 C 回调传入的 is_keyframe_c(RK VENC 硬编码给出的判定,
-    // 实测与 Rust 侧扫描 NAL 结果始终一致且更权威)。
-    // 参数集(VPS/SPS/PPS)不再在此缓存: 实测 RK 编码器默认会在每个 IDR/CRA 前内联携带
-    // VPS/SPS/PPS(见 test-data/output.h265 分析), 新 viewer 等到首个 IDR 即可直接解码,
-    // 无需额外补发 init_nals, 也避免了 init_nals 被误标关键帧导致的开屏花屏。
-    let is_keyframe = is_keyframe_c == 1;
-
-    if is_keyframe {
-        tracing::debug!("[rk_video] keyframe: chn={}, len={}",chn, len);
-    }
+    // 关键帧标志(cam 侧)已不再计算: C 回调 rk_camera.c 不再扫描 NAL、也不再传 is_keyframe,
+    // 关键帧判定由 viewer 侧字节扫描 `is_nal_keyframe` 完成(receiver 自包含、不信任对端 flag),
+    // 且 JNI 桥根本不把 flag 转发给原生 APP。`MediaPacket::video` 也不再接收 is_keyframe 参数
+    // (视频包 flags 字节保留置 0), 关键帧完全由接收端判定。
+    // 参数集(VPS/SPS/PPS)不在此缓存: 实测 RK 编码器默认在每个 IDR/CRA 前内联携带
+    // VPS/SPS/PPS, viewer 等到首个 IDR 即可直接解码, 无需补发 init_nals。
 
     let timestamp_ms = GLOBAL_START_TIMES[chn].lock()
         .ok()
@@ -168,7 +165,6 @@ extern "C" fn on_frame(
 
     let packet = MediaPacket::video(
         timestamp_ms,
-        is_keyframe,
         Bytes::copy_from_slice(slice),
     );
 

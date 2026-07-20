@@ -826,17 +826,16 @@ impl MediaPlayer {
                     // 尝试解码所有完整的包
                     while let Some(packet) = MediaPacket::try_decode(&mut buf) {
                         // 仅对视频流做 IDR 容错；音频始终透传。
-                        // 关键帧判定: `is_keyframe()`(对端标志, 实测常不可靠) || `Self::is_nal_keyframe`(扫字节, 可靠)。
-                        // 之前版本用字节扫描起播很快; 后来误删字节扫描、改信 `is_keyframe()` 标志,
-                        // 导致门控等不到关键帧、卡满整个超时才强制开门 → 起播极慢。
-                        // 收到首个 IDR 前的非关键帧直接丢弃(解码器无参考帧会报错),
+                        // 关键帧判定: 仅用 viewer 自身字节扫描 `Self::is_nal_keyframe`
+                        // (H.265 IRAP 16-21 / H.264 IDR 5), receiver 自包含、不信任对端 flag。
+                        // cam 侧已不再计算 keyframe 标志(见 rk_video_source.rs), JNI 桥也不转发该 flag,
+                        // 故此处为唯一权威判定。收到首个 IDR 前的非关键帧直接丢弃(解码器无参考帧会报错),
                         // 收到首个 IDR 后恢复正常转发。
                         if packet.track == MediaTrack::Video && !got_first_idr {
                             if first_video_at.is_none() {
                                 first_video_at = Some(std::time::Instant::now());
                             }
-                            let is_kf =
-                                packet.is_keyframe() || Self::is_nal_keyframe(&packet.data);
+                            let is_kf = Self::is_nal_keyframe(&packet.data);
                             let waited = first_video_at.map(|t| t.elapsed());
                             if is_kf || waited.map_or(false, |w| w >= Self::IDR_WAIT_TIMEOUT) {
                                 got_first_idr = true;

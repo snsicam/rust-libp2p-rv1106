@@ -1338,7 +1338,7 @@ fn process_video_frame(
             let elapsed = start.elapsed().as_secs_f64();
             let fps = *frame_count as f64 / elapsed;
             let kbps = (*bytes_received * 8) as f64 / elapsed / 1000.0;
-            let keyframe = if packet.is_keyframe() { "[I]" } else { "   " };
+            let keyframe = if is_nal_keyframe(&packet.data) { "[I]" } else { "   " };
             println!(
                 "[Viewer] {keyframe} frame #{} | {:.1} fps | {:.0} kbps | ts={}",
                 frame_count, fps, kbps, packet.timestamp_ms
@@ -1358,7 +1358,7 @@ fn process_video_frame(
     if let Some(p) = player {
         match p.render(
             &packet.data,
-            packet.is_keyframe() || is_nal_keyframe(&packet.data),
+            is_nal_keyframe(&packet.data),
         ) {
             Ok(action) => return action,
             Err(e) => {
@@ -1445,8 +1445,7 @@ async fn receive_frames(
                         if first_video_at.is_none() {
                             first_video_at = Some(std::time::Instant::now());
                         }
-                        let is_kf =
-                            packet.is_keyframe() || is_nal_keyframe(&packet.data);
+                        let is_kf = is_nal_keyframe(&packet.data);
                         let waited = first_video_at.map(|t| t.elapsed());
                         if is_kf || waited.map_or(false, |w| w >= IDR_WAIT_TIMEOUT) {
                             got_first_idr = true;
