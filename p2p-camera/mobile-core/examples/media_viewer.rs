@@ -193,8 +193,11 @@ async fn main() -> Result<()> {
     // 最小化时用于通知当前 session 优雅关闭连接的发送端
     let mut session_shutdown_tx: Option<oneshot::Sender<()>> = None;
     // DCUtR 是否启用：默认启用（锥形/EIM NAT 可打洞成功，省中继带宽）。
-    // 一旦会话内 net_diag 确认为 Symmetric NAT，后续重连传入 false 以跳过无效打洞。
-    let mut enable_dcutr = true;
+    // 一旦会话内 net_diag 确认为 Symmetric NAT，或 DCUtR 反复失败（如 4G/CGNAT 入站 UDP 被屏蔽），
+    // 后续重连传入 false 以跳过无效打洞。
+    // 关键：若配置强制 network_type="4g"，本端在 4G/CGNAT 下入站 UDP 被屏蔽，DCUtR 必然失败，
+    // 直接默认禁用，避免无谓打洞浪费 4G 上行并饿死中继视频流（本次日志 viewer 平均仅 2.3fps 的根因之一）。
+    let mut enable_dcutr = network_type != "4g";
 
     // 持久化密钥对：重连时复用，保证 PeerId 不变（与生产 lib 侧 MediaPlayer 行为一致）
     let keypair = libp2p::identity::Keypair::generate_ed25519();
@@ -407,11 +410,20 @@ async fn main() -> Result<()> {
                             remote_nat_hint = remote_nat;
                         }
                         // 对称型 NAT → 后续重连禁用 DCUtR（跳过无效打洞 ~17s）
-                        enable_dcutr = local_nat != NatType::Symmetric;
+                        // 但若配置强制 4G，入站 UDP 被屏蔽，DCUtR 必然失败，始终禁用。
+                        enable_dcutr = network_type != "4g" && local_nat != NatType::Symmetric;
                         tracing::info!(
                             "[Viewer] NAT type updated: {} → DCUtR {} for next reconnect",
                             local_nat.short_name(),
                             if enable_dcutr { "ENABLED" } else { "DISABLED" }
+                        );
+                    }
+                    Some(SessionEvent::DcutrBackoff) => {
+                        // DCUtR 反复打洞失败（如 4G/CGNAT 入站 UDP 被屏蔽），
+                        // 后续重连禁用 DCUtR，仅走中继电路，避免无效打洞干扰视频流。
+                        enable_dcutr = false;
+                        tracing::info!(
+                            "[Viewer] DCUtR backoff: disabling DCUtR for future reconnects (relay circuit only)"
                         );
                     }
                     None => break, // channel 关闭 → 退出
@@ -607,6 +619,8 @@ enum SessionEvent {
     DirectUpgraded { via_lan: bool },
     /// NAT 类型诊断更新
     NatDiagnosis { local_nat: NatType, remote_nat: Option<String> },
+    /// DCUtR 打洞反复失败，通知上层在后续重连中禁用 DCUtR（仅走中继电路）
+    DcutrBackoff,
 }
 
 /// 在后台启动一个 viewer session，返回 AbortHandle 用于取消 session
@@ -739,6 +753,10 @@ async fn run_viewer_session(
 
     let local_peer_id = keypair.public().to_peer_id();
     println!("[Viewer] PeerId: {local_peer_id}");
+
+    // DCUtR 打洞失败累计：4G/CGNAT 等入站 UDP 被屏蔽的网络下打洞必然失败，
+    // 达到阈值后通知上层在下次重连禁用 DCUtR，避免无效打洞干扰中继视频流。
+    let mut dcutr_fail_count: u32 = 0;
 
     // ---- 构建 Swarm ----
     // DCUtR 默认启用（锥形/EIM NAT 含多数 4G 可打洞成功，省中继带宽）。
@@ -975,6 +993,14 @@ async fn run_viewer_session(
         .context("Failed to open video stream")?;
     println!("[Viewer] Video stream opened (requested={}, resolved={}, relay={})", stream_type, resolved_name, initial_is_relay);
 
+    // ---- 4. 启动视频接收任务 (必须在 audio 之前!) ----
+    // 视频接收不依赖音频流。若 audio 的 open_stream 在 relay circuit 上挂起
+    // (不返回 Ok 也不返回 Err, libp2p-stream 偶发), 放在其后的 video receive
+    // 将永不 spawn -> 无视频 (典型症状: "Video stream opened" 后直接无帧)。
+    // 故先 spawn 视频接收, audio 独立打开, 二者解耦。
+    let mut video_abort_handle: Option<tokio::task::AbortHandle> =
+        Some(tokio::spawn(receive_frames(device_cam, video_stream, video_tx.clone(), event_tx.clone())).abort_handle());
+
     // ---- 3b. 打开 audio stream (可选) ----
     let mut audio_abort_handle: Option<tokio::task::AbortHandle> = None;
     if !no_audio {
@@ -990,10 +1016,6 @@ async fn run_viewer_session(
             }
         }
     }
-
-    // ---- 4. 启动视频接收任务 ----
-    let mut video_abort_handle: Option<tokio::task::AbortHandle> =
-        Some(tokio::spawn(receive_frames(device_cam, video_stream, video_tx.clone(), event_tx.clone())).abort_handle());
 
     let mut direct_upgraded = !initial_is_relay; // 初始直连时无需再升级
     let mut lan_direct_attempted = false;
@@ -1145,6 +1167,16 @@ async fn run_viewer_session(
                     tracing::info!("[Viewer] Fallback: Relay circuit is still active, video/audio will continue via relay");
                 } else {
                     tracing::warn!("[Viewer] Fallback: Relay circuit may be lost, connection may drop soon");
+                }
+                // 失败退避：累计打洞失败，达到阈值则通知上层下次重连禁用 DCUtR（仅走中继）
+                dcutr_fail_count += 1;
+                if dcutr_fail_count >= 2 {
+                    tracing::warn!(
+                        "[Viewer] DCUtR 已失败 {} 次，对本端无效（如 4G/CGNAT 入站 UDP 被屏蔽）。\
+                         将通知上层在下次重连禁用 DCUtR，仅走中继电路，避免无效打洞干扰视频流。",
+                        dcutr_fail_count
+                    );
+                    let _ = event_tx.send(SessionEvent::DcutrBackoff).await;
                 }
             }
             SwarmEvent::Behaviour(ViewerBehaviourEvent::Identify(

@@ -36,34 +36,47 @@ mkdir -p "$LOG_DIR"
 # 构建命令参数
 VIEWER_ARGS=()
 
-if [ $# -ge 2 ]; then
-    # 命令行模式
-    RELAY_ADDR="$1"
-    DEVICE_CAM_PEER="$2"
-    UDP_PORT="${3:-}"
-
-    VIEWER_ARGS+=(--relay "$RELAY_ADDR" --camera "$DEVICE_CAM_PEER")
-
-    if [ -n "$UDP_PORT" ]; then
-        VIEWER_ARGS+=(--udp-port "$UDP_PORT")
-    fi
-
+# 参数模式判断:
+#   - 若首个实参以 "-" 开头 (如 --stream / --relay / --camera)，视为「配置 + flag 透传」模式，
+#     把所有参数原样交给 binary (binary 自己解析 viewer.toml + CLI flag 覆盖)。
+#   - 否则视为「位置参数模式」: <relay> <device> [udp_port]
+if [ $# -gt 0 ] && [[ "$1" == -* ]]; then
+    VIEWER_ARGS+=("$@")
     echo ""
     echo "============================================"
     echo "  P2P Camera Viewer (SDL Player)"
     echo "============================================"
-    echo "  Relay:      $RELAY_ADDR"
-    echo "  DeviceCam:  $DEVICE_CAM_PEER"
-    if [ -n "$UDP_PORT" ]; then
-    echo "  UDP Port:   $UDP_PORT"
-    fi
+    echo "  Mode: config (viewer.toml) + CLI flags"
 else
-    # 配置文件模式
-    echo ""
-    echo "============================================"
-    echo "  P2P Camera Viewer (SDL Player)"
-    echo "============================================"
-    echo "  Config: viewer.toml"
+    if [ $# -ge 2 ]; then
+        # 位置参数模式
+        RELAY_ADDR="$1"
+        DEVICE_CAM_PEER="$2"
+        UDP_PORT="${3:-}"
+
+        VIEWER_ARGS+=(--relay "$RELAY_ADDR" --camera "$DEVICE_CAM_PEER")
+
+        if [ -n "$UDP_PORT" ]; then
+            VIEWER_ARGS+=(--udp-port "$UDP_PORT")
+        fi
+
+        echo ""
+        echo "============================================"
+        echo "  P2P Camera Viewer (SDL Player)"
+        echo "============================================"
+        echo "  Relay:      $RELAY_ADDR"
+        echo "  DeviceCam:  $DEVICE_CAM_PEER"
+        if [ -n "$UDP_PORT" ]; then
+            echo "  UDP Port:   $UDP_PORT"
+        fi
+    else
+        # 配置文件模式
+        echo ""
+        echo "============================================"
+        echo "  P2P Camera Viewer (SDL Player)"
+        echo "============================================"
+        echo "  Config: viewer.toml"
+    fi
 fi
 
 echo ""

@@ -13,6 +13,11 @@ relays = ["/ip4/101.35.90.171/udp/4001/quic-v1/p2p/12D3KooWDGUejVsts1G4tGyf8ukkr
 # mDNS 局域网发现 (默认开启，同局域网 viewer 优先直连)
 enable_mdns = true
 
+# 是否启用 DCUtR 直连打洞。
+# 4G/CGNAT 等入站 UDP 被屏蔽的网络下打洞必然失败，且其握手会挤占中继视频流
+# 写入带宽，导致 SLOW write / 帧丢弃 / 卡顿。viewer 在 4G 时务必设为 false，仅走中继。
+enable_dcutr = false
+
 # 运行模式 (listen: 等待 viewer 连接)
 mode = "listen"
 
@@ -79,8 +84,8 @@ rc_mode = "CBR"
 rc_quality = "high"
 # 最大码率 (kbps)
 bitrate_kbps = 2048
-# GOP (I帧间隔，秒数×帧率)
-gop = 50
+# GOP (I帧间隔，秒数×帧率)；4G 下改为 15 以加快丢帧后恢复
+gop = 15
 # GOP 模式: "normalP" 或 "smartP"
 gop_mode = "normalP"
 # SmartP 虚拟 I 帧间隔
@@ -104,7 +109,7 @@ dst_frame_rate_den = 1
 rc_mode = "CBR"
 rc_quality = "high"
 bitrate_kbps = 512
-gop = 50
+gop = 15
 gop_mode = "normalP"
 smartp_viridrlen = 25
 h264_profile = "high"
@@ -122,8 +127,9 @@ dst_frame_rate_num = 25
 dst_frame_rate_den = 1
 rc_mode = "CBR"
 rc_quality = "high"
-bitrate_kbps = 1024
-gop = 50
+# 第三码流(中清)原 1024kbps 在 4G(<1.5Mbps)下会饱和丢包，降到 500 留余量
+bitrate_kbps = 500
+gop = 15
 gop_mode = "normalP"
 smartp_viridrlen = 25
 h264_profile = "high"

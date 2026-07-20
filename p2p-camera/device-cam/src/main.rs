@@ -289,6 +289,7 @@ async fn main() -> Result<()> {
                 key.public().clone(),
                 relay_client,
                 identify_config,
+                config.enable_dcutr,
             )
         })?
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(120)))
@@ -334,6 +335,9 @@ async fn main() -> Result<()> {
     let mut local_ips: Vec<Ipv4Addr> = Vec::new();
     let mut local_quic_port: u16 = 0;
     let mut relay_states: Vec<RelayState> = relay_states;
+    // 每个 viewer 的 DCUtR 失败次数。4G/CGNAT 等入站 UDP 被屏蔽的网络下打洞必然失败，
+    // 反复失败说明该 peer 无法直连，应停用 DCUtR 以免其握手挤占中继视频流带宽。
+    let mut dcutr_fail_count: HashMap<PeerId, u32> = HashMap::new();
 
     // 初始连接所有 Relay
     for state in &relay_states {
@@ -382,6 +386,19 @@ async fn main() -> Result<()> {
                         Err(err) => {
                             let local_nat = local_nat_type.map(|t| t.short_name()).unwrap_or("Unknown");
                             tracing::warn!("[DeviceCam] DCUtR failed with {remote_peer_id}: {err}");
+                            // 按 peer 累计打洞失败次数；反复失败说明该 viewer 无法直连
+                            // (典型为 4G/CGNAT 入站 UDP 被屏蔽)，应停用 DCUtR 以免其握手
+                            // 挤占中继视频流写入带宽，导致 SLOW write / 卡顿。
+                            let fails = dcutr_fail_count.entry(remote_peer_id).or_insert(0);
+                            *fails += 1;
+                            if *fails >= 2 && config.enable_dcutr {
+                                tracing::warn!(
+                                    "[DeviceCam] DCUtR 对该 viewer 已失败 {} 次，打洞对本端无效。\
+                                     建议在该 device-cam.toml 设置 enable_dcutr = false 仅走中继，\
+                                     可消除打洞握手对视频流的干扰与卡顿。",
+                                    *fails
+                                );
+                            }
                             tracing::warn!("[DeviceCam] NAT context: local={}", local_nat);
                             if let Some(ref diag) = nat_diagnostic {
                                 let result = diag.diagnose();
@@ -807,8 +824,10 @@ async fn stream_video_to_viewer(
     const WRITE_SLOW_THRESHOLD_MS: u64 = 100;
     // write_all+flush 超过此阈值则视为 DCUtR 握手干扰（yamux 竞争导致写堵塞 500ms+）
     const WRITE_DCUTR_STALL_THRESHOLD_MS: u64 = 500;
-    // write_all+flush 超过此时间则断开该 viewer（防止慢 viewer 阻塞帧发送）
-    const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    // write_all+flush 超过此时间视为写入受阻。注意：relay 电路在跨网(4G/公网)场景下
+    // 偶发 3-5s 的慢写是正常的，阈值必须留足余量，否则会误判为断连。
+    // 旧值 5s 偏小，relay 拥塞时单帧写超 5s 就触发断连→viewer 重连风暴，反而更卡。
+    const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
     // 新 Viewer 接入时主动请求一帧 IDR：
     // 若连接时编码器正处于 GOP 中段，broadcast 里先到的会是 P 帧，viewer
@@ -844,7 +863,7 @@ async fn stream_video_to_viewer(
                         let write_ms = write_start.elapsed().as_millis() as u64;
                         if write_ms > WRITE_SLOW_THRESHOLD_MS {
                             let cause = if write_ms > WRITE_DCUTR_STALL_THRESHOLD_MS {
-                                " (likely DCUtR handshake interference on relay circuit)"
+                                " (likely relay congestion / peer DCUtR handshake interference)"
                             } else {
                                 " (relay congestion or backpressure)"
                             };
@@ -878,11 +897,14 @@ async fn stream_video_to_viewer(
                         break;
                     }
                     Err(_) => {
-                        // 写入超时：viewer 处理太慢或 DCUtR 握手占用 relay 带宽，断开连接
+                        // 写入超时：relay 拥塞或 viewer 暂忙（如 DCUtR 打洞占用 4G 上行）。
+                        // 关键修复：不再断开连接！断开会触发 viewer 重连风暴(每 16-25s 重连一次，
+                        // 每次只传几帧)，viewer 平均仅 2-3fps。改为丢弃本帧并继续，连接保持，
+                        // relay 通畅后写入自动恢复。真正的断连由 Ok(Err(e)) 分支(流已死)处理。
                         dropped_count += 1;
-                        println!("[DeviceCam] WRITE TIMEOUT ..{peer_short}: write blocked >{}s, disconnecting ({stream_name}, frame #{frame_count}, dropped: {dropped_count})",
+                        println!("[DeviceCam] WRITE TIMEOUT ..{peer_short}: write blocked >{}s, DROPPING frame (keep connection) ({stream_name}, frame #{frame_count}, dropped: {dropped_count})",
                             WRITE_TIMEOUT.as_secs());
-                        break;
+                        continue;
                     }
                 }
             }

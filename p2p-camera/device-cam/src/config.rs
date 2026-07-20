@@ -236,6 +236,13 @@ pub struct Config {
     #[serde(default = "default_enable_mdns")]
     pub enable_mdns: bool,
 
+    /// 是否启用 DCUtR 直连打洞 (默认 true)。
+    /// 4G/CGNAT 等入站 UDP 被屏蔽的网络下打洞必然失败，且打洞握手会挤占
+    /// 中继视频流的写入带宽，导致 SLOW write / 帧丢弃 / 卡顿。此类网络应设为 false，
+    /// 仅走中继电路 (relay circuit) 即可稳定传输。
+    #[serde(default = "default_enable_dcutr")]
+    pub enable_dcutr: bool,
+
     #[serde(default = "default_mode")]
     pub mode: String,
     #[serde(default = "default_key_file")]
@@ -258,6 +265,7 @@ pub struct Config {
 fn default_mode() -> String { "listen".to_string() }
 fn default_key_file() -> PathBuf { PathBuf::from("device-cam.key") }
 fn default_enable_mdns() -> bool { true }
+fn default_enable_dcutr() -> bool { true }
 
 impl Default for Config {
     fn default() -> Self {
@@ -265,6 +273,7 @@ impl Default for Config {
             relays: Vec::new(),
             relay: String::new(),
             enable_mdns: default_enable_mdns(),
+            enable_dcutr: default_enable_dcutr(),
             mode: default_mode(),
             key_file: default_key_file(),
             audio: AudioConfig::default(),
