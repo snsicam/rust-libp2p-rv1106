@@ -173,6 +173,7 @@ async fn main() -> Result<()> {
 
             let source = rk_video_source::RkVideoSource::new(
                 main_params, sub_params, third_params,
+                config.sensor_frame_rate,
             );
             let (_, start_tx) = source.spawn(
                 broadcast_sender_to_crossbeam(main_tx.clone()),

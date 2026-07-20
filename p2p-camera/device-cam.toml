@@ -24,6 +24,11 @@ mode = "listen"
 # 身份密钥文件 (持久化 PeerId，首次运行自动生成)
 key_file = "device-cam.key"
 
+# sensor 原生输出帧率 (摄像头模组实际产出率)。
+# 这是 VENC 的实际输入帧率, 编码器据此按各码流目标帧率(dst_frame_rate)丢帧;
+# 必须填真实 sensor 率(通常 30), 不能填某码流的配置 fps, 否则帧率控制失效、实测跑满原生帧率。
+sensor_frame_rate = 30
+
 # QUIC UDP 监听端口 (0=随机, 非0=固定端口便于端口映射)
 # udp_port = 9090
 

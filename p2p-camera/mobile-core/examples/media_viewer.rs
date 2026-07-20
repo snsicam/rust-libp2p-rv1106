@@ -1406,7 +1406,11 @@ fn process_video_frame(
 /// 字节流里的真实 IDR NAL 立即开门（cam 在 `request_idr` 后很快产出真 IDR），不会等到这里。
 /// 仅当字节扫描也异常时才兜底强制开门，避免 `!got_first_idr` 门控永久不开 → 黑屏。
 /// 3s 足够覆盖一个 GOP 周期（gop=50@25fps≈2s），正常绝不触发。
-const IDR_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+// 最后安全网: 仅当字节扫描(is_nal_keyframe)也异常时才兜底强制开门。
+// 正常情况下 cam 在 request_idr 后很快产出真 IDR(配合短 GOP=15 约 0.75s 即到),
+// 本超时不会触发。设为 5s 以覆盖设备仍跑旧 gop=40(自然 IDR 实测~4.7s)的情况,
+// 避免超时抢在真实 IDR 之前触发 → 解码器被迫解码无参考 P 帧 → 马赛克。
+const IDR_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// 从 Annex B 裸流扫描 NAL，判断是否为关键帧（IRAP）。
 /// H.265: IRAP NAL type 16..=21 (BLA/IDR/CRA)；H.264: IDR NAL type 5。

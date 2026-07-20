@@ -222,11 +222,11 @@ static int vi_chn_init(int width, int height, int fps, int sensor_fps) {
     vi_chn_attr.enPixelFormat = RK_FMT_YUV420SP;
     vi_chn_attr.enCompressMode = COMPRESS_MODE_NONE;
     vi_chn_attr.u32Depth = 0;
-    // VI 帧率: src=sensor_fps, dst=target_fps, 由 VI 做整数丢帧
-    // (对标 rkipc: 整数帧率时 VI 层丢帧更高效，减少编码器压力)
+    // VI 全速运行在 sensor 原生帧率 (src=dst=sensor_fps), 不做丢帧;
+    // 各码流的帧率控制由各 VENC 的 fr32DstFrameRate 完成 (见 venc_init_single)。
     if (sensor_fps <= 0) sensor_fps = fps;  // 回退: sensor_fps 未知时使用 target fps
     vi_chn_attr.stFrameRate.s32SrcFrameRate = sensor_fps;
-    vi_chn_attr.stFrameRate.s32DstFrameRate = fps;
+    vi_chn_attr.stFrameRate.s32DstFrameRate = sensor_fps;
 
     printf("[rk_camera] VI chn: %dx%d src_fps=%d dst_fps=%d\n", width, height, sensor_fps, fps);
 
@@ -275,9 +275,11 @@ static int vpss_init(int main_w, int main_h,
         stChnAttr.enChnMode = VPSS_CHN_MODE_USER;
         stChnAttr.enDynamicRange = DYNAMIC_RANGE_SDR8;
         stChnAttr.enPixelFormat = RK_FMT_YUV420SP;
-        // VPSS 通道不做帧率控制, 全速透传
-        stChnAttr.stFrameRate.s32SrcFrameRate = -1;
-        stChnAttr.stFrameRate.s32DstFrameRate = -1;
+        // VPSS 全速透传: 帧率控制交给定制 VENC 的 fr32DstFrameRate 做丢帧
+        // (对标 rkipc: 官方不在 VPSS 做控速, 由 VI/VENC 控速; 本管线 VI 共享,
+        // 故由 VENC 按各码流目标帧率丢帧, 见 venc_init_single)。
+        stChnAttr.stFrameRate.s32SrcFrameRate = -1;   // 输入全速
+        stChnAttr.stFrameRate.s32DstFrameRate = -1;   // 输出全速透传
         stChnAttr.u32Width = widths[i];
         stChnAttr.u32Height = heights[i];
         stChnAttr.enCompressMode = COMPRESS_MODE_NONE;
@@ -384,24 +386,15 @@ static int venc_init_single(int chn_id, int width, int height,
     // 设置帧率/GOP/码率 (根据编码类型和RC模式设置对应 union 字段)
     int is_vbr = (rc_mode == VENC_RC_MODE_H264VBR || rc_mode == VENC_RC_MODE_H265VBR);
 
-    // 帧率控制双路径 (对标 rkipc video.c rk_video_set_frame_rate):
-    //   整数帧率 (den==1): VENC src=dst=target_fps, 由 VI 层做整数丢帧
-    //   非整数帧率 (den!=1): VENC src=sensor_fps, dst=target_fps, 由编码器做分数帧率控制
-    int venc_src_num, venc_src_den, venc_dst_num, venc_dst_den;
-    if (fps_den == 1) {
-        // 整数帧率: 编码器帧率与 VI 输出一致
-        venc_src_num = fps_num;
-        venc_src_den = 1;
-        venc_dst_num = fps_num;
-        venc_dst_den = 1;
-    } else {
-        // 非整数帧率: 编码器做分数帧率控制
-        int s_fps = (sensor_fps > 0) ? sensor_fps : fps_num;
-        venc_src_num = s_fps;
-        venc_src_den = 1;
-        venc_dst_num = fps_num;
-        venc_dst_den = fps_den;
-    }
+    // 帧率控制 (对标 rkipc video.c rk_video_set_frame_rate 的分数帧率路径):
+    // 本管线 VI 为三路共享、无法按单路控速, 因此由 VENC 统一按目标帧率丢帧。
+    // 关键: u32SrcFrameRate 必须等于 VENC 实际接收帧率(=VI/VPSS 输出=输入源帧率 sensor_fps),
+    //       否则 Src==Dst 时 ratio=1 不丢帧, 实测会跑满 sensor 原生帧率(如 30fps, 配置 20 却出 30)。
+    //       fr32DstFrameRate 是真正生效的丢帧字段(对标 rkipc 对分数 fps 的用法)。
+    int venc_src_num = (sensor_fps > 0) ? sensor_fps : fps_num;
+    int venc_src_den = 1;
+    int venc_dst_num = fps_num;
+    int venc_dst_den = (fps_den > 0) ? fps_den : 1;
 
     if (codec == RK_VIDEO_ID_AVC) {
         // H264: GOP + 帧率 (CBR/VBR 字段布局相同, base 通用)
@@ -537,9 +530,11 @@ int rk_camera_init(int main_w, int main_h, int fps, int bitrate, int sensor_fps)
     isp_init();
 
     // 1. VI 初始化 (捕获主码流分辨率)
+    // VI 全速运行在 sensor 原生帧率; 各码流的目标帧率由各自 VENC 的 fr32DstFrameRate 丢帧实现
+    // (对标 rkipc: 单 VI 共享时无法按单路控速, 改由 VENC 控速, 见 venc_init_single)。
     int ret = vi_dev_init();
     if (ret != 0) { printf("[rk_camera] vi_dev_init failed\n"); return -1; }
-    ret = vi_chn_init(main_w, main_h, fps, sensor_fps);
+    ret = vi_chn_init(main_w, main_h, sensor_fps, sensor_fps);
     if (ret != 0) { printf("[rk_camera] vi_chn_init failed\n"); return -1; }
 
     // 2. VPSS 初始化 — 从 g_chn_attr 读取每通道的分辨率
@@ -679,7 +674,12 @@ void rk_camera_set_callback(frame_callback_t cb) {
     g_callback = cb;
 }
 
-// 请求特定通道的 IDR 关键帧
+// 请求特定通道的 IDR 关键帧 (best-effort)
+// 对标 rkipc: 官方从不调用 RK_MPI_VENC_RequestIDR, 而是完全依赖 GOP 自然出 IDR
+// (ini 中 refresh_time_s 周期刷新)。本函数保留 RequestIDR 作为尽力而为的加速手段,
+// 但真正保证 viewer 快速拿到首帧 IDR 的是短 GOP(配置 gop=15, 约 0.75s 一个 IDR)——
+// 即使 RequestIDR 在该 SDK 构建下不立即生效, viewer 也只需等一个 GOP 即可。
+// 注意: 重试一次无意义(若当前构建不支持, 立即重试同样无效), 故只调一次。
 int rk_camera_request_idr(int chn_id) {
     if (chn_id < 0 || chn_id >= VENC_MAX_CHN) return -1;
     return RK_MPI_VENC_RequestIDR(chn_id, RK_TRUE);
