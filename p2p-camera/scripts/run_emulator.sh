@@ -14,7 +14,7 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-APK_DIR="$WORKSPACE_DIR/android-media/demos/media_player/buildout/outputs/apk/release"
+APK_DIR="$WORKSPACE_DIR/../android-media/demos/media_player/buildout/outputs/apk/release"
 
 # --- 配置 ---
 AVD_NAME="${AVD_NAME:-Medium_Phone_API_34}"
@@ -97,7 +97,7 @@ start_emulator() {
     fi
 
     info "启动模拟器: $AVD_NAME"
-    nohup "$EMULATOR" -avd "$AVD_NAME" -no-window -no-snapshot-load -gpu swiftshader_indirect > /tmp/emulator.log 2>&1 &
+    nohup "$EMULATOR" -avd "$AVD_NAME" -no-snapshot-load -gpu swiftshader_indirect > /tmp/emulator.log 2>&1 &
 
     info "等待模拟器启动..."
     "$ADB" wait-for-device || true
@@ -201,10 +201,10 @@ case "${1:-run}" in
         echo ""
         launch_app
         ;;
-    --stop)
+    --stop|stop)
         stop_emulator
         ;;
-    --log)
+    --log|log)
         show_log
         ;;
     --help|-h)

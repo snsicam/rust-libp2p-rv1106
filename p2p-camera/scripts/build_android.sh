@@ -100,8 +100,8 @@ if [ -d "$WORKSPACE_DIR/android/app" ]; then
     copy_to_project "$WORKSPACE_DIR/android/app/src/main/jniLibs" "android/app"
 fi
 
-# 2) media_player demo (android-media/demos/media_player)
-copy_to_project "$WORKSPACE_DIR/android-media/demos/media_player/src/main/jniLibs" "media_player demo"
+# 2) media_player demo (../android-media/demos/media_player)
+copy_to_project "$WORKSPACE_DIR/../android-media/demos/media_player/src/main/jniLibs" "media_player demo"
 
 echo ""
 echo "=== Build Complete ==="

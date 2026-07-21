@@ -14,7 +14,7 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 WORKSPACE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-ANDROID_DIR="$WORKSPACE_DIR/android-media"
+ANDROID_DIR="$WORKSPACE_DIR/../android-media"
 DEMO_DIR="$ANDROID_DIR/demos/media_player"
 # 注意: 此 android-media 项目 buildDir 在 gradle.properties 中设为 buildout
 BUILD_DIR_NAME="${BUILD_DIR_NAME:-buildout}"
