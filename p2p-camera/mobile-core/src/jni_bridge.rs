@@ -251,6 +251,39 @@ pub extern "system" fn Java_com_p2pcamera_mediaplayer_RustBridge_nativeCreate(
                                     let conn_type = if via_lan { "LAN direct" } else { "DCUtR" };
                                     tracing::info!("[JNI] Direct upgraded: {conn_type}");
                                 }
+                                MediaPlayerEvent::StreamEOF { reason } => {
+                                    tracing::warn!("[JNI] Stream EOF: {reason}");
+                                    // StreamEOF 视同断连，触发重连
+                                    let _ = event_tx.send(ViewerEvent::Disconnected);
+                                    tracing::info!("[JNI] Auto-reconnecting...");
+                                    let _ = event_tx.send(ViewerEvent::Connecting);
+                                    match viewer.reconnect().await {
+                                        Ok(()) => {
+                                            let _ = event_tx.send(ViewerEvent::Connected {
+                                                peer_id: device_id.clone(),
+                                                connection_type: "relay".into(),
+                                            });
+                                            let _ = event_tx.send(ViewerEvent::StreamReady);
+                                            tracing::info!("[JNI] Reconnected successfully");
+                                        }
+                                        Err(e) => {
+                                            tracing::error!("[JNI] Reconnect failed: {e}");
+                                            let _ = event_tx.send(ViewerEvent::Error {
+                                                message: format!("reconnect failed: {e}"),
+                                            });
+                                            return;
+                                        }
+                                    }
+                                }
+                                MediaPlayerEvent::NatDiagnosis { local_nat, remote_nat } => {
+                                    tracing::info!("[JNI] NAT diagnosis: local={}, remote={}",
+                                        local_nat.short_name(),
+                                        remote_nat.as_deref().unwrap_or("Unknown"));
+                                }
+                                MediaPlayerEvent::DcutrBackoff => {
+                                    tracing::warn!("[JNI] DCUtR backoff, disabling DCUtR for next reconnect");
+                                    viewer.set_enable_dcutr(false);
+                                }
                             }
                         }
                     }

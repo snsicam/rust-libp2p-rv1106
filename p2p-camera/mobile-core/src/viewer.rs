@@ -27,12 +27,54 @@ use proto::{
 };
 use tokio::sync::mpsc;
 
-use crate::jitter_buffer::AvJitterBuffer;
 use crate::net_diag::{ConnectionQuality, ConnectionType, NatDiagnostic, NatDiagnosis, NatType};
 
 pub const STREAM_READ_BUF: usize = 65536; // 64KB
 pub const MDNS_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
 pub const RECONNECT_DELAY: Duration = Duration::from_secs(3);
+
+/// 等待首个关键帧的最长时间（最后安全网）。正常情况下门控由 `is_nal_keyframe` 扫描
+/// 字节流里的真实 IDR NAL 立即开门（cam 在 `request_idr` 后很快产出真 IDR），不会等到这里。
+/// 仅当字节扫描也异常时才兜底强制开门，避免 `!got_first_idr` 门控永久不开 → 黑屏。
+/// 3s 足够覆盖一个 GOP 周期（gop=50@25fps≈2s），正常绝不触发。
+// 最后安全网: 仅当字节扫描(is_nal_keyframe)也异常时才兜底强制开门。
+// 正常情况下 cam 在 request_idr 后很快产出真 IDR(配合短 GOP=15 约 0.75s 即到),
+// 本超时不会触发。设为 5s 以覆盖设备仍跑旧 gop=40(自然 IDR 实测~4.7s)的情况,
+// 避免超时抢在真实 IDR 之前触发 → 解码器被迫解码无参考 P 帧 → 马赛克。
+pub const IDR_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// 从 Annex B 裸流扫描 NAL，判断是否为关键帧（IRAP）。
+/// H.265: IRAP NAL type 16..=21 (BLA/IDR/CRA)；H.264: IDR NAL type 5。
+/// 与 C 侧 `rk_camera.c` 的 `is_keyframe_h265/h264` 判定范围一致，但在 viewer 侧**独立扫描
+/// 字节**，不依赖对端 `is_keyframe()` 标志位。日志实证：cam 发的 IDR 数据字节里确有 IRAP
+/// NAL（ffmpeg 能据此恢复解码），但 `is_keyframe()` 标志常不可靠（8s 内检测不到），
+/// 故必须用本函数扫字节兜底——这是之前版本快速起播的关键，删掉它改用 `is_keyframe()`
+/// 正是起播变慢（卡满超时）的根因。
+pub fn is_nal_keyframe(data: &[u8]) -> bool {
+    let len = data.len();
+    let mut i = 0;
+    while i + 4 < len {
+        let hdr_off = if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 0 && data[i + 3] == 1 {
+            i + 4
+        } else if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
+            i + 3
+        } else {
+            i += 1;
+            continue;
+        };
+        let b = data[hdr_off];
+        let h265_type = (b >> 1) & 0x3F;
+        if (16..=21).contains(&h265_type) {
+            return true;
+        }
+        let h264_type = b & 0x1F;
+        if h264_type == 5 {
+            return true;
+        }
+        i = hdr_off + 1;
+    }
+    false
+}
 
 /// MediaPlayer 内部事件，用于通知上层（JNI bridge）连接状态变化
 #[derive(Debug, Clone)]
@@ -41,6 +83,12 @@ pub enum MediaPlayerEvent {
     Disconnected { reason: String },
     /// 直连升级成功 (DCUtR 或 LAN direct)
     DirectUpgraded { via_lan: bool },
+    /// 码流 EOF（连接可能仍存活），窗口恢复时触发重连
+    StreamEOF { reason: String },
+    /// NAT 类型诊断更新
+    NatDiagnosis { local_nat: NatType, remote_nat: Option<String> },
+    /// DCUtR 打洞反复失败，通知上层在后续重连中禁用 DCUtR
+    DcutrBackoff,
 }
 
 /// 将 stream 名称映射到对应的协议
@@ -106,11 +154,31 @@ impl StreamTypeResolver {
     }
 }
 
+/// MediaPlayer::connect 的可选参数
+#[derive(Clone)]
+pub struct ConnectOptions {
+    /// 本地 QUIC 监听端口 (0 = 随机)
+    pub udp_port: u16,
+    /// 网络类型 ("wifi" | "4g")，影响 NAT 诊断和 DCUtR 策略
+    pub network_type: String,
+    /// 是否禁用音频流
+    pub no_audio: bool,
+}
+
+impl Default for ConnectOptions {
+    fn default() -> Self {
+        Self {
+            udp_port: 0,
+            network_type: "wifi".to_string(),
+            no_audio: false,
+        }
+    }
+}
+
 /// P2P Viewer — 对外暴露的核心结构
 pub struct MediaPlayer {
     swarm: Swarm<ViewerBehaviour>,
     stream_control: Control,
-    jitter: AvJitterBuffer,
     video_sender: mpsc::Sender<MediaPacket>,
     video_receiver: mpsc::Receiver<MediaPacket>,
     audio_sender: mpsc::Sender<MediaPacket>,
@@ -133,6 +201,22 @@ pub struct MediaPlayer {
     symmetric_detected: bool,
     /// 保存密钥对，重连重建 Swarm 时复用，保证 PeerId 不变
     keypair: libp2p::identity::Keypair,
+    /// DCUtR 打洞失败累计
+    dcutr_fail_count: u32,
+    /// 本地 IP 列表（从 NewListenAddr 收集）
+    local_ips: Vec<Ipv4Addr>,
+    /// 本地 QUIC 监听端口
+    local_quic_port: u16,
+    /// 对端 NAT 类型推断
+    remote_nat_hint: Option<String>,
+    /// 网络类型 (wifi/4g)
+    network_type: String,
+    /// 是否禁用音频
+    no_audio: bool,
+    /// UDP 监听端口
+    udp_port: u16,
+    /// mDNS 发现的 device-cam 地址缓存（key = PeerId, value = 最新的非 relay Multiaddr）
+    mdns_cache: std::collections::HashMap<libp2p::PeerId, Multiaddr>,
 }
 
 /// 保存连接参数，用于断连后自动重连
@@ -142,6 +226,7 @@ struct ConnectParams {
     device_cam_peer_id: String,
     enable_mdns: bool,
     stream_type: String,
+    no_audio: bool,
 }
 
 impl MediaPlayer {
@@ -153,6 +238,11 @@ impl MediaPlayer {
     /// 由 `poll_swarm` 在连接后检测，重连时通过重建 Swarm 自动禁用 DCUtR）。
     /// 不再以粗粒度的 `4g` 标志禁用，避免误杀可打洞的锥形 4G。
     pub async fn new(enable_dcutr: bool) -> Result<Self> {
+        Self::new_with_options(enable_dcutr, ConnectOptions::default()).await
+    }
+
+    /// 带选项的构造函数
+    pub async fn new_with_options(enable_dcutr: bool, options: ConnectOptions) -> Result<Self> {
         let keypair = libp2p::identity::Keypair::generate_ed25519();
         let swarm = Self::build_swarm(&keypair, enable_dcutr)?;
         let stream_control = swarm.behaviour().stream.new_control();
@@ -161,13 +251,9 @@ impl MediaPlayer {
         let (audio_sender, audio_receiver) = mpsc::channel::<MediaPacket>(200);
         let (event_sender, event_receiver) = mpsc::channel::<MediaPlayerEvent>(32);
 
-        Ok(Self {
+        let mut player = Self {
             swarm,
             stream_control,
-            jitter: AvJitterBuffer::new(
-                Duration::from_millis(100),
-                Duration::from_millis(50),
-            ),
             video_sender,
             video_receiver,
             audio_sender,
@@ -186,7 +272,32 @@ impl MediaPlayer {
             connected: false,
             symmetric_detected: false,
             keypair,
-        })
+            dcutr_fail_count: 0,
+            local_ips: Vec::new(),
+            local_quic_port: 0,
+            remote_nat_hint: None,
+            network_type: options.network_type.clone(),
+            no_audio: options.no_audio,
+            udp_port: options.udp_port,
+            mdns_cache: std::collections::HashMap::new(),
+        };
+
+        // 监听本地 QUIC (指定端口或随机)
+        let udp_port = options.udp_port;
+        let udp_addr = format!("/ip4/0.0.0.0/udp/{}/quic-v1", udp_port).parse()
+            .context("Invalid local QUIC listen addr")?;
+        player.swarm.listen_on(udp_addr)?;
+        player.swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()
+            .context("Invalid local TCP listen addr")?)?;
+        println!("[Viewer] Listening on QUIC (port {}) and TCP",
+            if udp_port != 0 { udp_port.to_string() } else { "random".to_string() });
+
+        if options.network_type == "4g" {
+            player.nat_diagnostic.set_force_4g(true);
+            tracing::info!("[Viewer] Network type: 4G (forced by config)");
+        }
+
+        Ok(player)
     }
 
     /// 构建 Swarm（含可选的 DCUtR 行为）
@@ -232,6 +343,24 @@ impl MediaPlayer {
         enable_mdns: bool,
         stream_type: &str,
     ) -> Result<()> {
+        self.connect_with_options(
+            relay_addrs,
+            device_cam_peer_id,
+            enable_mdns,
+            stream_type,
+            ConnectOptions::default(),
+        ).await
+    }
+
+    /// 连接（带选项）
+    pub async fn connect_with_options(
+        &mut self,
+        relay_addrs: &[String],
+        device_cam_peer_id: &str,
+        enable_mdns: bool,
+        stream_type: &str,
+        options: ConnectOptions,
+    ) -> Result<()> {
         let device_cam: PeerId = device_cam_peer_id.parse()?;
         self.device_cam_peer_id = Some(device_cam);
 
@@ -241,11 +370,18 @@ impl MediaPlayer {
             device_cam_peer_id: device_cam_peer_id.to_string(),
             enable_mdns,
             stream_type: stream_type.to_string(),
+            no_audio: options.no_audio,
         });
+
+        // 保存选项
+        self.no_audio = options.no_audio;
+        self.network_type = options.network_type.clone();
+        self.udp_port = options.udp_port;
 
         // 初始化码流选择器
         self.stream_resolver = StreamTypeResolver::new(stream_type);
         self.lan_direct_attempted = false;
+        self.dcutr_fail_count = 0;
 
         // 解析所有 Relay 地址
         let relay_multiaddrs: Vec<Multiaddr> = relay_addrs.iter()
@@ -265,6 +401,14 @@ impl MediaPlayer {
         let mut mdns_discovered_addr: Option<Multiaddr> = None;
         let mut relay_error_count: usize = 0;
         let total_relays = relay_multiaddrs.len();
+
+        // 优先使用 mDNS 缓存中已有的 device-cam 地址（重连时缓存可能已有）
+        if enable_mdns {
+            if let Some(cached_addr) = self.mdns_cache.get(&device_cam) {
+                tracing::info!("[Viewer] Using cached mDNS address for {device_cam}: {cached_addr}");
+                mdns_discovered_addr = Some(cached_addr.clone());
+            }
+        }
 
         loop {
             let now = tokio::time::Instant::now();
@@ -310,6 +454,20 @@ impl MediaPlayer {
                         )) => {
                             for (peer_id, addr) in peers {
                                 tracing::info!("[Viewer] mDNS discovered peer {peer_id} at {addr}");
+                                // 更新 mDNS 缓存
+                                let is_relay = addr.iter().any(|p| matches!(p, Protocol::P2pCircuit));
+                                if !is_relay {
+                                    let is_quic = addr.iter().any(|p| matches!(p, Protocol::QuicV1));
+                                    let entry = self.mdns_cache.entry(peer_id);
+                                    if let std::collections::hash_map::Entry::Occupied(mut e) = entry {
+                                        let existing_is_quic = e.get().iter().any(|p| matches!(p, Protocol::QuicV1));
+                                        if is_quic || !existing_is_quic {
+                                            e.insert(addr.clone());
+                                        }
+                                    } else {
+                                        entry.or_insert(addr.clone());
+                                    }
+                                }
                                 if peer_id == device_cam && mdns_discovered_addr.is_none() {
                                     tracing::info!("[Viewer] mDNS found target DeviceCam {peer_id} at {addr}");
                                     mdns_discovered_addr = Some(addr);
@@ -380,67 +538,90 @@ impl MediaPlayer {
             .await
             .context("Failed to open video stream")?;
 
-        // 打开音频 stream
-        let audio_stream = self.stream_control
-            .open_stream(device_cam, stream_protocols::AUDIO_PROTOCOL)
-            .await
-            .context("Failed to open audio stream")?;
-
-        println!("[Viewer] Video + Audio streams opened");
-
-        // 启动接收任务
+        // 启动视频接收任务（必须在 audio 之前！）
         let video_sender = self.video_sender.clone();
-        let audio_sender = self.audio_sender.clone();
         let event_sender = self.event_sender.clone();
 
         let video_handle = tokio::spawn(
             Self::receive_frames(device_cam, video_stream, video_sender, event_sender.clone())
         ).abort_handle();
         self.video_abort_handle = Some(video_handle);
-        let audio_handle = tokio::spawn(
-            Self::receive_frames(device_cam, audio_stream, audio_sender, event_sender)
-        ).abort_handle();
-        self.audio_abort_handle = Some(audio_handle);
+
+        // 打开音频 stream（可选）
+        if !self.no_audio {
+            match self.stream_control.open_stream(device_cam, stream_protocols::AUDIO_PROTOCOL).await {
+                Ok(audio_stream) => {
+                    println!("[Viewer] Audio stream opened");
+                    let audio_sender = self.audio_sender.clone();
+                    let audio_handle = tokio::spawn(
+                        Self::receive_frames(device_cam, audio_stream, audio_sender, event_sender)
+                    ).abort_handle();
+                    self.audio_abort_handle = Some(audio_handle);
+                }
+                Err(e) => {
+                    println!("[Viewer] Audio stream open failed (non-fatal): {e}");
+                }
+            }
+        }
+
+        println!("[Viewer] Video stream opened (stream={})", resolved_name);
 
         self.connected = true;
         Ok(())
     }
 
     /// 获取下一个视频帧 (供 Native UI 层轮询)
+    /// 直接从 channel 取帧，不经过 Jitter Buffer。
+    /// 实时监控场景对延迟敏感，Jitter Buffer 的缓冲和音视频同步
+    /// 会引入额外延迟和帧丢弃，导致马赛克。
     pub fn poll_video_frame(&mut self) -> Option<MediaPacket> {
-        // 先尝试从 Jitter Buffer 取
-        if let Some(frame) = self.jitter.next_video() {
-            return Some(frame);
-        }
-        // 再尝试从接收 channel 取新包送入 jitter
-        while let Ok(packet) = self.video_receiver.try_recv() {
-            self.jitter.push(packet);
-        }
-        self.jitter.next_video()
+        self.video_receiver.try_recv().ok()
     }
 
     /// 获取下一个音频帧 (供 Native UI 层轮询)
     pub fn poll_audio_frame(&mut self) -> Option<MediaPacket> {
-        // 先尝试从 Jitter Buffer 取
-        if let Some(frame) = self.jitter.next_audio() {
-            return Some(frame);
-        }
-        // 再尝试从接收 channel 取新包送入 jitter
-        while let Ok(packet) = self.audio_receiver.try_recv() {
-            self.jitter.push(packet);
-        }
-        self.jitter.next_audio()
+        self.audio_receiver.try_recv().ok()
     }
 
     /// 驱动 Swarm 事件循环 (需要定期调用)
     pub async fn poll_swarm(&mut self) {
-        if let Some(event) = self.swarm.next().await {
+        // 加超时避免长时间阻塞导致帧积压：Swarm 事件通常很频繁，
+        // 但在连接空闲时可能长时间无事件，此时应返回让调用方处理帧
+        let event = tokio::select! {
+            event = self.swarm.next() => event,
+            _ = tokio::time::sleep(std::time::Duration::from_millis(5)) => return,
+        };
+        if let Some(event) = event {
             match event {
                 SwarmEvent::Behaviour(ViewerBehaviourEvent::Mdns(
                     mdns::Event::Discovered(peers),
                 )) => {
                     for (peer_id, addr) in peers {
                         tracing::info!("[Viewer] mDNS discovered peer {peer_id} at {addr}");
+                        // 缓存非 relay 的 mDNS 地址（优先 QUIC）
+                        let is_relay = addr.iter().any(|p| matches!(p, Protocol::P2pCircuit));
+                        if !is_relay {
+                            let is_quic = addr.iter().any(|p| matches!(p, Protocol::QuicV1));
+                            let entry = self.mdns_cache.entry(peer_id);
+                            if let std::collections::hash_map::Entry::Occupied(mut e) = entry {
+                                // 优先保留 QUIC 地址
+                                let existing_is_quic = e.get().iter().any(|p| matches!(p, Protocol::QuicV1));
+                                if is_quic || !existing_is_quic {
+                                    e.insert(addr);
+                                }
+                            } else {
+                                entry.or_insert(addr);
+                            }
+                        }
+                    }
+                }
+                SwarmEvent::Behaviour(ViewerBehaviourEvent::Mdns(
+                    mdns::Event::Expired(peers),
+                )) => {
+                    for (peer_id, _addr) in peers {
+                        tracing::debug!("[Viewer] mDNS peer expired: {peer_id}");
+                        // 注意：不立即从缓存移除，因为 Expired 可能只是某个地址过期
+                        // 缓存会在下次 Discovered 时更新
                     }
                 }
                 SwarmEvent::Behaviour(ViewerBehaviourEvent::Dcutr(
@@ -456,7 +637,10 @@ impl MediaPlayer {
                     dcutr::Event { result: Err(err), remote_peer_id, .. },
                 )) => {
                     let err_str = err.to_string();
-                    tracing::warn!("[Viewer] DCUtR failed with {remote_peer_id}: {err}");
+                    let local_nat = self.nat_diagnostic.diagnose().nat_type.short_name().to_string();
+                    let remote_nat = self.remote_nat_hint.clone().unwrap_or_else(|| "Unknown".to_string());
+                    tracing::warn!("[Viewer] DCUtR hole punch FAILED with {remote_peer_id}: {err}");
+                    tracing::warn!("[Viewer] NAT context: local={}, remote={}", local_nat, remote_nat);
                     if err_str.contains("timeout") {
                         tracing::warn!("[Viewer] DCUtR failure cause: NAT type incompatibility or firewall blocking UDP");
                     } else if err_str.contains("IO error") || err_str.contains("connection refused") || err_str.contains("network unreachable") {
@@ -473,11 +657,25 @@ impl MediaPlayer {
                             tracing::warn!("[Viewer] Fallback: Relay circuit may be lost, connection may drop soon");
                         }
                     }
+                    // 失败退避：累计打洞失败，达到阈值则通知上层下次重连禁用 DCUtR
+                    self.dcutr_fail_count += 1;
+                    if self.dcutr_fail_count >= 2 {
+                        tracing::warn!(
+                            "[Viewer] DCUtR 已失败 {} 次，对本端无效（如 4G/CGNAT 入站 UDP 被屏蔽）。\
+                             将通知上层在下次重连禁用 DCUtR，仅走中继电路，避免无效打洞干扰视频流。",
+                            self.dcutr_fail_count
+                        );
+                        let _ = self.event_sender.send(MediaPlayerEvent::DcutrBackoff).await;
+                    }
                 }
                 SwarmEvent::Behaviour(ViewerBehaviourEvent::Identify(
                     identify::Event::Received { info, peer_id: identify_peer_id, .. },
                 )) => {
-                    tracing::info!("[Viewer] Identify: observed_addr={}", info.observed_addr);
+                    tracing::info!("[Viewer] Identify: observed_addr={}, listen_addrs={}",
+                        info.observed_addr,
+                        info.listen_addrs.len());
+
+                    // NAT 诊断：记录观测地址
                     self.nat_diagnostic.record_observed(&info.observed_addr);
                     if let Some(Protocol::Ip4(ip)) = info.observed_addr.iter().find(|p| matches!(p, Protocol::Ip4(_))) {
                         if ip.is_private() {
@@ -488,6 +686,17 @@ impl MediaPlayer {
                     }
                     if info.observed_addr.iter().any(|p| matches!(p, Protocol::QuicV1)) {
                         tracing::info!("[Viewer] Observed address protocol: QUIC - good for DCUtR hole punching");
+                        // NAT 端口映射检测
+                        if let Some(Protocol::Udp(observed_port)) = info.observed_addr.iter().find(|p| matches!(p, Protocol::Udp(_))) {
+                            let local_port = self.udp_port;
+                            if local_port != 0 && observed_port != local_port {
+                                tracing::warn!("[Viewer] NAT port mapping detected: local UDP port {} → observed UDP port {}", local_port, observed_port);
+                                tracing::warn!("[Viewer] This may indicate symmetric NAT, which prevents DCUtR hole-punching");
+                                tracing::info!("[Viewer] Consider configuring port forwarding: router maps external UDP {} → internal UDP {}", observed_port, local_port);
+                            } else if local_port != 0 && observed_port == local_port {
+                                tracing::info!("[Viewer] Observed UDP port {} matches local QUIC port - good for DCUtR", observed_port);
+                            }
+                        }
                     } else if info.observed_addr.iter().any(|p| matches!(p, Protocol::Tcp(_))) {
                         tracing::warn!("[Viewer] Observed address protocol: TCP only - DCUtR will produce TCP candidates, hole punching unlikely to succeed");
                     }
@@ -507,8 +716,6 @@ impl MediaPlayer {
                         );
                     }
                     // 汇总日志：本端 NAT 类型 + 当前 DCUtR 实际状态
-                    // 注意：symmetric_detected=true 只能说明"下次重连会禁用"，当前连接的 DCUtR
-                    // 仍然活跃（因为 Swarm 创建时已确定）。另外检查当前 swarm 中 dcutr 是否真被禁用。
                     let dcutr_currently_enabled = self.swarm.behaviour().dcutr.is_enabled();
                     tracing::info!(
                         "[Viewer] === NAT type: {} ({}) | DCUtR currently {} | will skip on reconnect: {} ===",
@@ -518,40 +725,64 @@ impl MediaPlayer {
                         self.symmetric_detected
                     );
 
-                    // 局域网直连检测：检查对端 listen_addrs 中是否有与本地 IP 同子网的 QUIC 地址
-                    if let Some(device_cam) = self.device_cam_peer_id {
-                        if identify_peer_id == device_cam
-                            && !self.connection_quality.direct_upgraded
-                            && !self.lan_direct_attempted
-                        {
-                            let local_ips = self.nat_diagnostic.local_ips();
-                            let lan_addrs: Vec<Multiaddr> = info.listen_addrs.iter()
-                                .filter(|a| a.iter().any(|p| matches!(p, Protocol::QuicV1)))
-                                .filter(|a| !a.iter().any(|p| matches!(p, Protocol::P2pCircuit)))
-                                .filter(|a| {
-                                    if let Some(Protocol::Ip4(ip)) = a.iter().find(|p| matches!(p, Protocol::Ip4(_))) {
-                                        ip.is_private() && !ip.is_loopback()
-                                    } else {
-                                        false
-                                    }
-                                })
-                                .filter(|a| {
-                                    if let Some(Protocol::Ip4(remote_ip)) = a.iter().find(|p| matches!(p, Protocol::Ip4(_))) {
-                                        local_ips.iter().any(|local_ip| is_same_subnet(*local_ip, remote_ip))
-                                    } else {
-                                        false
-                                    }
-                                })
-                                .cloned()
-                                .collect();
+                    // 发送 NAT 诊断事件
+                    let _ = self.event_sender.send(MediaPlayerEvent::NatDiagnosis {
+                        local_nat: diag.nat_type,
+                        remote_nat: self.remote_nat_hint.clone(),
+                    }).await;
 
-                            if !lan_addrs.is_empty() {
-                                self.lan_direct_attempted = true;
-                                for addr in &lan_addrs {
-                                    tracing::info!("[Viewer] LAN direct: detected same-subnet address {addr}, dialing...");
+                    // 对端 NAT 类型推断 + 局域网直连检测（仅对 device-cam 的 Identify 事件）
+                    if let Some(device_cam) = self.device_cam_peer_id {
+                        if identify_peer_id == device_cam {
+                            // 对端 NAT 类型推断
+                            if let Some(Protocol::Udp(observed_port)) = info.observed_addr.iter().find(|p| matches!(p, Protocol::Udp(_))) {
+                                let remote_quic_port = info.listen_addrs.iter()
+                                    .filter(|a| a.iter().any(|p| matches!(p, Protocol::QuicV1)))
+                                    .filter_map(|a| a.iter().find(|p| matches!(p, Protocol::Udp(_))))
+                                    .find_map(|p| if let Protocol::Udp(port) = p { Some(port) } else { None });
+
+                                if let Some(remote_port) = remote_quic_port {
+                                    if observed_port == remote_port {
+                                        self.remote_nat_hint = Some("Cone".to_string());
+                                        tracing::info!("[Viewer] Remote peer NAT hint: Cone (observed port {} matches listen port {})", observed_port, remote_port);
+                                    } else {
+                                        self.remote_nat_hint = Some("Symmetric?".to_string());
+                                        tracing::warn!("[Viewer] Remote peer NAT hint: possibly Symmetric (observed port {} != listen port {})", observed_port, remote_port);
+                                    }
                                 }
-                                if let Err(e) = self.swarm.dial(lan_addrs[0].clone()) {
-                                    tracing::warn!("[Viewer] LAN direct dial failed: {e}");
+                            }
+
+                            // 局域网直连检测
+                            if !self.connection_quality.direct_upgraded && !self.lan_direct_attempted {
+                                let local_ips = self.nat_diagnostic.local_ips();
+                                let lan_addrs: Vec<Multiaddr> = info.listen_addrs.iter()
+                                    .filter(|a| a.iter().any(|p| matches!(p, Protocol::QuicV1)))
+                                    .filter(|a| !a.iter().any(|p| matches!(p, Protocol::P2pCircuit)))
+                                    .filter(|a| {
+                                        if let Some(Protocol::Ip4(ip)) = a.iter().find(|p| matches!(p, Protocol::Ip4(_))) {
+                                            ip.is_private() && !ip.is_loopback()
+                                        } else {
+                                            false
+                                        }
+                                    })
+                                    .filter(|a| {
+                                        if let Some(Protocol::Ip4(remote_ip)) = a.iter().find(|p| matches!(p, Protocol::Ip4(_))) {
+                                            local_ips.iter().any(|local_ip| is_same_subnet(*local_ip, remote_ip))
+                                        } else {
+                                            false
+                                        }
+                                    })
+                                    .cloned()
+                                    .collect();
+
+                                if !lan_addrs.is_empty() {
+                                    self.lan_direct_attempted = true;
+                                    for addr in &lan_addrs {
+                                        tracing::info!("[Viewer] LAN direct: detected same-subnet address {addr}, dialing...");
+                                    }
+                                    if let Err(e) = self.swarm.dial(lan_addrs[0].clone()) {
+                                        tracing::warn!("[Viewer] LAN direct dial failed: {e}");
+                                    }
                                 }
                             }
                         }
@@ -608,11 +839,32 @@ impl MediaPlayer {
                                     self.video_abort_handle = Some(handle);
                                     tracing::info!("[Viewer] Stream upgraded: sub → main (direct connection established)");
 
+                                    // 发送直连升级事件
+                                    let is_lan = self.connection_quality.connection_type == ConnectionType::LanDirect;
+                                    let _ = self.event_sender.send(MediaPlayerEvent::DirectUpgraded { via_lan: is_lan }).await;
+
                                     // 直连升级成功后，关闭中继连接
                                     // 防止 DCUtR 基于中继连接继续尝试打洞，导致视频卡顿
                                     if let Some(relay_conn_id) = self.relay_connection_id.take() {
                                         tracing::info!("[Viewer] Closing relay circuit connection after direct upgrade (prevents DCUtR interference)");
                                         self.swarm.close_connection(relay_conn_id);
+                                    }
+
+                                    // 音频流也升级到直连
+                                    if !self.no_audio {
+                                        match self.stream_control.open_stream(device_cam, stream_protocols::AUDIO_PROTOCOL).await {
+                                            Ok(new_stream) => {
+                                                if let Some(h) = self.audio_abort_handle.take() { h.abort(); }
+                                                let handle = tokio::spawn(
+                                                    Self::receive_frames(device_cam, new_stream, self.audio_sender.clone(), self.event_sender.clone())
+                                                ).abort_handle();
+                                                self.audio_abort_handle = Some(handle);
+                                                println!("[Viewer] Audio stream upgraded to direct connection");
+                                            }
+                                            Err(e) => {
+                                                println!("[Viewer] Failed to open direct audio stream: {e}");
+                                            }
+                                        }
                                     }
                                 }
                                 Err(e) => {
@@ -644,6 +896,36 @@ impl MediaPlayer {
                         }).await;
                     } else {
                         tracing::info!("[Viewer] Connection to {peer_id} closed, {num_established} remaining");
+                    }
+                }
+                SwarmEvent::NewListenAddr { address, .. } => {
+                    // 将本地 QUIC 地址注入为 DCUtR 候选地址
+                    let is_quic = address.iter().any(|p| matches!(p, Protocol::QuicV1));
+                    let is_relayed = address.iter().any(|p| matches!(p, Protocol::P2pCircuit));
+                    if is_quic && !is_relayed {
+                        if let Some(Protocol::Ip4(ip)) = address.iter().find(|p| matches!(p, Protocol::Ip4(_))) {
+                            if !ip.is_loopback() && !ip.is_unspecified() {
+                                self.swarm.add_external_address(address.clone());
+                                tracing::info!("[Viewer] Added local address as DCUtR candidate: {address}");
+
+                                // 收集本地 IP 和端口用于 NAT 诊断
+                                if !self.local_ips.contains(&ip) {
+                                    self.local_ips.push(ip);
+                                }
+                                if let Some(Protocol::Udp(port)) = address.iter().find(|p| matches!(p, Protocol::Udp(_))) {
+                                    self.local_quic_port = port;
+                                }
+                                // 延迟初始化 NatDiagnostic（需要端口和 IP）
+                                if self.nat_diagnostic.observed_history_is_empty() && self.local_quic_port != 0 && !self.local_ips.is_empty() {
+                                    let mut diag = NatDiagnostic::new(self.local_quic_port, self.local_ips.clone());
+                                    if self.network_type == "4g" {
+                                        diag.set_force_4g(true);
+                                    }
+                                    self.nat_diagnostic = diag;
+                                    tracing::info!("[Viewer] NAT diagnostic initialized: port={}, ips={:?}", self.local_quic_port, self.local_ips);
+                                }
+                            }
+                        }
                     }
                 }
                 _ => {
@@ -686,41 +968,137 @@ impl MediaPlayer {
         tracing::info!("[Viewer] Reconnecting in {}s...", RECONNECT_DELAY.as_secs());
         tokio::time::sleep(RECONNECT_DELAY).await;
 
-        // 若已确认 Symmetric NAT，重建 Swarm 并禁用 DCUtR，
-        // 避免每次重连都进行 ~17s 的无效打洞（Toggle 无法运行时切换，只能重建）。
-        if self.symmetric_detected {
+        // 始终重建 Swarm（与老版本 run_viewer_session 行为一致）：
+        // 1. 新 Swarm = 新 mDNS 实例 → mDNS 从零发现 → 重连能走 LAN Direct
+        // 2. 旧 Swarm 的 mDNS 不会重新触发 Discovered 事件（peer 已知），导致重连走 Relay
+        // 3. 若已确认 Symmetric NAT，禁用 DCUtR 避免无效打洞
+        let enable_dcutr = !self.symmetric_detected;
+        if !enable_dcutr {
             tracing::info!("[Viewer] Rebuilding Swarm with DCUtR DISABLED (Symmetric NAT confirmed)");
-            self.swarm = Self::build_swarm(&self.keypair, false)?;
-            self.stream_control = self.swarm.behaviour().stream.new_control();
-            // 重置 NAT 诊断状态：新 Swarm 需要重新通过 Identify 观测地址
-            self.nat_diagnostic = NatDiagnostic::new(0, Vec::new());
         }
+        self.swarm = Self::build_swarm(&self.keypair, enable_dcutr)?;
+        self.stream_control = self.swarm.behaviour().stream.new_control();
+        // 重置 NAT 诊断状态：新 Swarm 需要重新通过 Identify 观测地址
+        self.nat_diagnostic = NatDiagnostic::new(0, Vec::new());
+
+        // 关键：重建 Swarm 后必须 listen_on，否则 mDNS/DCUtR/QUIC 全部失效
+        let udp_addr = format!("/ip4/0.0.0.0/udp/{}/quic-v1", self.udp_port).parse()
+            .context("Invalid local QUIC listen addr")?;
+        self.swarm.listen_on(udp_addr)?;
+        self.swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()
+            .context("Invalid local TCP listen addr")?)?;
 
         // 停止旧的接收任务
         if let Some(h) = self.video_abort_handle.take() { h.abort(); }
         if let Some(h) = self.audio_abort_handle.take() { h.abort(); }
 
-        // 清空 jitter buffer 中的旧数据
-        self.jitter.clear();
+        // 清空 channel 中旧 session 的残留帧，避免新 session 取到旧 P 帧导致花屏
+        while self.video_receiver.try_recv().is_ok() {}
+        while self.audio_receiver.try_recv().is_ok() {}
 
-        self.connect(
+        self.connect_with_options(
             &params.relay_addrs,
             &params.device_cam_peer_id,
             params.enable_mdns,
             &params.stream_type,
-        ).await
+            ConnectOptions {
+                udp_port: self.udp_port,
+                network_type: self.network_type.clone(),
+                no_audio: params.no_audio,
+            },
+        ).await?;
+
+        // connect_with_options 执行期间 receive_frames 已在产出帧，
+        // 这些帧积压在 channel 中会导致延迟。丢弃积压帧，只保留最新关键帧及其后续帧。
+        self.drain_to_latest_keyframe();
+
+        Ok(())
+    }
+
+    /// 优雅关闭当前连接（abort 接收任务 + disconnect peer），但不断开 Swarm
+    pub fn shutdown(&mut self) {
+        if let Some(h) = self.video_abort_handle.take() { h.abort(); }
+        if let Some(h) = self.audio_abort_handle.take() { h.abort(); }
+        // 清空 channel 残留帧
+        while self.video_receiver.try_recv().is_ok() {}
+        while self.audio_receiver.try_recv().is_ok() {}
+        if let Some(device_cam) = self.device_cam_peer_id {
+            let _ = self.swarm.disconnect_peer_id(device_cam);
+        }
+        self.connected = false;
+        println!("[Viewer] Session shutdown, closing connection to device");
+    }
+
+    /// 获取本地 IP 列表
+    pub fn local_ips(&self) -> &[Ipv4Addr] {
+        &self.local_ips
+    }
+
+    /// 获取本地 QUIC 端口
+    pub fn local_quic_port(&self) -> u16 {
+        self.local_quic_port
+    }
+
+    /// 设置 DCUtR 启用/禁用（供上层在收到 DcutrBackoff 后调用）
+    /// 注意：Toggle 无法运行时切换，此方法仅标记标志，重连时通过 rebuild Swarm 生效
+    pub fn set_enable_dcutr(&mut self, enable: bool) {
+        if !enable {
+            self.symmetric_detected = true;
+        }
     }
 
     // ---- 内部方法 ----
+
+    /// 丢弃 channel 中积压的旧帧，只保留最新关键帧及其后续帧。
+    /// 重连后调用，避免 connect_with_options 期间积压的帧导致延迟。
+    fn drain_to_latest_keyframe(&mut self) {
+        // 收集 channel 中所有视频帧
+        let mut frames: Vec<MediaPacket> = Vec::new();
+        while let Ok(packet) = self.video_receiver.try_recv() {
+            frames.push(packet);
+        }
+
+        if frames.is_empty() {
+            return;
+        }
+
+        let total = frames.len();
+
+        // 找到最后一个关键帧的位置，只保留从该关键帧开始的帧
+        let last_kf_pos = frames.iter().rposition(|p| is_nal_keyframe(&p.data));
+        if let Some(pos) = last_kf_pos {
+            let kept: Vec<MediaPacket> = frames.into_iter().skip(pos).collect();
+            let dropped = total - kept.len();
+            // 重新放回 channel
+            for packet in kept {
+                if self.video_sender.try_send(packet).is_err() {
+                    break;
+                }
+            }
+            if dropped > 0 {
+                tracing::debug!("[Viewer] Drained {dropped} stale frames, kept from latest keyframe");
+            }
+        }
+        // 如果没有关键帧，丢弃所有帧（下一轮 poll_video_frame 会取到新帧）
+    }
 
     /// 等待与 DeviceCam 的连接建立，并判断连接方式（转发/直连）
     ///
     /// 在 ConnectionEstablished 事件中分析 Multiaddr 判断连接方式，
     /// 返回 ConnectionType 用于码流自动选择。
     async fn wait_for_connection_and_classify(&mut self) -> Result<ConnectionType> {
+        let device_cam = self.device_cam_peer_id
+            .ok_or_else(|| anyhow::anyhow!("device_cam_peer_id not set"))?;
+
         loop {
             match self.swarm.select_next_some().await {
                 SwarmEvent::ConnectionEstablished { peer_id, endpoint, connection_id, .. } => {
+                    // 只关注 device-cam 的连接事件，忽略其他 peer（如 relay）
+                    if peer_id != device_cam {
+                        tracing::debug!("[Viewer] Ignoring connection to non-target peer {peer_id}");
+                        continue;
+                    }
+
                     let addr = endpoint.get_remote_address().clone();
                     println!("[Viewer] Connected to {peer_id}");
 
@@ -745,6 +1123,12 @@ impl MediaPlayer {
                     tracing::info!("[Viewer] Connection type: {}", conn_type.description());
                     return Ok(conn_type);
                 }
+                SwarmEvent::OutgoingConnectionError { peer_id: Some(peer_id), error, .. } => {
+                    if peer_id == device_cam {
+                        anyhow::bail!("Connection to device-cam failed: {error}");
+                    }
+                    tracing::warn!("[Viewer] Connection error to {peer_id}: {error}");
+                }
                 SwarmEvent::OutgoingConnectionError { error, .. } => {
                     anyhow::bail!("Connection failed: {error}");
                 }
@@ -755,51 +1139,8 @@ impl MediaPlayer {
         }
     }
 
-    /// 等待首个关键帧的最长时间（最后安全网）。正常情况下门控由 `is_nal_keyframe` 扫描
-    /// 字节流里的真实 IDR NAL 立即开门（cam 在 `request_idr` 后很快产出真 IDR），不会等到这里。
-    /// 仅当字节扫描也异常时才兜底强制开门，避免 `!got_first_idr` 门控永久不开 → 黑屏。
-    /// 3s 足够覆盖一个 GOP 周期（gop=50@25fps≈2s），正常绝不触发。
-    // 最后安全网: 仅当字节扫描(is_nal_keyframe)也异常时才兜底强制开门。
-    // 正常情况下 cam 在 request_idr 后很快产出真 IDR(配合短 GOP=15 约 0.75s 即到),
-    // 本超时不会触发。设为 5s 以覆盖设备仍跑旧 gop=40(自然 IDR 实测~4.7s)的情况,
-    // 避免超时抢在真实 IDR 之前触发 → 解码器被迫解码无参考 P 帧 → 马赛克。
-    const IDR_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-
-    /// 从 Annex B 裸流扫描 NAL，判断是否为关键帧（IRAP）。
-    /// H.265: IRAP NAL type 16..=21 (BLA/IDR/CRA)；H.264: IDR NAL type 5。
-    /// 与 C 侧 `rk_camera.c` 的 `is_keyframe_h265/h264` 判定范围一致，但在 viewer 侧**独立扫描
-    /// 字节**，不依赖对端 `is_keyframe()` 标志位。日志实证：cam 发的 IDR 数据字节里确有 IRAP
-    /// NAL（ffmpeg 能据此恢复解码），但 `is_keyframe()` 标志常不可靠（8s 内检测不到），
-    /// 故必须用本函数扫字节兜底——这是之前版本快速起播的关键，删掉它改用 `is_keyframe()`
-    /// 正是起播变慢（卡满超时）的根因。
-    fn is_nal_keyframe(data: &[u8]) -> bool {
-        let len = data.len();
-        let mut i = 0;
-        while i + 4 < len {
-            let hdr_off = if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 0 && data[i + 3] == 1 {
-                i + 4
-            } else if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
-                i + 3
-            } else {
-                i += 1;
-                continue;
-            };
-            let b = data[hdr_off];
-            let h265_type = (b >> 1) & 0x3F;
-            if (16..=21).contains(&h265_type) {
-                return true;
-            }
-            let h264_type = b & 0x1F;
-            if h264_type == 5 {
-                return true;
-            }
-            i = hdr_off + 1;
-        }
-        false
-    }
-
     /// 从 stream 持续读取帧，送入 channel
-    /// EOF 或读错误时通过 event_sender 发送 Disconnected 通知
+    /// EOF 时发送 StreamEOF 通知，读错误时发送 Disconnected 通知
     async fn receive_frames(
         peer_id: PeerId,
         mut stream: libp2p::swarm::Stream,
@@ -819,7 +1160,7 @@ impl MediaPlayer {
             match stream.read(&mut read_buf).await {
                 Ok(0) => {
                     tracing::warn!("[Viewer] Stream EOF from {peer_id}");
-                    let _ = event_sender.send(MediaPlayerEvent::Disconnected {
+                    let _ = event_sender.send(MediaPlayerEvent::StreamEOF {
                         reason: format!("Stream EOF from {peer_id}"),
                     }).await;
                     break;
@@ -830,7 +1171,7 @@ impl MediaPlayer {
                     // 尝试解码所有完整的包
                     while let Some(packet) = MediaPacket::try_decode(&mut buf) {
                         // 仅对视频流做 IDR 容错；音频始终透传。
-                        // 关键帧判定: 仅用 viewer 自身字节扫描 `Self::is_nal_keyframe`
+                        // 关键帧判定: 仅用 viewer 自身字节扫描 `is_nal_keyframe`
                         // (H.265 IRAP 16-21 / H.264 IDR 5), receiver 自包含、不信任对端 flag。
                         // cam 侧已不再计算 keyframe 标志(见 rk_video_source.rs), JNI 桥也不转发该 flag,
                         // 故此处为唯一权威判定。收到首个 IDR 前的非关键帧直接丢弃(解码器无参考帧会报错),
@@ -839,9 +1180,9 @@ impl MediaPlayer {
                             if first_video_at.is_none() {
                                 first_video_at = Some(std::time::Instant::now());
                             }
-                            let is_kf = Self::is_nal_keyframe(&packet.data);
+                            let is_kf = is_nal_keyframe(&packet.data);
                             let waited = first_video_at.map(|t| t.elapsed());
-                            if is_kf || waited.map_or(false, |w| w >= Self::IDR_WAIT_TIMEOUT) {
+                            if is_kf || waited.map_or(false, |w| w >= IDR_WAIT_TIMEOUT) {
                                 got_first_idr = true;
                                 if is_kf {
                                     tracing::info!(
@@ -850,7 +1191,7 @@ impl MediaPlayer {
                                 } else {
                                     tracing::warn!(
                                         "[Viewer] No IDR within {:?}, forwarding video anyway (cam keyframe flag may be unreliable)",
-                                        Self::IDR_WAIT_TIMEOUT
+                                        IDR_WAIT_TIMEOUT
                                     );
                                 }
                             } else {
