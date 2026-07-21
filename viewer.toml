@@ -8,4 +8,5 @@ relays = [
 camera = "12D3KooWG2ihY7Ne75KqkYyYrQWL1ACLUgUN8rp1nTskQB3RNNNt"
 no_audio = false
 play = true
-network_type = "4g"
+network_type = "auto"
+stream = "auto"

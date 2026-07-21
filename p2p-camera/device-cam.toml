@@ -16,6 +16,8 @@ enable_mdns = true
 # 是否启用 DCUtR 直连打洞。
 # 4G/CGNAT 等入站 UDP 被屏蔽的网络下打洞必然失败，且其握手会挤占中继视频流
 # 写入带宽，导致 SLOW write / 帧丢弃 / 卡顿。viewer 在 4G 时务必设为 false，仅走中继。
+# 方案 B 实测失败（cam 在 4G/CGNAT 对称 NAT，DCUtR 打不通），回退方案 A 强制 main 流，
+# 故此处保持 false，避免打洞握手挤占中继带宽。
 enable_dcutr = false
 
 # 运行模式 (listen: 等待 viewer 连接)

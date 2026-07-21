@@ -5,7 +5,7 @@
 //! API:
 //!   nativeCreate()                  -> Long handle
 //!   nativeConnect(handle, json)     -> Boolean
-//!   nativePollVideoFrame(handle)    -> byte[] or null  (PTS prefix + H.265 data)
+//!   nativePollVideoFrame(handle)    -> byte[] or null  (PTS 8B + flags 1B + H.265 data)
 //!   nativePollAudioFrame(handle)    -> byte[] or null  (PTS prefix + PCM data)
 //!   nativePollEvent(handle)         -> String or null
 //!   nativeDestroy(handle)           -> void
@@ -35,6 +35,9 @@ enum ViewerEvent {
         connection_type: String,
     },
     StreamReady,
+    DirectUpgraded {
+        connection_type: String,
+    },
     Disconnected,
     Error {
         message: String,
@@ -250,6 +253,10 @@ pub extern "system" fn Java_com_p2pcamera_mediaplayer_RustBridge_nativeCreate(
                                 MediaPlayerEvent::DirectUpgraded { via_lan } => {
                                     let conn_type = if via_lan { "LAN direct" } else { "DCUtR" };
                                     tracing::info!("[JNI] Direct upgraded: {conn_type}");
+                                    // 通知 Android 侧直连升级 (从 sub 流切换到 main 流)
+                                    let _ = event_tx.send(ViewerEvent::DirectUpgraded {
+                                        connection_type: conn_type.to_string(),
+                                    });
                                 }
                                 MediaPlayerEvent::StreamEOF { reason } => {
                                     tracing::warn!("[JNI] Stream EOF: {reason}");
@@ -391,14 +398,19 @@ pub extern "system" fn Java_com_p2pcamera_mediaplayer_RustBridge_nativeConnect(
 ///
 /// Kotlin: external fun nativePollVideoFrame(handle: Long): ByteArray?
 ///
-/// 返回格式: [PTS(8 bytes, big-endian i64, µs)] + [H.265 NAL data]
+/// 返回格式: [PTS(8 bytes, big-endian i64, µs)] + [flags(1 byte)] + [H.265 NAL data]
+///   - flags bit 2 (0x04, FLAG_VIDEO_KEYFRAME) = 关键帧, 由 viewer 接收端字节扫描判定
+///     (cam 不计算/不传该标志, 实测不可靠), 此处为唯一权威值。
+///     原生 APP 用 `(flags & 0x04) != 0` 判定关键帧。
 /// 无帧时返回 null
 ///
 /// Kotlin 侧解包:
 /// ```kotlin
 /// val buf = java.nio.ByteBuffer.wrap(data).order(java.nio.ByteOrder.BIG_ENDIAN)
-/// val ptsUs = buf.long
-/// val frameData = data.sliceArray(8 until data.size)
+/// val ptsUs = buf.long                       // 8 bytes
+/// val flags = buf.get().toInt() and 0xFF     // 1 byte
+/// val isKeyframe = (flags and 0x04) != 0     // FLAG_VIDEO_KEYFRAME
+/// val frameData = data.sliceArray(9 until data.size)
 /// ```
 #[no_mangle]
 pub extern "system" fn Java_com_p2pcamera_mediaplayer_RustBridge_nativePollVideoFrame(
@@ -422,7 +434,10 @@ pub extern "system" fn Java_com_p2pcamera_mediaplayer_RustBridge_nativePollVideo
             let data = &packet.data;
             let pts_us = (packet.timestamp_ms * 1000) as i64;
             let pts_bytes = pts_us.to_be_bytes();
-            let total_len = (8 + data.len()) as i32;
+            // flags 字节: 含关键帧 bit (FLAG_VIDEO_KEYFRAME=0x04), 由 viewer 接收端字节扫描判定
+            // (cam 不计算/不传, 实测不可靠), 此处为唯一权威值。原生 APP 用 (flags & 0x04) != 0 判定关键帧。
+            let flags = packet.flags;
+            let total_len = (8 + 1 + data.len()) as i32;
 
             match env.new_byte_array(total_len) {
                 Ok(arr) => {
@@ -431,11 +446,16 @@ pub extern "system" fn Java_com_p2pcamera_mediaplayer_RustBridge_nativePollVideo
                         std::slice::from_raw_parts(pts_bytes.as_ptr() as *const i8, 8)
                     };
                     let _ = env.set_byte_array_region(&arr, 0, pts_i8);
-                    // 写帧数据
+                    // 写 flags (1 byte): bit 2 (0x04) = 关键帧
+                    let flags_i8: &[i8] = unsafe {
+                        std::slice::from_raw_parts(&flags as *const u8 as *const i8, 1)
+                    };
+                    let _ = env.set_byte_array_region(&arr, 8, flags_i8);
+                    // 写帧数据 (从 offset 9 开始)
                     let data_i8: &[i8] = unsafe {
                         std::slice::from_raw_parts(data.as_ptr() as *const i8, data.len())
                     };
-                    let _ = env.set_byte_array_region(&arr, 8, data_i8);
+                    let _ = env.set_byte_array_region(&arr, 9, data_i8);
                     arr.into_raw()
                 }
                 Err(_) => std::ptr::null_mut(),
