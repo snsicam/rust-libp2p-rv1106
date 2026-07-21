@@ -32,6 +32,7 @@
 
 // ISP (rkaiq) 头文件
 #include "rk_aiq_user_api2_sysctl.h"
+#include "rk_aiq_user_api2_imgproc.h"
 
 // ---- 常量定义 ----
 
@@ -1082,6 +1083,296 @@ void rk_audio_deinit() {
     g_audio_initialized = 0;
     g_aenc_enabled = 0;
     printf("[rk_camera] audio deinitialized\n");
+}
+
+// ---- 控制通道: ISP 图像参数 C shim ----
+// 供 Rust FFI 调用，利用已有的 g_aiq_ctx 操作 rkaiq SDK
+
+// ACP 参数类型枚举 (对应 acp_attrib_t 的不同字段)
+#define RK_CAM_ACP_CONTRAST     0
+#define RK_CAM_ACP_BRIGHTNESS   1
+#define RK_CAM_ACP_SATURATION   2
+#define RK_CAM_ACP_HUE          3
+
+// 设置 ACP 参数 (contrast/brightness/saturation/hue)
+// value: 0-100 (rkipc 范围), 内部映射到 0-255 (rkaiq 范围: value * 2.55)
+int rk_camera_set_acp_param(int param_type, int value) {
+    if (!g_aiq_ctx) {
+        printf("[rk_camera] ERROR: set_acp_param: ISP not initialized\n");
+        return -1;
+    }
+
+    acp_attrib_t attrib;
+    memset(&attrib, 0, sizeof(attrib));
+
+    if (rk_aiq_user_api2_acp_GetAttrib(g_aiq_ctx, &attrib) != 0) {
+        printf("[rk_camera] ERROR: acp_GetAttrib failed\n");
+        return -1;
+    }
+
+    float scaled = value * 2.55f;
+    switch (param_type) {
+        case RK_CAM_ACP_CONTRAST:   attrib.contrast = scaled; break;
+        case RK_CAM_ACP_BRIGHTNESS: attrib.brightness = scaled; break;
+        case RK_CAM_ACP_SATURATION: attrib.saturation = scaled; break;
+        case RK_CAM_ACP_HUE:        attrib.hue = scaled; break;
+        default:
+            printf("[rk_camera] ERROR: unknown acp param type %d\n", param_type);
+            return -1;
+    }
+
+    if (rk_aiq_user_api2_acp_SetAttrib(g_aiq_ctx, &attrib) != 0) {
+        printf("[rk_camera] ERROR: acp_SetAttrib failed\n");
+        return -1;
+    }
+
+    return 0;
+}
+
+// 获取 ACP 参数 (contrast/brightness/saturation/hue)
+// 返回值: 0-100 范围 (从 rkaiq 的 0-255 映射回来: value / 2.55)
+int rk_camera_get_acp_param(int param_type) {
+    if (!g_aiq_ctx) {
+        return -1;
+    }
+
+    acp_attrib_t attrib;
+    memset(&attrib, 0, sizeof(attrib));
+
+    if (rk_aiq_user_api2_acp_GetAttrib(g_aiq_ctx, &attrib) != 0) {
+        return -1;
+    }
+
+    float value = 0;
+    switch (param_type) {
+        case RK_CAM_ACP_CONTRAST:   value = attrib.contrast; break;
+        case RK_CAM_ACP_BRIGHTNESS: value = attrib.brightness; break;
+        case RK_CAM_ACP_SATURATION: value = attrib.saturation; break;
+        case RK_CAM_ACP_HUE:        value = attrib.hue; break;
+        default: return -1;
+    }
+
+    // 映射 0-255 → 0-100
+    int result = (int)(value / 2.55f + 0.5f);
+    if (result < 0) result = 0;
+    if (result > 100) result = 100;
+    return result;
+}
+
+// 设置锐度 (使用 asharpV33 API, 与 ACP 不同)
+// value: 0-100 (百分比)
+int rk_camera_set_sharpness(int value) {
+    if (!g_aiq_ctx) {
+        printf("[rk_camera] ERROR: set_sharpness: ISP not initialized\n");
+        return -1;
+    }
+
+    rk_aiq_sharp_strength_v33_t strength;
+    memset(&strength, 0, sizeof(strength));
+    strength.sync.sync_mode = RK_AIQ_UAPI_MODE_SYNC;
+    strength.percent = value / 100.0f;
+    strength.strength_enable = (value > 0) ? 1 : 0;
+
+    if (rk_aiq_user_api2_asharpV33_SetStrength(g_aiq_ctx, &strength) != 0) {
+        printf("[rk_camera] ERROR: asharpV33_SetStrength failed\n");
+        return -1;
+    }
+
+    return 0;
+}
+
+// 获取锐度 (从 rkaiq 读取)
+int rk_camera_get_sharpness() {
+    if (!g_aiq_ctx) {
+        return -1;
+    }
+
+    rk_aiq_sharp_strength_v33_t strength;
+    memset(&strength, 0, sizeof(strength));
+
+    if (rk_aiq_user_api2_asharpV33_GetStrength(g_aiq_ctx, &strength) != 0) {
+        return -1;
+    }
+
+    // percent 是 0.0-1.0, 映射到 0-100
+    int result = (int)(strength.percent * 100.0f + 0.5f);
+    if (result < 0) result = 0;
+    if (result > 100) result = 100;
+    return result;
+}
+
+// ============================================================
+// ISP 图像参数接口 (rk_isp_*) — 供 rk_video_source.rs 控制通道调用
+// cam_id 当前忽略 (单摄像头), 内部转调 acp/sharpness 实现。
+// ============================================================
+
+int rk_isp_get_contrast(int cam_id) {
+    (void)cam_id;
+    return rk_camera_get_acp_param(RK_CAM_ACP_CONTRAST);
+}
+int rk_isp_set_contrast(int cam_id, int value) {
+    (void)cam_id;
+    return rk_camera_set_acp_param(RK_CAM_ACP_CONTRAST, value);
+}
+int rk_isp_get_brightness(int cam_id) {
+    (void)cam_id;
+    return rk_camera_get_acp_param(RK_CAM_ACP_BRIGHTNESS);
+}
+int rk_isp_set_brightness(int cam_id, int value) {
+    (void)cam_id;
+    return rk_camera_set_acp_param(RK_CAM_ACP_BRIGHTNESS, value);
+}
+int rk_isp_get_saturation(int cam_id) {
+    (void)cam_id;
+    return rk_camera_get_acp_param(RK_CAM_ACP_SATURATION);
+}
+int rk_isp_set_saturation(int cam_id, int value) {
+    (void)cam_id;
+    return rk_camera_set_acp_param(RK_CAM_ACP_SATURATION, value);
+}
+int rk_isp_get_hue(int cam_id) {
+    (void)cam_id;
+    return rk_camera_get_acp_param(RK_CAM_ACP_HUE);
+}
+int rk_isp_set_hue(int cam_id, int value) {
+    (void)cam_id;
+    return rk_camera_set_acp_param(RK_CAM_ACP_HUE, value);
+}
+int rk_isp_get_sharpness(int cam_id) {
+    (void)cam_id;
+    return rk_camera_get_sharpness();
+}
+int rk_isp_set_sharpness(int cam_id, int value) {
+    (void)cam_id;
+    return rk_camera_set_sharpness(value);
+}
+
+// ============================================================
+// INI 参数持久化 (rk_param_*) — 简易 key=value 文件存储
+// 参考 rkipc rk_param_* 接口语义。控制通道单任务串行调用,
+// get_string 返回静态缓冲区指针 (Rust 侧调用后立即拷贝, 无需释放)。
+// ============================================================
+
+#define RK_PARAM_FILE       "/userdata/device-cam.ini"
+#define RK_PARAM_MAX_LINE   512
+#define RK_PARAM_MAX_LINES  512
+
+static pthread_mutex_t g_param_lock = PTHREAD_MUTEX_INITIALIZER;
+
+// 读取 key 的原始字符串值到 out; 返回 0=找到, -1=未找到
+static int param_read_raw(const char *key, char *out, size_t out_size) {
+    FILE *fp = fopen(RK_PARAM_FILE, "r");
+    if (!fp) return -1;
+
+    char line[RK_PARAM_MAX_LINE];
+    size_t klen = strlen(key);
+    int found = -1;
+    while (fgets(line, sizeof(line), fp)) {
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (strncmp(p, key, klen) == 0 && p[klen] == '=') {
+            char *val = p + klen + 1;
+            char *nl = strpbrk(val, "\r\n");
+            if (nl) *nl = '\0';
+            strncpy(out, val, out_size - 1);
+            out[out_size - 1] = '\0';
+            found = 0;
+            break;
+        }
+    }
+    fclose(fp);
+    return found;
+}
+
+// 写入/更新 key=value (整文件重写); 返回 0=成功, -1=失败
+static int param_write_raw(const char *key, const char *value) {
+    static char buf[RK_PARAM_MAX_LINES][RK_PARAM_MAX_LINE];
+    int n = 0;
+    size_t klen = strlen(key);
+    int replaced = 0;
+
+    FILE *fp = fopen(RK_PARAM_FILE, "r");
+    if (fp) {
+        while (n < RK_PARAM_MAX_LINES && fgets(buf[n], RK_PARAM_MAX_LINE, fp)) {
+            char *p = buf[n];
+            while (*p == ' ' || *p == '\t') p++;
+            if (!replaced && strncmp(p, key, klen) == 0 && p[klen] == '=') {
+                snprintf(buf[n], RK_PARAM_MAX_LINE, "%s=%s\n", key, value);
+                replaced = 1;
+            }
+            n++;
+        }
+        fclose(fp);
+    }
+    if (!replaced && n < RK_PARAM_MAX_LINES) {
+        snprintf(buf[n], RK_PARAM_MAX_LINE, "%s=%s\n", key, value);
+        n++;
+    }
+
+    FILE *out = fopen(RK_PARAM_FILE, "w");
+    if (!out) {
+        printf("[rk_camera] ERROR: cannot write param file %s\n", RK_PARAM_FILE);
+        return -1;
+    }
+    for (int i = 0; i < n; i++) fputs(buf[i], out);
+    fflush(out);
+    fclose(out);
+    sync();
+    return 0;
+}
+
+int rk_param_get_int(const char *key, int default_value) {
+    pthread_mutex_lock(&g_param_lock);
+    char val[RK_PARAM_MAX_LINE];
+    int ret = default_value;
+    if (param_read_raw(key, val, sizeof(val)) == 0) {
+        ret = atoi(val);
+    }
+    pthread_mutex_unlock(&g_param_lock);
+    return ret;
+}
+
+int rk_param_set_int(const char *key, int value) {
+    char val[32];
+    snprintf(val, sizeof(val), "%d", value);
+    pthread_mutex_lock(&g_param_lock);
+    int ret = param_write_raw(key, val);
+    pthread_mutex_unlock(&g_param_lock);
+    return ret;
+}
+
+char *rk_param_get_string(const char *key, const char *default_value) {
+    static char s_buf[RK_PARAM_MAX_LINE];
+    pthread_mutex_lock(&g_param_lock);
+    if (param_read_raw(key, s_buf, sizeof(s_buf)) != 0) {
+        strncpy(s_buf, default_value ? default_value : "", sizeof(s_buf) - 1);
+        s_buf[sizeof(s_buf) - 1] = '\0';
+    }
+    pthread_mutex_unlock(&g_param_lock);
+    return s_buf;
+}
+
+int rk_param_set_string(const char *key, const char *value) {
+    pthread_mutex_lock(&g_param_lock);
+    int ret = param_write_raw(key, value ? value : "");
+    pthread_mutex_unlock(&g_param_lock);
+    return ret;
+}
+
+// ============================================================
+// 系统操作 (rk_system_*)
+// ============================================================
+
+int rk_system_reboot(void) {
+    sync();
+    return system("reboot");
+}
+
+int rk_system_factory_reset(void) {
+    // 删除持久化配置, 恢复默认后重启
+    remove(RK_PARAM_FILE);
+    sync();
+    return system("reboot");
 }
 
 // ---- Stubs for glibc functions missing in uclibc ----

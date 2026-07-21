@@ -55,6 +55,10 @@ enum Cmd {
         no_audio: bool,
         network_type: String,
     },
+    Control {
+        request_json: String,
+        response_tx: Sender<String>,
+    },
 }
 
 // ── ViewerHandle ──
@@ -192,10 +196,64 @@ pub extern "system" fn Java_com_p2pcamera_mediaplayer_RustBridge_nativeCreate(
                         drop(audio_tx.take());
                     }
                 }
+                Ok(Cmd::Control { response_tx, .. }) => {
+                    // 控制命令在连接前到达，返回错误并继续等待 Connect
+                    let err_resp = proto::control::ControlResponse::err("not connected");
+                    let _ = response_tx.send(serde_json::to_string(&err_resp).unwrap_or_default());
+                    // 继续等待 Connect 命令
+                    loop {
+                        match cmd_rx.recv() {
+                            Ok(Cmd::Connect { relays, device_id: did, enable_mdns, stream_type, no_audio, network_type: nt }) => {
+                                device_id = did.clone();
+                                network_type = nt;
+                                let enable_dcutr = true;
+                                println!("[Viewer] DCUtR enabled (network_type={}, will auto-disable on reconnect if Symmetric NAT detected)", network_type);
+                                viewer = match MediaPlayer::new(enable_dcutr).await {
+                                    Ok(v) => v,
+                                    Err(e) => {
+                                        let _ = event_tx.send(ViewerEvent::Error {
+                                            message: format!("create viewer: {e}"),
+                                        });
+                                        return;
+                                    }
+                                };
+                                let _ = event_tx.send(ViewerEvent::Connecting);
+                                let relay_strs: Vec<String> = relays.clone();
+                                match viewer
+                                    .connect(&relay_strs, &did, enable_mdns, &stream_type)
+                                    .await
+                                {
+                                    Ok(()) => {
+                                        let _ = event_tx.send(ViewerEvent::Connected {
+                                            peer_id: did,
+                                            connection_type: "relay".into(),
+                                        });
+                                        let _ = event_tx.send(ViewerEvent::StreamReady);
+                                    }
+                                    Err(e) => {
+                                        let _ = event_tx.send(ViewerEvent::Error {
+                                            message: format!("connect failed: {e}"),
+                                        });
+                                        return;
+                                    }
+                                }
+                                if no_audio {
+                                    drop(audio_tx.take());
+                                }
+                                break;
+                            }
+                            Ok(Cmd::Control { response_tx, .. }) => {
+                                let err_resp = proto::control::ControlResponse::err("not connected");
+                                let _ = response_tx.send(serde_json::to_string(&err_resp).unwrap_or_default());
+                            }
+                            Err(_) => return,
+                        }
+                    }
+                }
                 Err(_) => return, // channel closed
             }
 
-            // 主事件循环: 驱动 swarm + 轮询帧 + 检测断连 + 自动重连
+            // 主事件循环: 驱动 swarm + 轮询帧 + 检测断连 + 自动重连 + 处理控制命令
             loop {
                 tokio::select! {
                     _ = viewer.poll_swarm() => {
@@ -220,6 +278,35 @@ pub extern "system" fn Java_com_p2pcamera_mediaplayer_RustBridge_nativeCreate(
                         } else {
                             // no_audio 模式：丢弃音频帧
                             while viewer.poll_audio_frame().is_some() {}
+                        }
+
+                        // 处理控制命令 (非阻塞轮询)
+                        while let Ok(cmd) = cmd_rx.try_recv() {
+                            match cmd {
+                                Cmd::Control { request_json, response_tx } => {
+                                    let req: proto::control::ControlRequest = match serde_json::from_str(&request_json) {
+                                        Ok(r) => r,
+                                        Err(e) => {
+                                            let err_resp = proto::control::ControlResponse::err(&format!("invalid json: {e}"));
+                                            let _ = response_tx.send(serde_json::to_string(&err_resp).unwrap_or_default());
+                                            continue;
+                                        }
+                                    };
+
+                                    match viewer.send_control(&req).await {
+                                        Ok(resp) => {
+                                            let _ = response_tx.send(serde_json::to_string(&resp).unwrap_or_default());
+                                        }
+                                        Err(e) => {
+                                            let err_resp = proto::control::ControlResponse::err(&e.to_string());
+                                            let _ = response_tx.send(serde_json::to_string(&err_resp).unwrap_or_default());
+                                        }
+                                    }
+                                }
+                                Cmd::Connect { .. } => {
+                                    // Connect 命令已在循环前处理，忽略
+                                }
+                            }
                         }
 
                         // 检测 MediaPlayer 内部事件（断连/直连升级）
@@ -570,4 +657,78 @@ pub extern "system" fn Java_com_p2pcamera_mediaplayer_RustBridge_nativeDestroy(
 ) {
     let idx = handle as usize;
     drop(take_handle(idx));
+}
+
+/// 发送控制命令
+///
+/// Kotlin: external fun nativeSendControlCommand(handle: Long, json: String): String
+///
+/// json: ControlRequest JSON (如 {"type":"get_encoder_config","stream":"main"})
+/// 返回: ControlResponse JSON (如 {"ok":true,"encoder_config":{...}})
+#[no_mangle]
+pub extern "system" fn Java_com_p2pcamera_mediaplayer_RustBridge_nativeSendControlCommand(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    json: JString,
+) -> jstring {
+    let idx = match handle_to_idx(handle) {
+        Some(i) => i,
+        None => {
+            let err = proto::control::ControlResponse::err("invalid handle");
+            return json_response(&mut env, &err);
+        }
+    };
+
+    let json_str: String = match env.get_string(&json) {
+        Ok(s) => s.into(),
+        Err(e) => {
+            let _ = env.throw_new("java/lang/IllegalArgumentException", format!("{e}"));
+            let err = proto::control::ControlResponse::err("invalid json string");
+            return json_response(&mut env, &err);
+        }
+    };
+
+    // 创建响应通道
+    let (response_tx, response_rx) = bounded::<String>(1);
+
+    // 发送命令到后台线程
+    let sent = with_handles(|handles| {
+        handles
+            .get(idx)
+            .and_then(|h| h.as_ref())
+            .map(|h| h.cmd_tx.send(Cmd::Control {
+                request_json: json_str,
+                response_tx: response_tx.clone(),
+            }).is_ok())
+            .unwrap_or(false)
+    });
+
+    if !sent {
+        let err = proto::control::ControlResponse::err("failed to send control command");
+        return json_response(&mut env, &err);
+    }
+
+    // 等待响应 (5s 超时)
+    match response_rx.recv_timeout(std::time::Duration::from_secs(5)) {
+        Ok(resp_json) => {
+            match env.new_string(&resp_json) {
+                Ok(s) => s.into_raw(),
+                Err(_) => std::ptr::null_mut(),
+            }
+        }
+        Err(_) => {
+            let err = proto::control::ControlResponse::err("control command timeout");
+            json_response(&mut env, &err)
+        }
+    }
+}
+
+/// 将 ControlResponse 序列化为 JSON 并创建 jstring
+fn json_response(env: &mut JNIEnv, resp: &proto::control::ControlResponse) -> jstring {
+    let json = serde_json::to_string(resp).unwrap_or_else(|_| r#"{"ok":false,"error":"serialize error"}"#.to_string());
+    match env.new_string(&json) {
+        Ok(s) => s.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
 }
