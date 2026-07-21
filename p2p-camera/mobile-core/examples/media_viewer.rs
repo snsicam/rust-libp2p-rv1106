@@ -33,7 +33,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use mobile_core::viewer::{
     MediaPlayer, MediaPlayerEvent, ConnectOptions,
-    is_nal_keyframe, RECONNECT_DELAY,
+    RECONNECT_DELAY,
 };
 #[cfg(feature = "player")]
 use mobile_core::viewer::IDR_WAIT_TIMEOUT;
@@ -403,7 +403,7 @@ fn process_video_frame(
             let elapsed = start.elapsed().as_secs_f64();
             let fps = *frame_count as f64 / elapsed;
             let kbps = (*bytes_received * 8) as f64 / elapsed / 1000.0;
-            let keyframe = if is_nal_keyframe(&packet.data) { "[I]" } else { "   " };
+            let keyframe = if packet.is_keyframe() { "[I]" } else { "   " };
             println!(
                 "[Viewer] {keyframe} frame #{} | {:.1} fps | {:.0} kbps | ts={}",
                 frame_count, fps, kbps, packet.timestamp_ms
@@ -423,7 +423,7 @@ fn process_video_frame(
     if let Some(p) = player {
         match p.render(
             &packet.data,
-            is_nal_keyframe(&packet.data),
+            packet.is_keyframe(),
         ) {
             Ok(action) => return action,
             Err(e) => {

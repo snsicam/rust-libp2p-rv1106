@@ -22,7 +22,7 @@ use libp2p::{
 use libp2p::swarm::behaviour::toggle::Toggle;
 use libp2p_stream::{self, Control};
 use proto::{
-    media_packet::{MediaPacket, MediaTrack},
+    media_packet::{MediaPacket, MediaTrack, FLAG_VIDEO_KEYFRAME},
     stream_protocols,
 };
 use tokio::sync::mpsc;
@@ -1065,7 +1065,7 @@ impl MediaPlayer {
         let total = frames.len();
 
         // 找到最后一个关键帧的位置，只保留从该关键帧开始的帧
-        let last_kf_pos = frames.iter().rposition(|p| is_nal_keyframe(&p.data));
+        let last_kf_pos = frames.iter().rposition(|p| p.is_keyframe());
         if let Some(pos) = last_kf_pos {
             let kept: Vec<MediaPacket> = frames.into_iter().skip(pos).collect();
             let dropped = total - kept.len();
@@ -1169,38 +1169,40 @@ impl MediaPlayer {
                     buf.extend_from_slice(&read_buf[..n]);
 
                     // 尝试解码所有完整的包
-                    while let Some(packet) = MediaPacket::try_decode(&mut buf) {
-                        // 仅对视频流做 IDR 容错；音频始终透传。
-                        // 关键帧判定: 仅用 viewer 自身字节扫描 `is_nal_keyframe`
-                        // (H.265 IRAP 16-21 / H.264 IDR 5), receiver 自包含、不信任对端 flag。
-                        // cam 侧已不再计算 keyframe 标志(见 rk_video_source.rs), JNI 桥也不转发该 flag,
-                        // 故此处为唯一权威判定。收到首个 IDR 前的非关键帧直接丢弃(解码器无参考帧会报错),
-                        // 收到首个 IDR 后恢复正常转发。
-                        if packet.track == MediaTrack::Video && !got_first_idr {
-                            if first_video_at.is_none() {
-                                first_video_at = Some(std::time::Instant::now());
+                    while let Some(mut packet) = MediaPacket::try_decode(&mut buf) {
+                        // 视频包: receiver 自包含地扫描一次关键帧, 结果写入 packet.flags 的
+                        // FLAG_VIDEO_KEYFRAME bit, 下游 (drain / media_viewer / JNI) 用 is_keyframe()
+                        // 直接复用, 避免每帧重复字节扫描。不信任 cam 端 flag (见 rk_video_source.rs),
+                        // 此处为唯一权威判定。
+                        if packet.track == MediaTrack::Video {
+                            if is_nal_keyframe(&packet.data) {
+                                packet.flags |= FLAG_VIDEO_KEYFRAME;
                             }
-                            let is_kf = is_nal_keyframe(&packet.data);
-                            let waited = first_video_at.map(|t| t.elapsed());
-                            if is_kf || waited.map_or(false, |w| w >= IDR_WAIT_TIMEOUT) {
-                                got_first_idr = true;
-                                if is_kf {
-                                    tracing::info!(
-                                        "[Viewer] First IDR received, video decode started (dropped pre-IDR non-keyframes)"
-                                    );
-                                } else {
-                                    tracing::warn!(
-                                        "[Viewer] No IDR within {:?}, forwarding video anyway (cam keyframe flag may be unreliable)",
-                                        IDR_WAIT_TIMEOUT
-                                    );
+                            if !got_first_idr {
+                                if first_video_at.is_none() {
+                                    first_video_at = Some(std::time::Instant::now());
                                 }
-                            } else {
-                                // 首个 IDR 前的非关键帧：解码器无参考帧，直接丢弃
-                                tracing::debug!(
-                                    "[Viewer] Drop pre-IDR non-keyframe ({} bytes) to avoid decode error",
-                                    packet.data.len()
-                                );
-                                continue;
+                                let waited = first_video_at.map(|t| t.elapsed());
+                                if packet.is_keyframe() || waited.map_or(false, |w| w >= IDR_WAIT_TIMEOUT) {
+                                    got_first_idr = true;
+                                    if packet.is_keyframe() {
+                                        tracing::info!(
+                                            "[Viewer] First IDR received, video decode started (dropped pre-IDR non-keyframes)"
+                                        );
+                                    } else {
+                                        tracing::warn!(
+                                            "[Viewer] No IDR within {:?}, forwarding video anyway (cam keyframe flag may be unreliable)",
+                                            IDR_WAIT_TIMEOUT
+                                        );
+                                    }
+                                } else {
+                                    // 首个 IDR 前的非关键帧：解码器无参考帧，直接丢弃
+                                    tracing::debug!(
+                                        "[Viewer] Drop pre-IDR non-keyframe ({} bytes) to avoid decode error",
+                                        packet.data.len()
+                                    );
+                                    continue;
+                                }
                             }
                         }
                         if sender.send(packet).await.is_err() {
