@@ -20,6 +20,7 @@ pub struct Behaviour {
 
 impl Behaviour {
     /// 由 SwarmBuilder 回调构造，relay_client 必须由 builder 传入
+    #[allow(dead_code)]
     pub fn new(
         local_public_key: libp2p::identity::PublicKey,
         relay_client: relay::client::Behaviour,

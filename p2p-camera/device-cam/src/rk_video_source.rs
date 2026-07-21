@@ -47,6 +47,7 @@ extern "C" {
     ) -> std::ffi::c_int;
     fn rk_camera_set_callback(cb: FrameCallback);
     fn rk_camera_request_idr(chn_id: std::ffi::c_int) -> std::ffi::c_int;
+    #[allow(dead_code)]
     fn rk_camera_request_idr_all() -> std::ffi::c_int;
     fn rk_camera_deinit();
 
@@ -116,6 +117,7 @@ pub fn request_idr(chn_id: u8) {
 }
 
 /// 请求所有通道的 IDR
+#[allow(dead_code)]
 pub fn request_idr_all() {
     unsafe { rk_camera_request_idr_all(); }
 }
@@ -557,7 +559,6 @@ pub fn get_encoder_config(chn_id: u32) -> Option<EncoderConfig> {
         _ => return None,
     };
 
-    unsafe {
         let output_data_type = param_get_string(&format!("{stream_prefix}.output_data_type"), "H.265");
         let width = param_get_int(&format!("{stream_prefix}.width"), 2304) as u32;
         let height = param_get_int(&format!("{stream_prefix}.height"), 1296) as u32;
@@ -587,7 +588,6 @@ pub fn get_encoder_config(chn_id: u32) -> Option<EncoderConfig> {
             smart,
             rotation,
         })
-    }
 }
 
 /// 设置编码参数 (写入 INI + 热改/重建)
@@ -599,7 +599,6 @@ pub fn set_encoder_config(chn_id: u32, config: &EncoderConfig) -> anyhow::Result
         _ => return Err(anyhow::anyhow!("invalid chn_id: {chn_id}")),
     };
 
-    unsafe {
         // 写入 INI 持久化
         param_set_string(&format!("{stream_prefix}.output_data_type"), &config.output_data_type);
         param_set_int(&format!("{stream_prefix}.width"), config.width as i32);
@@ -621,7 +620,6 @@ pub fn set_encoder_config(chn_id: u32, config: &EncoderConfig) -> anyhow::Result
         //   2. rk_camera_deinit + rk_camera_init (重建编码器, 短暂中断视频流)
         // 当前先仅持久化 INI, 编码参数在下次重启后生效
         tracing::warn!("[RkVideoSource] Encoder config saved to INI, hot-update not yet implemented");
-    }
 
     Ok(())
 }
@@ -695,7 +693,6 @@ pub fn set_image_config(cam_id: u32, config: &ImageConfig) -> anyhow::Result<()>
 
 /// 获取系统参数 (从 INI 读取)
 pub fn get_system_config() -> Option<SystemConfig> {
-    unsafe {
         let device_name = param_get_string("system.device_info.device_name", "RK IP Camera");
         let telecontrol_id = param_get_string("system.device_info.telecontrol_id", "0");
         let model = param_get_string("system.device_info.model", "RV1106");
@@ -711,19 +708,16 @@ pub fn get_system_config() -> Option<SystemConfig> {
             firmware_version,
             manufacturer,
         })
-    }
 }
 
 /// 设置系统参数 (写入 INI 持久化)
 pub fn set_system_config(config: &SystemConfigSet) -> anyhow::Result<()> {
-    unsafe {
         if let Some(ref name) = config.device_name {
             param_set_string("system.device_info.device_name", name);
         }
         if let Some(ref id) = config.telecontrol_id {
             param_set_string("system.device_info.telecontrol_id", id);
         }
-    }
     Ok(())
 }
 

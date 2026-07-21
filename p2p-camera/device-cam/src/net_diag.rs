@@ -11,6 +11,7 @@ use libp2p::core::multiaddr::{Multiaddr, Protocol};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NatType {
     FullCone,
+    #[allow(dead_code)]
     RestrictedCone,
     PortRestrictedCone,
     Symmetric,
@@ -44,6 +45,7 @@ impl NatType {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct NatDiagnosis {
     pub nat_type: NatType,
     pub observed_addresses: Vec<Multiaddr>,
@@ -56,6 +58,7 @@ pub struct NatDiagnosis {
 
 /// DCUtR 尝试前的预测结果
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct DcutrPrediction {
     pub likely_success: bool,
     pub is_4g: bool,
@@ -101,6 +104,7 @@ impl NatDiagnostic {
     }
 
     /// 设置用户手动指定的 4G 网络标志
+    #[allow(dead_code)]
     pub fn set_force_4g(&mut self, force: bool) {
         self.force_4g = force;
     }
@@ -124,6 +128,7 @@ impl NatDiagnostic {
         self.observed_history.push(addr.clone());
     }
 
+    #[allow(dead_code)]
     pub fn observed_history_is_empty(&self) -> bool {
         self.observed_history.is_empty()
     }
@@ -132,6 +137,7 @@ impl NatDiagnostic {
     ///
     /// 当本端为 Symmetric NAT 或 4G/CGNAT 网络时，DCUtR 打洞必然失败，
     /// 应跳过以节省约 17 秒的超时等待。
+    #[allow(dead_code)]
     pub fn should_skip_dcutr(&self) -> bool {
         let is_4g = self.force_4g || self.local_ips.iter().any(|ip| is_4g_network(*ip));
         let diag = self.diagnose();

@@ -34,6 +34,14 @@
 #include "rk_aiq_user_api2_sysctl.h"
 #include "rk_aiq_user_api2_imgproc.h"
 
+// ---- 前向声明: rk_camera_set_chn_config 等在使用点之前调用这些 static 辅助函数 ----
+static int get_codec_type(const char *codec_str);
+static int get_rc_mode(const char *rc_str, int codec);
+static int get_rc_quality(const char *q_str);
+static int get_profile(const char *p_str);
+static int get_gop_mode(const char *g_str);
+static int get_mirror(const char *m_str);
+
 // ---- 常量定义 ----
 
 #define VI_DEV_ID           0
@@ -311,53 +319,6 @@ static int vpss_init(int main_w, int main_h,
 }
 
 // ---- VENC 单通道初始化 ----
-
-static int get_codec_type(const char *codec_str) {
-    if (strcmp(codec_str, "H264") == 0 || strcmp(codec_str, "h264") == 0)
-        return RK_VIDEO_ID_AVC;
-    return RK_VIDEO_ID_HEVC;  // default H.265
-}
-
-static int get_rc_mode(const char *rc_str, int codec) {
-    if (codec == RK_VIDEO_ID_AVC) {
-        if (strcmp(rc_str, "VBR") == 0) return VENC_RC_MODE_H264VBR;
-        return VENC_RC_MODE_H264CBR;
-    } else {
-        if (strcmp(rc_str, "VBR") == 0) return VENC_RC_MODE_H265VBR;
-        return VENC_RC_MODE_H265CBR;
-    }
-}
-
-static int get_rc_quality(const char *q_str) {
-    if (strcmp(q_str, "highest") == 0) return 6;
-    if (strcmp(q_str, "higher") == 0) return 5;
-    if (strcmp(q_str, "high") == 0) return 4;
-    if (strcmp(q_str, "medium") == 0) return 3;
-    if (strcmp(q_str, "low") == 0) return 2;
-    if (strcmp(q_str, "lower") == 0) return 1;
-    if (strcmp(q_str, "lowest") == 0) return 0;
-    return -1;  // 不设置
-}
-
-static int get_profile(const char *p_str) {
-    if (strcmp(p_str, "high") == 0) return 100;
-    if (strcmp(p_str, "main") == 0) return 77;
-    if (strcmp(p_str, "baseline") == 0) return 66;
-    return 0;  // default main
-}
-
-static int get_gop_mode(const char *g_str) {
-    if (strcmp(g_str, "smartP") == 0) return VENC_GOPMODE_SMARTP;
-    return VENC_GOPMODE_NORMALP;
-}
-
-static int get_mirror(const char *m_str) {
-    if (strcmp(m_str, "horizontal") == 0) return MIRROR_HORIZONTAL;
-    if (strcmp(m_str, "vertical") == 0) return MIRROR_VERTICAL;
-    if (strcmp(m_str, "both") == 0) return MIRROR_HORIZONTAL | MIRROR_VERTICAL;
-    return MIRROR_NONE;
-}
-
 static int venc_init_single(int chn_id, int width, int height,
                              int fps_num, int fps_den, int sensor_fps,
                              int bitrate_kbps, int gop,
@@ -1084,6 +1045,55 @@ void rk_audio_deinit() {
     g_aenc_enabled = 0;
     printf("[rk_camera] audio deinitialized\n");
 }
+
+// ---- 控制通道: ISP 图像参数 C shim ----
+
+static int get_codec_type(const char *codec_str) {
+    if (strcmp(codec_str, "H264") == 0 || strcmp(codec_str, "h264") == 0)
+        return RK_VIDEO_ID_AVC;
+    return RK_VIDEO_ID_HEVC;  // default H.265
+}
+
+static int get_rc_mode(const char *rc_str, int codec) {
+    if (codec == RK_VIDEO_ID_AVC) {
+        if (strcmp(rc_str, "VBR") == 0) return VENC_RC_MODE_H264VBR;
+        return VENC_RC_MODE_H264CBR;
+    } else {
+        if (strcmp(rc_str, "VBR") == 0) return VENC_RC_MODE_H265VBR;
+        return VENC_RC_MODE_H265CBR;
+    }
+}
+
+static int get_rc_quality(const char *q_str) {
+    if (strcmp(q_str, "highest") == 0) return 6;
+    if (strcmp(q_str, "higher") == 0) return 5;
+    if (strcmp(q_str, "high") == 0) return 4;
+    if (strcmp(q_str, "medium") == 0) return 3;
+    if (strcmp(q_str, "low") == 0) return 2;
+    if (strcmp(q_str, "lower") == 0) return 1;
+    if (strcmp(q_str, "lowest") == 0) return 0;
+    return -1;  // 不设置
+}
+
+static int get_profile(const char *p_str) {
+    if (strcmp(p_str, "high") == 0) return 100;
+    if (strcmp(p_str, "main") == 0) return 77;
+    if (strcmp(p_str, "baseline") == 0) return 66;
+    return 0;  // default main
+}
+
+static int get_gop_mode(const char *g_str) {
+    if (strcmp(g_str, "smartP") == 0) return VENC_GOPMODE_SMARTP;
+    return VENC_GOPMODE_NORMALP;
+}
+
+static int get_mirror(const char *m_str) {
+    if (strcmp(m_str, "horizontal") == 0) return MIRROR_HORIZONTAL;
+    if (strcmp(m_str, "vertical") == 0) return MIRROR_VERTICAL;
+    if (strcmp(m_str, "both") == 0) return MIRROR_HORIZONTAL | MIRROR_VERTICAL;
+    return MIRROR_NONE;
+}
+
 
 // ---- 控制通道: ISP 图像参数 C shim ----
 // 供 Rust FFI 调用，利用已有的 g_aiq_ctx 操作 rkaiq SDK
