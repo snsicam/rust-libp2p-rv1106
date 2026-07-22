@@ -183,10 +183,9 @@ async fn main() -> Result<()> {
                 main_params, sub_params, third_params,
                 config.sensor_frame_rate,
             );
-            // TODO: LCD/FB 暂屏蔽，先验证三码流编码正常
-            // if config.lcd.enabled {
-            //     source = source.with_lcd(config.lcd.width, config.lcd.height);
-            // }
+            if config.lcd.enabled {
+                source = source.with_lcd(config.lcd.width, config.lcd.height);
+            }
             let (_, start_tx) = source.spawn(
                 broadcast_sender_to_crossbeam(main_tx.clone()),
                 if sub_enabled { Some(broadcast_sender_to_crossbeam(sub_tx.clone())) } else { None },
