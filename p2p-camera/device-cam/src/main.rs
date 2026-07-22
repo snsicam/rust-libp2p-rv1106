@@ -19,6 +19,7 @@
 
 mod behaviour;
 mod config;
+mod control_handler;
 mod media_source;
 mod net_diag;
 #[cfg(feature = "rv1106")]
@@ -327,6 +328,10 @@ async fn main() -> Result<()> {
     let mut incoming_audio = stream_control
         .accept(stream_protocols::AUDIO_PROTOCOL)
         .context("Failed to accept audio protocol")?;
+    // 控制通道
+    let mut incoming_control = stream_control
+        .accept(stream_protocols::CONTROL_PROTOCOL)
+        .context("Failed to accept control protocol")?;
 
     // ---- 状态 ----
     let mut connection_times: HashMap<PeerId, Instant> = HashMap::new();
@@ -719,6 +724,17 @@ async fn main() -> Result<()> {
                     active_streams.insert(key, handle);
                 } else {
                     tracing::error!("[DeviceCam] Audio stream accept channel closed");
+                }
+            }
+
+            // 控制通道
+            control = incoming_control.next() => {
+                if let Some((peer_id, stream)) = control {
+                    let conn_type = peer_conn_type.get(&peer_id).map(|s| s.as_str()).unwrap_or("Unknown");
+                    println!("[DeviceCam] New control connection: {peer_id} via {conn_type}");
+                    tokio::spawn(control_handler::handle_control_stream(peer_id, stream));
+                } else {
+                    tracing::error!("[DeviceCam] Control stream accept channel closed");
                 }
             }
 

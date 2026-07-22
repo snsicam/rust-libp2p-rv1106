@@ -217,6 +217,8 @@ pub struct MediaPlayer {
     udp_port: u16,
     /// mDNS 发现的 device-cam 地址缓存（key = PeerId, value = 最新的非 relay Multiaddr）
     mdns_cache: std::collections::HashMap<libp2p::PeerId, Multiaddr>,
+    /// 控制通道流 (用于发送控制请求)
+    control_stream: Option<libp2p::Stream>,
 }
 
 /// 保存连接参数，用于断连后自动重连
@@ -280,6 +282,7 @@ impl MediaPlayer {
             no_audio: options.no_audio,
             udp_port: options.udp_port,
             mdns_cache: std::collections::HashMap::new(),
+            control_stream: None,
         };
 
         // 监听本地 QUIC (指定端口或随机)
@@ -561,6 +564,17 @@ impl MediaPlayer {
                 Err(e) => {
                     println!("[Viewer] Audio stream open failed (non-fatal): {e}");
                 }
+            }
+        }
+
+        // 打开控制通道 stream（可选，失败不阻塞）
+        match self.stream_control.open_stream(device_cam, stream_protocols::CONTROL_PROTOCOL).await {
+            Ok(control_stream) => {
+                println!("[Viewer] Control stream opened");
+                self.control_stream = Some(control_stream);
+            }
+            Err(e) => {
+                println!("[Viewer] Control stream open failed (non-fatal): {e}");
             }
         }
 
@@ -877,6 +891,17 @@ impl MediaPlayer {
                                             }
                                         }
                                     }
+
+                                    // 控制流也升级到直连
+                                    match self.stream_control.open_stream(device_cam, stream_protocols::CONTROL_PROTOCOL).await {
+                                        Ok(new_stream) => {
+                                            self.control_stream = Some(new_stream);
+                                            println!("[Viewer] Control stream upgraded to direct connection");
+                                        }
+                                        Err(e) => {
+                                            println!("[Viewer] Failed to open direct control stream: {e}");
+                                        }
+                                    }
                                 }
                                 Err(e) => {
                                     tracing::warn!("[Viewer] Failed to open main stream on direct connection, staying on sub: {e}");
@@ -1002,6 +1027,7 @@ impl MediaPlayer {
         // 停止旧的接收任务
         if let Some(h) = self.video_abort_handle.take() { h.abort(); }
         if let Some(h) = self.audio_abort_handle.take() { h.abort(); }
+        self.control_stream = None;
 
         // 清空 channel 中旧 session 的残留帧，避免新 session 取到旧 P 帧导致花屏
         while self.video_receiver.try_recv().is_ok() {}
@@ -1030,6 +1056,7 @@ impl MediaPlayer {
     pub fn shutdown(&mut self) {
         if let Some(h) = self.video_abort_handle.take() { h.abort(); }
         if let Some(h) = self.audio_abort_handle.take() { h.abort(); }
+        self.control_stream = None;
         // 清空 channel 残留帧
         while self.video_receiver.try_recv().is_ok() {}
         while self.audio_receiver.try_recv().is_ok() {}
@@ -1038,6 +1065,31 @@ impl MediaPlayer {
         }
         self.connected = false;
         println!("[Viewer] Session shutdown, closing connection to device");
+    }
+
+    /// 发送控制请求并等待响应 (5s 超时)
+    pub async fn send_control(
+        &mut self,
+        req: &proto::control::ControlRequest,
+    ) -> Result<proto::control::ControlResponse> {
+        use proto::control::{encode_request, read_frame, write_frame};
+
+        let stream = self.control_stream.as_mut()
+            .ok_or_else(|| anyhow::anyhow!("control stream not ready"))?;
+
+        // 编码并发送请求
+        let frame = encode_request(req)?;
+        write_frame(stream, &frame).await?;
+
+        // 读取响应 (5s 超时)
+        let payload = tokio::time::timeout(
+            Duration::from_secs(5),
+            read_frame(stream),
+        ).await
+            .map_err(|_| anyhow::anyhow!("control request timeout"))??;
+
+        let resp: proto::control::ControlResponse = serde_json::from_slice(&payload)?;
+        Ok(resp)
     }
 
     /// 获取本地 IP 列表

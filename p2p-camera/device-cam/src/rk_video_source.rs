@@ -47,6 +47,7 @@ extern "C" {
     ) -> std::ffi::c_int;
     fn rk_camera_set_callback(cb: FrameCallback);
     fn rk_camera_request_idr(chn_id: std::ffi::c_int) -> std::ffi::c_int;
+    #[allow(dead_code)]
     fn rk_camera_request_idr_all() -> std::ffi::c_int;
     fn rk_camera_deinit();
 
@@ -116,6 +117,7 @@ pub fn request_idr(chn_id: u8) {
 }
 
 /// 请求所有通道的 IDR
+#[allow(dead_code)]
 pub fn request_idr_all() {
     unsafe { rk_camera_request_idr_all(); }
 }
@@ -517,5 +519,269 @@ impl Drop for RkAudioSource {
         if let Ok(mut s) = GLOBAL_AUDIO_SENDER.lock() {
             *s = None;
         }
+    }
+}
+
+// ============== 控制通道 FFI 接口 (编码/图像/系统参数) ==============
+
+extern "C" {
+    // INI 持久化 (参考 rkipc rk_param_* 接口)
+    fn rk_param_get_int(key: *const std::ffi::c_char, default: std::ffi::c_int) -> std::ffi::c_int;
+    fn rk_param_set_int(key: *const std::ffi::c_char, value: std::ffi::c_int) -> std::ffi::c_int;
+    fn rk_param_get_string(key: *const std::ffi::c_char, default: *const std::ffi::c_char) -> *mut std::ffi::c_char;
+    fn rk_param_set_string(key: *const std::ffi::c_char, value: *const std::ffi::c_char) -> std::ffi::c_int;
+
+    // ISP 图像参数 (参考 rkipc rk_isp_* 接口)
+    fn rk_isp_get_contrast(cam_id: std::ffi::c_int) -> std::ffi::c_int;
+    fn rk_isp_set_contrast(cam_id: std::ffi::c_int, value: std::ffi::c_int) -> std::ffi::c_int;
+    fn rk_isp_get_brightness(cam_id: std::ffi::c_int) -> std::ffi::c_int;
+    fn rk_isp_set_brightness(cam_id: std::ffi::c_int, value: std::ffi::c_int) -> std::ffi::c_int;
+    fn rk_isp_get_saturation(cam_id: std::ffi::c_int) -> std::ffi::c_int;
+    fn rk_isp_set_saturation(cam_id: std::ffi::c_int, value: std::ffi::c_int) -> std::ffi::c_int;
+    fn rk_isp_get_sharpness(cam_id: std::ffi::c_int) -> std::ffi::c_int;
+    fn rk_isp_set_sharpness(cam_id: std::ffi::c_int, value: std::ffi::c_int) -> std::ffi::c_int;
+    fn rk_isp_get_hue(cam_id: std::ffi::c_int) -> std::ffi::c_int;
+    fn rk_isp_set_hue(cam_id: std::ffi::c_int, value: std::ffi::c_int) -> std::ffi::c_int;
+
+    // 系统操作
+    fn rk_system_reboot() -> std::ffi::c_int;
+    fn rk_system_factory_reset() -> std::ffi::c_int;
+}
+
+use proto::control::{EncoderConfig, ImageConfig, ImageAdjustment, SystemConfig, SystemConfigSet};
+
+/// 获取编码参数 (从 INI 配置读取)
+pub fn get_encoder_config(chn_id: u32) -> Option<EncoderConfig> {
+    let stream_prefix = match chn_id {
+        0 => "video.0",
+        1 => "video.1",
+        2 => "video.2",
+        _ => return None,
+    };
+
+        let output_data_type = param_get_string(&format!("{stream_prefix}.output_data_type"), "H.265");
+        let width = param_get_int(&format!("{stream_prefix}.width"), 2304) as u32;
+        let height = param_get_int(&format!("{stream_prefix}.height"), 1296) as u32;
+        let rc_mode = param_get_string(&format!("{stream_prefix}.rc_mode"), "CBR");
+        let rc_quality = param_get_string(&format!("{stream_prefix}.rc_quality"), "high");
+        let gop = param_get_int(&format!("{stream_prefix}.gop"), 50) as u32;
+        let gop_mode = param_get_string(&format!("{stream_prefix}.gop_mode"), "normalP");
+        let max_rate = param_get_int(&format!("{stream_prefix}.max_rate"), 2048) as u32;
+        let dst_frame_rate_num = param_get_int(&format!("{stream_prefix}.dst_frame_rate_num"), 25) as u32;
+        let dst_frame_rate_den = param_get_int(&format!("{stream_prefix}.dst_frame_rate_den"), 1) as u32;
+        let h264_profile = param_get_string(&format!("{stream_prefix}.h264_profile"), "high");
+        let smart = param_get_string(&format!("{stream_prefix}.smart"), "close");
+        let rotation = param_get_int(&format!("{stream_prefix}.rotation"), 0) as u32;
+
+        Some(EncoderConfig {
+            output_data_type,
+            width,
+            height,
+            rc_mode,
+            rc_quality,
+            gop,
+            gop_mode,
+            max_rate,
+            dst_frame_rate_num,
+            dst_frame_rate_den,
+            h264_profile,
+            smart,
+            rotation,
+        })
+}
+
+/// 设置编码参数 (写入 INI + 热改/重建)
+pub fn set_encoder_config(chn_id: u32, config: &EncoderConfig) -> anyhow::Result<()> {
+    let stream_prefix = match chn_id {
+        0 => "video.0",
+        1 => "video.1",
+        2 => "video.2",
+        _ => return Err(anyhow::anyhow!("invalid chn_id: {chn_id}")),
+    };
+
+        // 写入 INI 持久化
+        param_set_string(&format!("{stream_prefix}.output_data_type"), &config.output_data_type);
+        param_set_int(&format!("{stream_prefix}.width"), config.width as i32);
+        param_set_int(&format!("{stream_prefix}.height"), config.height as i32);
+        param_set_string(&format!("{stream_prefix}.rc_mode"), &config.rc_mode);
+        param_set_string(&format!("{stream_prefix}.rc_quality"), &config.rc_quality);
+        param_set_int(&format!("{stream_prefix}.gop"), config.gop as i32);
+        param_set_string(&format!("{stream_prefix}.gop_mode"), &config.gop_mode);
+        param_set_int(&format!("{stream_prefix}.max_rate"), config.max_rate as i32);
+        param_set_int(&format!("{stream_prefix}.dst_frame_rate_num"), config.dst_frame_rate_num as i32);
+        param_set_int(&format!("{stream_prefix}.dst_frame_rate_den"), config.dst_frame_rate_den as i32);
+        param_set_string(&format!("{stream_prefix}.h264_profile"), &config.h264_profile);
+        param_set_string(&format!("{stream_prefix}.smart"), &config.smart);
+        param_set_int(&format!("{stream_prefix}.rotation"), config.rotation as i32);
+
+        // TODO: 热改编码参数 — 需确认 RK MPI SDK 是否支持运行时修改
+        // 可选方案:
+        //   1. RK_MPI_VENC_SetChnAttr (热改码率/GOP/帧率, 不中断视频流)
+        //   2. rk_camera_deinit + rk_camera_init (重建编码器, 短暂中断视频流)
+        // 当前先仅持久化 INI, 编码参数在下次重启后生效
+        tracing::warn!("[RkVideoSource] Encoder config saved to INI, hot-update not yet implemented");
+
+    Ok(())
+}
+
+/// 获取图像参数 (从 ISP AIQ 读取)
+pub fn get_image_config(cam_id: u32) -> Option<ImageConfig> {
+    let cam = cam_id as i32;
+
+    unsafe {
+        let adjustment = Some(ImageAdjustment {
+            contrast: rk_isp_get_contrast(cam),
+            brightness: rk_isp_get_brightness(cam),
+            saturation: rk_isp_get_saturation(cam),
+            sharpness: rk_isp_get_sharpness(cam),
+            hue: rk_isp_get_hue(cam),
+        });
+
+        Some(ImageConfig {
+            adjustment,
+            // 其他子类别暂不实现, 后续按需扩展
+            exposure: None,
+            night_to_day: None,
+            white_balance: None,
+            enhancement: None,
+            video_adjustment: None,
+        })
+    }
+}
+
+/// 设置图像参数 (调用 ISP AIQ 接口 + INI 持久化)
+pub fn set_image_config(cam_id: u32, config: &ImageConfig) -> anyhow::Result<()> {
+    let cam = cam_id as i32;
+
+    unsafe {
+        if let Some(ref adj) = config.adjustment {
+            rk_isp_set_contrast(cam, adj.contrast);
+            rk_isp_set_brightness(cam, adj.brightness);
+            rk_isp_set_saturation(cam, adj.saturation);
+            rk_isp_set_sharpness(cam, adj.sharpness);
+            rk_isp_set_hue(cam, adj.hue);
+
+            // INI 持久化
+            let prefix = format!("isp.{}.adjustment", cam_id);
+            param_set_int(&format!("{prefix}.contrast"), adj.contrast);
+            param_set_int(&format!("{prefix}.brightness"), adj.brightness);
+            param_set_int(&format!("{prefix}.saturation"), adj.saturation);
+            param_set_int(&format!("{prefix}.sharpness"), adj.sharpness);
+            param_set_int(&format!("{prefix}.hue"), adj.hue);
+        }
+
+        // 其他子类别暂不实现
+        if config.exposure.is_some() {
+            tracing::warn!("[RkVideoSource] ImageExposure set not yet implemented");
+        }
+        if config.night_to_day.is_some() {
+            tracing::warn!("[RkVideoSource] ImageNightToDay set not yet implemented");
+        }
+        if config.white_balance.is_some() {
+            tracing::warn!("[RkVideoSource] ImageWhiteBalance set not yet implemented");
+        }
+        if config.enhancement.is_some() {
+            tracing::warn!("[RkVideoSource] ImageEnhancement set not yet implemented");
+        }
+        if config.video_adjustment.is_some() {
+            tracing::warn!("[RkVideoSource] ImageVideoAdjustment set not yet implemented");
+        }
+    }
+
+    Ok(())
+}
+
+/// 获取系统参数 (从 INI 读取)
+pub fn get_system_config() -> Option<SystemConfig> {
+        let device_name = param_get_string("system.device_info.device_name", "RK IP Camera");
+        let telecontrol_id = param_get_string("system.device_info.telecontrol_id", "0");
+        let model = param_get_string("system.device_info.model", "RV1106");
+        let serial_number = param_get_string("system.device_info.serial_number", "unknown");
+        let firmware_version = param_get_string("system.device_info.firmware_version", "1.0.0");
+        let manufacturer = param_get_string("system.device_info.manufacturer", "Rockchip");
+
+        Some(SystemConfig {
+            device_name,
+            telecontrol_id,
+            model,
+            serial_number,
+            firmware_version,
+            manufacturer,
+        })
+}
+
+/// 设置系统参数 (写入 INI 持久化)
+pub fn set_system_config(config: &SystemConfigSet) -> anyhow::Result<()> {
+        if let Some(ref name) = config.device_name {
+            param_set_string("system.device_info.device_name", name);
+        }
+        if let Some(ref id) = config.telecontrol_id {
+            param_set_string("system.device_info.telecontrol_id", id);
+        }
+    Ok(())
+}
+
+/// 系统重启
+pub fn system_reboot() -> anyhow::Result<()> {
+    unsafe {
+        let ret = rk_system_reboot();
+        if ret != 0 {
+            return Err(anyhow::anyhow!("rk_system_reboot failed: {ret}"));
+        }
+    }
+    Ok(())
+}
+
+/// 恢复出厂设置
+pub fn factory_reset() -> anyhow::Result<()> {
+    unsafe {
+        let ret = rk_system_factory_reset();
+        if ret != 0 {
+            return Err(anyhow::anyhow!("rk_system_factory_reset failed: {ret}"));
+        }
+    }
+    Ok(())
+}
+
+// ---- INI 参数读写辅助 ----
+
+/// 从 INI 读取整数
+fn param_get_int(key: &str, default: i32) -> i32 {
+    unsafe {
+        let key_c = std::ffi::CString::new(key).unwrap();
+        rk_param_get_int(key_c.as_ptr(), default)
+    }
+}
+
+/// 写入 INI 整数
+fn param_set_int(key: &str, value: i32) {
+    unsafe {
+        let key_c = std::ffi::CString::new(key).unwrap();
+        rk_param_set_int(key_c.as_ptr(), value);
+    }
+}
+
+/// 从 INI 读取字符串
+fn param_get_string(key: &str, default: &str) -> String {
+    unsafe {
+        let key_c = std::ffi::CString::new(key).unwrap();
+        let default_c = std::ffi::CString::new(default).unwrap();
+        let ptr = rk_param_get_string(key_c.as_ptr(), default_c.as_ptr());
+        if ptr.is_null() {
+            return default.to_string();
+        }
+        let s = std::ffi::CStr::from_ptr(ptr).to_string_lossy().into_owned();
+        // 注意: rk_param_get_string 返回的指针可能需要释放, 取决于 rkipc 实现
+        // 当前假设返回静态缓冲区指针, 无需释放
+        s
+    }
+}
+
+/// 写入 INI 字符串
+fn param_set_string(key: &str, value: &str) {
+    unsafe {
+        let key_c = std::ffi::CString::new(key).unwrap();
+        let value_c = std::ffi::CString::new(value).unwrap();
+        rk_param_set_string(key_c.as_ptr(), value_c.as_ptr());
     }
 }

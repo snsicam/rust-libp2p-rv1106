@@ -5089,8 +5089,12 @@ dependencies = [
 name = "proto"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "bytes",
+ "futures",
  "libp2p-swarm",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

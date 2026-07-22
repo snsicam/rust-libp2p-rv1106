@@ -148,16 +148,16 @@ async fn main() -> Result<()> {
 
     let mut frame_count: u64 = 0;
     let mut bytes_received: u64 = 0;
-    let mut audio_count: u64 = 0;
-    let mut direct_upgraded = false;
-    let mut direct_via_lan = false;
-    let mut local_nat_type: Option<NatType> = None;
-    let mut remote_nat_hint: Option<String> = None;
+    let mut _audio_count: u64 = 0;
+    let mut _direct_upgraded = false;
+    let mut _direct_via_lan = false;
+    let mut _local_nat_type: Option<NatType> = None;
+    let mut _remote_nat_hint: Option<String> = None;
     let mut video_start: Option<std::time::Instant> = None;
     let mut stream_disconnected = false;
     let mut window_minimized = false;
     // DCUtR 是否启用：默认启用（锥形/EIM NAT 可打洞成功，省中继带宽）。
-    let mut enable_dcutr = network_type != "4g";
+    let enable_dcutr = network_type != "4g";
 
     // ---- 创建 MediaPlayer ----
     let mut viewer = MediaPlayer::new_with_options(
@@ -279,21 +279,20 @@ async fn main() -> Result<()> {
                     }
                 }
                 MediaPlayerEvent::DirectUpgraded { via_lan } => {
-                    direct_upgraded = true;
-                    direct_via_lan = via_lan;
+                    _direct_upgraded = true;
+                    _direct_via_lan = via_lan;
                     let via = if via_lan { "LAN direct" } else { "DCUtR hole punch" };
                     println!("[Viewer] Direct connection established via {via}, streams upgraded");
                 }
                 MediaPlayerEvent::NatDiagnosis { local_nat, remote_nat } => {
-                    local_nat_type = Some(local_nat);
-                    remote_nat_hint = remote_nat.clone();
+                    _local_nat_type = Some(local_nat);
+                    _remote_nat_hint = remote_nat.clone();
                     println!("[Viewer] NAT diagnosis: local={}, remote={}",
                         local_nat.short_name(),
                         remote_nat.as_deref().unwrap_or("Unknown"));
                 }
                 MediaPlayerEvent::DcutrBackoff => {
                     tracing::warn!("[Viewer] DCUtR backoff detected, disabling DCUtR for next reconnect");
-                    enable_dcutr = false;
                     viewer.set_enable_dcutr(false);
                 }
             }
@@ -328,7 +327,7 @@ async fn main() -> Result<()> {
 
         // 轮询音频帧
         while let Some(packet) = viewer.poll_audio_frame() {
-            audio_count += 1;
+            _audio_count += 1;
             #[cfg(feature = "player")]
             if let Some(ap) = audio_player.as_mut() {
                 ap.write(&packet.data);
