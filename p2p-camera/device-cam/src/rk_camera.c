@@ -88,7 +88,13 @@ static uint8_t *g_fb_work_buf = NULL;
 static pthread_t g_lcd_thread = 0;
 
 // V4L2 buffer 缓存 (初始化时 mmap, DQBUF 时直接用)
-#define LCD_V4L2_BUF_CNT 4
+// V4L2 抓帧缓冲数。
+// 这是 LCD 预览延时的头号来源: 驱动会把 N 个 buffer 轮流填充, 显示线程
+// DQBUF 拿到的是其中最旧的一个, 其余 N-1 个已在驱动里"囤"着。
+// 4 个缓冲 = 囤约 3 帧 (~100ms@30fps), 反而比 LAN 网络流还慢。
+// 改为 2 (MMAP streaming 的最小安全值): DQBUF 拿到的就是最新帧,
+// 队列延时降到 ~1 帧 (~33ms), 且落后时自动丢旧帧而不是追帧, 预览更低延迟。
+#define LCD_V4L2_BUF_CNT 2
 static void *g_lcd_v4l2_bufs[LCD_V4L2_BUF_CNT];
 static size_t g_lcd_v4l2_buf_sizes[LCD_V4L2_BUF_CNT];
 
@@ -523,7 +529,16 @@ static void nv12_to_bgra_sw(const uint8_t *nv12, int src_w, int src_h, int src_s
     const int uv_stride = src_stride;  // NV12 色度与亮度 stride 相同
 
     // 预计算列映射, 避免内层整数除法 (优化)
-    uint16_t *xmap = (uint16_t *)malloc(sizeof(uint16_t) * dst_w);
+    // 提升为函数内静态缓存: 只在目标宽度变化时重分配, 避免每帧 malloc/free
+    // 带来的开销与延迟抖动 (预览场景 dst_w 恒定, 实际只分配一次)。
+    static uint16_t *s_xmap = NULL;
+    static int s_xmap_w = 0;
+    if (s_xmap_w != dst_w) {
+        free(s_xmap);
+        s_xmap = (uint16_t *)malloc(sizeof(uint16_t) * dst_w);
+        s_xmap_w = dst_w;
+    }
+    uint16_t *xmap = s_xmap;
     if (!xmap) return;
     for (int dx = 0; dx < dst_w; dx++) {
         int sx = (dx * src_w) / dst_w;
@@ -559,8 +574,6 @@ static void nv12_to_bgra_sw(const uint8_t *nv12, int src_w, int src_h, int src_s
             out += 4;
         }
     }
-
-    free(xmap);
 }
 
 // Framebuffer 初始化: 打开 /dev/fb0, mmap
