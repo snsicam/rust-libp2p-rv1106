@@ -171,18 +171,46 @@ async fn main() -> Result<()> {
 
     println!("[Viewer] Receiving video frames... (Ctrl+C to stop)");
 
-    // ---- 连接 ----
-    viewer.connect_with_options(
-        &relay_addrs,
-        &device_cam_str,
-        enable_mdns,
-        &stream_type,
-        ConnectOptions {
-            udp_port,
-            network_type: network_type.clone(),
-            no_audio,
-        },
-    ).await?;
+    // ---- 连接 (带重试) ----
+    // 设备可能尚未在 relay 上完成 reservation, 或 relay 连接尚在重连中,
+    // 初次拨号会失败 ("Relay has no reservation for destination")。
+    // 这里重试而不是直接退出, 否则 viewer 会"异常退出"。
+    let mut connect_attempt: u32 = 0;
+    const MAX_CONNECT_ATTEMPTS: u32 = 60; // 最多重试 60 次 (约 60 * RECONNECT_DELAY)
+    loop {
+        connect_attempt += 1;
+        match viewer
+            .connect_with_options(
+                &relay_addrs,
+                &device_cam_str,
+                enable_mdns,
+                &stream_type,
+                ConnectOptions {
+                    udp_port,
+                    network_type: network_type.clone(),
+                    no_audio,
+                },
+            )
+            .await
+        {
+            Ok(()) => {
+                println!("[Viewer] Connected to DeviceCam (attempt #{})", connect_attempt);
+                break;
+            }
+            Err(e) => {
+                eprintln!("[Viewer] Connect attempt #{} failed: {}", connect_attempt, e);
+                if connect_attempt >= MAX_CONNECT_ATTEMPTS {
+                    anyhow::bail!(
+                        "Failed to connect to device-cam after {} retries: {}",
+                        connect_attempt,
+                        e
+                    );
+                }
+                eprintln!("[Viewer] Retrying in {}s...", RECONNECT_DELAY.as_secs());
+                tokio::time::sleep(RECONNECT_DELAY).await;
+            }
+        }
+    }
 
     // ---- 主循环: 驱动 Swarm + 消费帧 + 监控事件 ----
     loop {
