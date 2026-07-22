@@ -15,6 +15,11 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <time.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <linux/fb.h>
 
 #include "rk_mpi_sys.h"
 #include "rk_mpi_vi.h"
@@ -56,16 +61,34 @@ static int get_mirror(const char *m_str);
 #define VENC_CHN_THIRD      2
 #define VENC_MAX_CHN        3
 
-// VPSS 三路输出通道
+// VPSS 三路输出通道 (编码)
 #define VPSS_CHN_MAIN       VPSS_CHN0
 #define VPSS_CHN_SUB        VPSS_CHN1
 #define VPSS_CHN_THIRD      VPSS_CHN2
+// VPSS 第四路输出 → LCD (VO)
+#define VPSS_CHN_LCD        VPSS_CHN3
 
 // ---- 全局状态 ----
 
 static volatile int g_quit = 0;
 static volatile int g_initialized = 0;
 static rk_aiq_sys_ctx_t *g_aiq_ctx = NULL;
+
+// Framebuffer (LCD) 状态 — 替代复杂的 MPP VO 管线
+// RV1106 最简单可靠的显示方式: 直接写 /dev/fb0 (参考 Luckfox Pico 示例)
+static volatile int g_fb_enabled = 0;
+static volatile int g_fb_initialized = 0;
+// VPSS LCD 通道是否已创建 (独立于 fb_init 成败: fb_init 可能因 /dev/fb0 不存在而失败,
+// 但 VPSS_CHN_LCD 已在 VPSS 初始化时创建, deinit 必须正确 disable 它)
+static volatile int g_vpss_lcd_created = 0;
+static int g_lcd_width = 800;
+static int g_lcd_height = 480;
+static int g_fb_fd = -1;
+static uint8_t *g_framebuffer = NULL;       // mmap'd framebuffer
+static size_t g_fb_size = 0;                // framebuffer size in bytes
+static int g_fb_bpp = 16;                   // bits per pixel (16=BGR565, 32=BGRA)
+static uint8_t *g_fb_work_buf = NULL;       // RGB work buffer
+static pthread_t g_fb_thread = 0;
 
 // MPP 系统引用计数 (与 audio 共享)
 static volatile int g_sys_init_count = 0;
@@ -252,9 +275,6 @@ static int vpss_init(int main_w, int main_h,
     int ret;
     VPSS_GRP_ATTR_S stGrpAttr;
     VPSS_CHN_ATTR_S stChnAttr;
-    VPSS_CHN vpss_chns[] = {VPSS_CHN_MAIN, VPSS_CHN_SUB, VPSS_CHN_THIRD};
-    int widths[] = {main_w, sub_w, third_w};
-    int heights[] = {main_h, sub_h, third_h};
 
     memset(&stGrpAttr, 0, sizeof(stGrpAttr));
     stGrpAttr.u32MaxW = 4096;
@@ -278,32 +298,67 @@ static int vpss_init(int main_w, int main_h,
         return ret;
     }
 
-    // 创建 3 个 VPSS channel
-    for (int i = 0; i < 3; i++) {
+    // 编码通道: CHN0 (主), CHN1 (子), CHN2 (第三)
+    {
+        VPSS_CHN vpss_chns[] = {VPSS_CHN_MAIN, VPSS_CHN_SUB, VPSS_CHN_THIRD};
+        int widths[] = {main_w, sub_w, third_w};
+        int heights[] = {main_h, sub_h, third_h};
+
+        for (int i = 0; i < 3; i++) {
+            memset(&stChnAttr, 0, sizeof(stChnAttr));
+            stChnAttr.enChnMode = VPSS_CHN_MODE_AUTO;  // 绑定到 VENC 的通道用 AUTO 模式
+            stChnAttr.enDynamicRange = DYNAMIC_RANGE_SDR8;
+            stChnAttr.enPixelFormat = RK_FMT_YUV420SP;
+            stChnAttr.stFrameRate.s32SrcFrameRate = -1;
+            stChnAttr.stFrameRate.s32DstFrameRate = -1;
+            stChnAttr.u32Width = widths[i];
+            stChnAttr.u32Height = heights[i];
+            stChnAttr.enCompressMode = COMPRESS_MODE_NONE;
+
+            ret = RK_MPI_VPSS_SetChnAttr(VPSS_GRP_ID, vpss_chns[i], &stChnAttr);
+            if (ret != RK_SUCCESS) {
+                printf("[rk_camera] VPSS SetChnAttr[%d] failed: %x\n", i, ret);
+                return ret;
+            }
+
+            ret = RK_MPI_VPSS_EnableChn(VPSS_GRP_ID, vpss_chns[i]);
+            if (ret != RK_SUCCESS) {
+                printf("[rk_camera] VPSS EnableChn[%d] failed: %x\n", i, ret);
+                return ret;
+            }
+        }
+    }
+
+    // LCD 通道: CHN3 → FB (仅在启用 LCD 时创建)
+    if (g_fb_enabled) {
+        int lcd_w = g_lcd_width > 0 ? g_lcd_width : 800;
+        int lcd_h = g_lcd_height > 0 ? g_lcd_height : 480;
+
         memset(&stChnAttr, 0, sizeof(stChnAttr));
         stChnAttr.enChnMode = VPSS_CHN_MODE_USER;
         stChnAttr.enDynamicRange = DYNAMIC_RANGE_SDR8;
         stChnAttr.enPixelFormat = RK_FMT_YUV420SP;
-        // VPSS 全速透传: 帧率控制交给定制 VENC 的 fr32DstFrameRate 做丢帧
-        // (对标 rkipc: 官方不在 VPSS 做控速, 由 VI/VENC 控速; 本管线 VI 共享,
-        // 故由 VENC 按各码流目标帧率丢帧, 见 venc_init_single)。
-        stChnAttr.stFrameRate.s32SrcFrameRate = -1;   // 输入全速
-        stChnAttr.stFrameRate.s32DstFrameRate = -1;   // 输出全速透传
-        stChnAttr.u32Width = widths[i];
-        stChnAttr.u32Height = heights[i];
+        stChnAttr.stFrameRate.s32SrcFrameRate = -1;
+        stChnAttr.stFrameRate.s32DstFrameRate = -1;
+        stChnAttr.u32Width = lcd_w;
+        stChnAttr.u32Height = lcd_h;
+        stChnAttr.u32Depth = 3;  // LCD 通道缓冲深度 (对齐其他 VPSS 通道默认值)
         stChnAttr.enCompressMode = COMPRESS_MODE_NONE;
 
-        ret = RK_MPI_VPSS_SetChnAttr(VPSS_GRP_ID, vpss_chns[i], &stChnAttr);
+        ret = RK_MPI_VPSS_SetChnAttr(VPSS_GRP_ID, VPSS_CHN_LCD, &stChnAttr);
         if (ret != RK_SUCCESS) {
-            printf("[rk_camera] VPSS SetChnAttr[%d] failed: %x\n", i, ret);
+            printf("[rk_camera] VPSS SetChnAttr LCD failed: %x\n", ret);
             return ret;
         }
 
-        ret = RK_MPI_VPSS_EnableChn(VPSS_GRP_ID, vpss_chns[i]);
+        ret = RK_MPI_VPSS_EnableChn(VPSS_GRP_ID, VPSS_CHN_LCD);
         if (ret != RK_SUCCESS) {
-            printf("[rk_camera] VPSS EnableChn[%d] failed: %x\n", i, ret);
+            printf("[rk_camera] VPSS EnableChn LCD failed: %x\n", ret);
             return ret;
         }
+        g_vpss_lcd_created = 1;
+
+        printf("[rk_camera] VPSS LCD channel: %dx%d\n", lcd_w, lcd_h);
     }
 
     // 启动 VPSS Group
@@ -313,8 +368,9 @@ static int vpss_init(int main_w, int main_h,
         return ret;
     }
 
-    printf("[rk_camera] VPSS init: group=%d, outputs: %dx%d / %dx%d / %dx%d\n",
-           VPSS_GRP_ID, main_w, main_h, sub_w, sub_h, third_w, third_h);
+    printf("[rk_camera] VPSS init: group=%d, outputs: %dx%d / %dx%d / %dx%d%s\n",
+           VPSS_GRP_ID, main_w, main_h, sub_w, sub_h, third_w, third_h,
+           g_fb_enabled ? " + LCD" : "");
     return 0;
 }
 
@@ -475,6 +531,220 @@ static int bind_vpss_to_venc(int vpss_chn, int venc_chn) {
     return RK_MPI_SYS_Bind(&stSrcChn, &stDestChn);
 }
 
+// ---- VO (Video Output → LCD) 初始化 ----
+// ---- NV12(YUV420SP) → RGB 软件转换 ----
+// RV1106 的简单可靠方案: 绕过 MPP VO 管线, 直接写 Linux framebuffer
+// 参考 Luckfox Pico retinaface/facenet 示例的 /dev/fb0 显示方式
+
+// 固定查找表: Y 分量映射 (免去每像素 Y-16 计算)
+#define YUV_CLAMP(v) ((v) < 0 ? 0 : ((v) > 255 ? 255 : (v)))
+
+static void nv12_to_bgr565(const uint8_t *y_plane, const uint8_t *uv_plane,
+                           int width, int height, int y_stride,
+                           uint8_t *dst_rgb) {
+    // NV12: Y plane at y_plane[y_stride * row + col]
+    //       UV interleaved at uv_plane[y_stride * row/2 + (col & ~1)]
+    // BGR565: 16-bit per pixel packed in little-endian
+    //         B[4:0] G[5:3] R[4:3] | G[2:0] R[2:0]
+    //         实际布局: [G2:0][B4:0] [R4:0][G5:3]
+    //         即 byte0 = ((g & 0x07) << 5) | (b & 0x1f)
+    //            byte1 = ((r & 0x1f) << 3) | ((g >> 3) & 0x07)
+    for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
+            int Y = (int)y_plane[y * y_stride + x];
+            int U = (int)uv_plane[(y / 2) * y_stride + (x & ~1)];
+            int V = (int)uv_plane[(y / 2) * y_stride + (x & ~1) + 1];
+
+            int c = Y - 16;
+            int d = U - 128;
+            int e = V - 128;
+
+            int r = (298 * c + 409 * e + 128) >> 8;
+            int g = (298 * c - 100 * d - 208 * e + 128) >> 8;
+            int b = (298 * c + 516 * d + 128) >> 8;
+
+            r = YUV_CLAMP(r);
+            g = YUV_CLAMP(g);
+            b = YUV_CLAMP(b);
+
+            // Pack to BGR565 little-endian
+            uint8_t r5 = (uint8_t)(r >> 3);
+            uint8_t g6 = (uint8_t)(g >> 2);
+            uint8_t b5 = (uint8_t)(b >> 3);
+
+            uint16_t pixel = (uint16_t)((g6 & 0x07) << 5) | (b5 & 0x1f)
+                           | (uint16_t)((r5 & 0x1f) << 3) | (uint16_t)((g6 >> 3) & 0x07) << 8;
+            // 实际: low byte = ((g & 7)<<5) | b, high byte = (r<<3) | (g>>3)
+
+            int out_idx = (y * width + x) * 2;
+            dst_rgb[out_idx] = (uint8_t)((uint8_t)((g6 & 0x07) << 5) | (b5 & 0x1f));
+            dst_rgb[out_idx + 1] = (uint8_t)((uint8_t)((r5 & 0x1f) << 3) | (uint8_t)((g6 >> 3) & 0x07));
+        }
+    }
+}
+
+static void nv12_to_bgra(const uint8_t *y_plane, const uint8_t *uv_plane,
+                         int width, int height, int y_stride,
+                         uint8_t *dst_rgb) {
+    // BGRA8888: 4 bytes per pixel, byte order B, G, R, A(255)
+    for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
+            int Y = (int)y_plane[y * y_stride + x];
+            int U = (int)uv_plane[(y / 2) * y_stride + (x & ~1)];
+            int V = (int)uv_plane[(y / 2) * y_stride + (x & ~1) + 1];
+
+            int c = Y - 16;
+            int d = U - 128;
+            int e = V - 128;
+
+            int r = (298 * c + 409 * e + 128) >> 8;
+            int g = (298 * c - 100 * d - 208 * e + 128) >> 8;
+            int b = (298 * c + 516 * d + 128) >> 8;
+
+            int out_idx = (y * width + x) * 4;
+            dst_rgb[out_idx + 0] = (uint8_t)YUV_CLAMP(b);
+            dst_rgb[out_idx + 1] = (uint8_t)YUV_CLAMP(g);
+            dst_rgb[out_idx + 2] = (uint8_t)YUV_CLAMP(r);
+            dst_rgb[out_idx + 3] = 255;  // alpha
+        }
+    }
+}
+
+// Framebuffer 初始化: 打开 /dev/fb0, 获取参数, mmap
+static int fb_init(int width, int height, int fps) {
+    if (!g_fb_enabled) return 0;
+
+    struct fb_var_screeninfo vinfo;
+    struct fb_fix_screeninfo finfo;
+
+    g_fb_fd = open("/dev/fb0", O_RDWR);
+    if (g_fb_fd < 0) {
+        printf("[rk_camera] FB open /dev/fb0 failed: %s\n", strerror(errno));
+        return -1;
+    }
+
+    if (ioctl(g_fb_fd, FBIOGET_VSCREENINFO, &vinfo) < 0) {
+        printf("[rk_camera] FB ioctl FBIOGET_VSCREENINFO failed\n");
+        close(g_fb_fd);
+        g_fb_fd = -1;
+        return -1;
+    }
+
+    if (ioctl(g_fb_fd, FBIOGET_FSCREENINFO, &finfo) < 0) {
+        printf("[rk_camera] FB ioctl FBIOGET_FSCREENINFO failed\n");
+        close(g_fb_fd);
+        g_fb_fd = -1;
+        return -1;
+    }
+
+    g_fb_bpp = vinfo.bits_per_pixel;
+    int pixel_size = g_fb_bpp / 8;
+    g_fb_size = finfo.smem_len;
+
+    if (g_fb_size < (size_t)(vinfo.xres * vinfo.yres * pixel_size)) {
+        g_fb_size = (size_t)vinfo.xres * vinfo.yres * pixel_size;
+    }
+
+    g_framebuffer = (uint8_t *)mmap(NULL, g_fb_size, PROT_READ | PROT_WRITE, MAP_SHARED, g_fb_fd, 0);
+    if (g_framebuffer == MAP_FAILED) {
+        printf("[rk_camera] FB mmap failed: %s\n", strerror(errno));
+        close(g_fb_fd);
+        g_fb_fd = -1;
+        return -1;
+    }
+
+    // 工作缓冲区: 显示分辨率 RGB 数据
+    g_fb_work_buf = (uint8_t *)malloc((size_t)width * height * 4);  // 最大 4 字节/pixel
+    if (!g_fb_work_buf) {
+        printf("[rk_camera] FB work buffer alloc failed\n");
+        munmap(g_framebuffer, g_fb_size);
+        close(g_fb_fd);
+        g_fb_fd = -1;
+        return -1;
+    }
+
+    g_fb_initialized = 1;
+    printf("[rk_camera] FB initialized: %dx%d bpp=%d (framebuffer %dx%d) @%dfps → LCD\n",
+           width, height, g_fb_bpp, vinfo.xres, vinfo.yres, fps);
+    return 0;
+}
+
+// Framebuffer 显示线程: VPSS CHN3 → GetChnFrame → NV12→RGB → memcpy(fb) → ReleaseChnFrame
+static void *fb_display_thread(void *arg) {
+    (void)arg;
+    printf("[rk_camera] FB display thread started (NV12→RGB software, /dev/fb0)\n");
+
+    int frame_count = 0;
+    while (!g_quit) {
+        VIDEO_FRAME_INFO_S stFrame;
+        memset(&stFrame, 0, sizeof(stFrame));
+
+        int ret = RK_MPI_VPSS_GetChnFrame(VPSS_GRP_ID, VPSS_CHN_LCD, &stFrame, 100);
+        if (ret == RK_SUCCESS) {
+            VIDEO_FRAME_S *pstVFrame = &stFrame.stVFrame;
+            uint8_t *y_plane = (uint8_t *)pstVFrame->pVirAddr[0];
+            uint8_t *uv_plane = (uint8_t *)pstVFrame->pVirAddr[1];
+            if (uv_plane == NULL) {
+                // fallback: UV 紧接 Y 之后
+                uv_plane = y_plane + (size_t)pstVFrame->u32VirWidth * pstVFrame->u32Height;
+            }
+
+            int src_w = (int)pstVFrame->u32Width;
+            int src_h = (int)pstVFrame->u32Height;
+            int y_stride = (int)pstVFrame->u32VirWidth;
+
+            // NV12 → RGB 转换到工作缓冲区
+            if (g_fb_bpp == 16) {
+                nv12_to_bgr565(y_plane, uv_plane, src_w, src_h, y_stride, g_fb_work_buf);
+            } else {
+                // 32bpp: BGRA8888
+                nv12_to_bgra(y_plane, uv_plane, src_w, src_h, y_stride, g_fb_work_buf);
+            }
+
+            // 拷贝到 framebuffer
+            int pixel_size = g_fb_bpp / 8;
+            size_t copy_size = (size_t)src_w * src_h * pixel_size;
+            if (copy_size <= g_fb_size) {
+                memcpy(g_framebuffer, g_fb_work_buf, copy_size);
+            }
+
+            RK_MPI_VPSS_ReleaseChnFrame(VPSS_GRP_ID, VPSS_CHN_LCD, &stFrame);
+
+            frame_count++;
+            if (frame_count == 30) {
+                // 每 30 帧静默确认运行正常 (不每次打印减少 log 刷屏)
+                frame_count = 0;
+            }
+        }
+        // 超时正常: VPSS CHN3 帧率取决于编码通道绑定
+    }
+
+    printf("[rk_camera] FB display thread stopped\n");
+    return NULL;
+}
+
+static void fb_deinit() {
+    if (!g_fb_initialized) return;
+
+    if (g_fb_work_buf) {
+        free(g_fb_work_buf);
+        g_fb_work_buf = NULL;
+    }
+
+    if (g_framebuffer && g_framebuffer != MAP_FAILED) {
+        munmap(g_framebuffer, g_fb_size);
+        g_framebuffer = NULL;
+    }
+
+    if (g_fb_fd >= 0) {
+        close(g_fb_fd);
+        g_fb_fd = -1;
+    }
+
+    g_fb_initialized = 0;
+    printf("[rk_camera] FB deinitialized\n");
+}
+
 // ---- 公开 API ----
 
 // rk_camera_init: 三码流模式初始化
@@ -574,9 +844,34 @@ int rk_camera_init(int main_w, int main_h, int fps, int bitrate, int sensor_fps)
         if (ret != 0) return -1;
     }
 
+    // 5. Framebuffer (LCD) 初始化 + 启动显示线程
+    //    参考 Luckfox Pico 示例: 直接写 /dev/fb0, 绕过复杂的 MPP VO 管线
+    if (g_fb_enabled) {
+        int lcd_w = g_lcd_width;
+        int lcd_h = g_lcd_height;
+        int main_fps2 = (g_chn_enabled[VENC_CHN_MAIN] && g_chn_attr[VENC_CHN_MAIN].dst_fps_den > 0)
+                        ? g_chn_attr[VENC_CHN_MAIN].dst_fps_num / g_chn_attr[VENC_CHN_MAIN].dst_fps_den : 25;
+
+        ret = fb_init(lcd_w, lcd_h, main_fps2);
+        if (ret != 0) {
+            printf("[rk_camera] WARN: fb_init failed, LCD disabled\n");
+            g_fb_enabled = 0;
+        } else {
+            // 给 VENC 流线程 200ms 启动时间，避免多线程同时调 MPP buffer pool 导致竞争崩溃
+            usleep(200 * 1000);
+            ret = pthread_create(&g_fb_thread, NULL, fb_display_thread, NULL);
+            if (ret != 0) {
+                printf("[rk_camera] WARN: fb_display_thread create failed\n");
+                fb_deinit();
+                g_fb_enabled = 0;
+            }
+        }
+    }
+
     g_initialized = 1;
-    printf("[rk_camera] initialized, %d stream threads started\n",
-           (g_chn_enabled[0]?1:0) + (g_chn_enabled[1]?1:0) + (g_chn_enabled[2]?1:0));
+    printf("[rk_camera] initialized, %d stream threads started%s\n",
+           (g_chn_enabled[0]?1:0) + (g_chn_enabled[1]?1:0) + (g_chn_enabled[2]?1:0),
+           g_fb_initialized ? " + LCD" : "");
     return 0;
 }
 
@@ -631,6 +926,16 @@ void rk_camera_set_chn_config(int chn_id,
     }
 }
 
+// 设置 LCD 参数 (在 rk_camera_init 之前调用)
+// width/height: LCD 分辨率 (0 表示使用 framebuffer 自动检测的默认值)
+// fps: 显示帧率
+void rk_camera_set_vo_config(int width, int height, int fps) {
+    if (width > 0) g_lcd_width = width;
+    if (height > 0) g_lcd_height = height;
+    g_fb_enabled = 1;
+    printf("[rk_camera] FB enabled: %dx%d @%dfps\n", g_lcd_width, g_lcd_height, fps);
+}
+
 // 设置帧回调
 void rk_camera_set_callback(frame_callback_t cb) {
     g_callback = cb;
@@ -669,6 +974,11 @@ void rk_camera_deinit() {
         }
     }
 
+    // 停止 framebuffer 显示线程 (必须在 VPSS disable 之前 join)
+    if (g_fb_initialized) {
+        pthread_join(g_fb_thread, NULL);
+    }
+
     // 解绑: VENC ← VPSS ← VI
     for (int i = 0; i < VENC_MAX_CHN; i++) {
         if (g_chn_enabled[i]) {
@@ -702,12 +1012,20 @@ void rk_camera_deinit() {
         }
     }
 
+    // Framebuffer deinit (在 VPSS disable 之前)
+    fb_deinit();
+
     // 停止 VPSS
     for (int i = 0; i < VENC_MAX_CHN; i++) {
         if (g_chn_enabled[i]) {
             RK_MPI_VPSS_DisableChn(VPSS_GRP_ID,
                 (i == 0) ? VPSS_CHN_MAIN : (i == 1) ? VPSS_CHN_SUB : VPSS_CHN_THIRD);
         }
+    }
+    // 使用 g_vpss_lcd_created 而非 g_fb_enabled:
+    // fb_init 可能失败但 VPSS_CHN_LCD 已创建，必须 disable
+    if (g_vpss_lcd_created) {
+        RK_MPI_VPSS_DisableChn(VPSS_GRP_ID, VPSS_CHN_LCD);
     }
     RK_MPI_VPSS_StopGrp(VPSS_GRP_ID);
     RK_MPI_VPSS_DestroyGrp(VPSS_GRP_ID);
@@ -723,6 +1041,8 @@ void rk_camera_deinit() {
         g_chn_enabled[i] = 0;
         memset(&g_chn_attr[i], 0, sizeof(ChnEncAttr));
     }
+    g_fb_enabled = 0;
+    g_vpss_lcd_created = 0;
 
     g_initialized = 0;
     printf("[rk_camera] deinitialized\n");
@@ -1046,12 +1366,15 @@ void rk_audio_deinit() {
     printf("[rk_camera] audio deinitialized\n");
 }
 
-// ---- 控制通道: ISP 图像参数 C shim ----
+// ---- 控制通道: 编码器参数转换 helpers ----
+// 参考 rkipc video.c 中 output_data_type / rc_mode / rc_quality / profile / gop_mode 的取值语义
 
 static int get_codec_type(const char *codec_str) {
-    if (strcmp(codec_str, "H264") == 0 || strcmp(codec_str, "h264") == 0)
+    // 兼容 rkipc INI 格式 "H.264"/"H.265" 和简化格式 "H264"/"h264"
+    if (strcmp(codec_str, "H264") == 0 || strcmp(codec_str, "h264") == 0 ||
+        strcmp(codec_str, "H.264") == 0 || strcmp(codec_str, "h.264") == 0)
         return RK_VIDEO_ID_AVC;
-    return RK_VIDEO_ID_HEVC;  // default H.265
+    return RK_VIDEO_ID_HEVC;  // default H.265 (对标 rkipc)
 }
 
 static int get_rc_mode(const char *rc_str, int codec) {
@@ -1065,6 +1388,7 @@ static int get_rc_mode(const char *rc_str, int codec) {
 }
 
 static int get_rc_quality(const char *q_str) {
+    // 对标 rkipc: lowest→0 .. highest→6, 调节 MinQp
     if (strcmp(q_str, "highest") == 0) return 6;
     if (strcmp(q_str, "higher") == 0) return 5;
     if (strcmp(q_str, "high") == 0) return 4;
@@ -1076,10 +1400,11 @@ static int get_rc_quality(const char *q_str) {
 }
 
 static int get_profile(const char *p_str) {
+    // H.264 profile: high=100, main=77, baseline=66 (对标 rkipc video.c)
     if (strcmp(p_str, "high") == 0) return 100;
     if (strcmp(p_str, "main") == 0) return 77;
     if (strcmp(p_str, "baseline") == 0) return 66;
-    return 0;  // default main
+    return 0;  // default
 }
 
 static int get_gop_mode(const char *g_str) {
@@ -1088,6 +1413,7 @@ static int get_gop_mode(const char *g_str) {
 }
 
 static int get_mirror(const char *m_str) {
+    // VENC 层镜像 (对标 rkipc MIRROR 枚举)
     if (strcmp(m_str, "horizontal") == 0) return MIRROR_HORIZONTAL;
     if (strcmp(m_str, "vertical") == 0) return MIRROR_VERTICAL;
     if (strcmp(m_str, "both") == 0) return MIRROR_HORIZONTAL | MIRROR_VERTICAL;
@@ -1097,6 +1423,7 @@ static int get_mirror(const char *m_str) {
 
 // ---- 控制通道: ISP 图像参数 C shim ----
 // 供 Rust FFI 调用，利用已有的 g_aiq_ctx 操作 rkaiq SDK
+// 参考 rkipc common/isp/rv1106/isp.c 的 rk_isp_set/get_* 实现
 
 // ACP 参数类型枚举 (对应 acp_attrib_t 的不同字段)
 #define RK_CAM_ACP_CONTRAST     0
@@ -1105,7 +1432,7 @@ static int get_mirror(const char *m_str) {
 #define RK_CAM_ACP_HUE          3
 
 // 设置 ACP 参数 (contrast/brightness/saturation/hue)
-// value: 0-100 (rkipc 范围), 内部映射到 0-255 (rkaiq 范围: value * 2.55)
+// value: 0-100 (对标 rkipc UI 范围), 内部映射到 0-255 (rkaiq SDK: value * 2.55)
 int rk_camera_set_acp_param(int param_type, int value) {
     if (!g_aiq_ctx) {
         printf("[rk_camera] ERROR: set_acp_param: ISP not initialized\n");
@@ -1140,7 +1467,7 @@ int rk_camera_set_acp_param(int param_type, int value) {
 }
 
 // 获取 ACP 参数 (contrast/brightness/saturation/hue)
-// 返回值: 0-100 范围 (从 rkaiq 的 0-255 映射回来: value / 2.55)
+// 返回值: 0-100 范围 (从 rkaiq SDK 的 0-255 映射回来: value / 2.55)
 int rk_camera_get_acp_param(int param_type) {
     if (!g_aiq_ctx) {
         return -1;
@@ -1169,7 +1496,7 @@ int rk_camera_get_acp_param(int param_type) {
     return result;
 }
 
-// 设置锐度 (使用 asharpV33 API, 与 ACP 不同)
+// 设置锐度 (使用 asharpV33 API, 对标 rkipc rk_isp_set_sharpness)
 // value: 0-100 (百分比)
 int rk_camera_set_sharpness(int value) {
     if (!g_aiq_ctx) {
@@ -1191,7 +1518,7 @@ int rk_camera_set_sharpness(int value) {
     return 0;
 }
 
-// 获取锐度 (从 rkaiq 读取)
+// 获取锐度 (从 rkaiq SDK 读取)
 int rk_camera_get_sharpness() {
     if (!g_aiq_ctx) {
         return -1;
@@ -1211,56 +1538,154 @@ int rk_camera_get_sharpness() {
     return result;
 }
 
+// ---- rk_param_* 前向声明 (定义在文件末尾) ----
+int rk_param_get_int(const char *key, int default_value);
+int rk_param_set_int(const char *key, int value);
+char *rk_param_get_string(const char *key, const char *default_value);
+int rk_param_set_string(const char *key, const char *value);
+
 // ============================================================
 // ISP 图像参数接口 (rk_isp_*) — 供 rk_video_source.rs 控制通道调用
-// cam_id 当前忽略 (单摄像头), 内部转调 acp/sharpness 实现。
+// cam_id 当前忽略 (单摄像头)
+// 对标 rkipc common/isp/rv1106/isp.c:
+//   GET 从 INI 读取 (fallback 读 hardware), 保证返回上次 set 的值
+//   SET 先写 hardware 再持久化到 INI
 // ============================================================
 
 int rk_isp_get_contrast(int cam_id) {
     (void)cam_id;
+    int val = rk_param_get_int("isp.0.adjustment:contrast", -1);
+    if (val >= 0) return val;
     return rk_camera_get_acp_param(RK_CAM_ACP_CONTRAST);
 }
 int rk_isp_set_contrast(int cam_id, int value) {
     (void)cam_id;
-    return rk_camera_set_acp_param(RK_CAM_ACP_CONTRAST, value);
+    int ret = rk_camera_set_acp_param(RK_CAM_ACP_CONTRAST, value);
+    rk_param_set_int("isp.0.adjustment:contrast", value);
+    return ret;
 }
 int rk_isp_get_brightness(int cam_id) {
     (void)cam_id;
+    int val = rk_param_get_int("isp.0.adjustment:brightness", -1);
+    if (val >= 0) return val;
     return rk_camera_get_acp_param(RK_CAM_ACP_BRIGHTNESS);
 }
 int rk_isp_set_brightness(int cam_id, int value) {
     (void)cam_id;
-    return rk_camera_set_acp_param(RK_CAM_ACP_BRIGHTNESS, value);
+    int ret = rk_camera_set_acp_param(RK_CAM_ACP_BRIGHTNESS, value);
+    rk_param_set_int("isp.0.adjustment:brightness", value);
+    return ret;
 }
 int rk_isp_get_saturation(int cam_id) {
     (void)cam_id;
+    int val = rk_param_get_int("isp.0.adjustment:saturation", -1);
+    if (val >= 0) return val;
     return rk_camera_get_acp_param(RK_CAM_ACP_SATURATION);
 }
 int rk_isp_set_saturation(int cam_id, int value) {
     (void)cam_id;
-    return rk_camera_set_acp_param(RK_CAM_ACP_SATURATION, value);
+    int ret = rk_camera_set_acp_param(RK_CAM_ACP_SATURATION, value);
+    rk_param_set_int("isp.0.adjustment:saturation", value);
+    return ret;
 }
 int rk_isp_get_hue(int cam_id) {
     (void)cam_id;
+    int val = rk_param_get_int("isp.0.adjustment:hue", -1);
+    if (val >= 0) return val;
     return rk_camera_get_acp_param(RK_CAM_ACP_HUE);
 }
 int rk_isp_set_hue(int cam_id, int value) {
     (void)cam_id;
-    return rk_camera_set_acp_param(RK_CAM_ACP_HUE, value);
+    int ret = rk_camera_set_acp_param(RK_CAM_ACP_HUE, value);
+    rk_param_set_int("isp.0.adjustment:hue", value);
+    return ret;
 }
 int rk_isp_get_sharpness(int cam_id) {
     (void)cam_id;
+    int val = rk_param_get_int("isp.0.adjustment:sharpness", -1);
+    if (val >= 0) return val;
     return rk_camera_get_sharpness();
 }
 int rk_isp_set_sharpness(int cam_id, int value) {
     (void)cam_id;
-    return rk_camera_set_sharpness(value);
+    int ret = rk_camera_set_sharpness(value);
+    rk_param_set_int("isp.0.adjustment:sharpness", value);
+    return ret;
+}
+
+// ---- ISP 图像翻转 (对标 rkipc rk_isp_set_image_flip) ----
+// 使用 rkaiq 内置 mirror/flip API (rk_aiq_uapi2_setMirrorFlip),
+// 与 VENC 层 enMirror 独立 (VENC mirror 在编码级裁剪, ISP flip 在 sensor 级翻转)。
+
+int rk_isp_get_image_flip(int cam_id, const char **value) {
+    (void)cam_id;
+    if (!value) return -1;
+    *value = rk_param_get_string("isp.0.video_adjustment:image_flip", "close");
+    return 0;
+}
+
+int rk_isp_set_image_flip(int cam_id, const char *value) {
+    (void)cam_id;
+    if (!g_aiq_ctx || !value) return -1;
+
+    int mirror = 0, flip = 0;
+
+    if (strcmp(value, "close") == 0) {
+        mirror = 0; flip = 0;
+    } else if (strcmp(value, "flip") == 0) {
+        mirror = 0; flip = 1;
+    } else if (strcmp(value, "mirror") == 0) {
+        mirror = 1; flip = 0;
+    } else if (strcmp(value, "centrosymmetric") == 0) {
+        mirror = 1; flip = 1;
+    } else {
+        printf("[rk_camera] ERROR: unknown image_flip value: %s\n", value);
+        return -1;
+    }
+
+    // skip 4 frames (对标 rkipc: 等待管线稳定)
+    int ret = rk_aiq_uapi2_setMirrorFlip(g_aiq_ctx, mirror, flip, 4);
+    if (ret != 0) {
+        printf("[rk_camera] ERROR: rk_aiq_uapi2_setMirrorFlip failed: %d\n", ret);
+        return -1;
+    }
+
+    rk_param_set_string("isp.0.video_adjustment:image_flip", value);
+    printf("[rk_camera] image_flip set to %s (mirror=%d flip=%d)\n", value, mirror, flip);
+    return 0;
+}
+
+// ---- ISP 参数从 INI 恢复 (对标 rkipc rk_isp_set_from_ini) ----
+// 在 ISP 初始化后调用, 将上次持久化的 ISP 参数重新应用到硬件。
+// 默认值对标 rkipc: contrast/brightness/saturation/sharpness/hue=50, image_flip=close。
+int rk_isp_set_from_ini(int cam_id) {
+    (void)cam_id;
+    if (!g_aiq_ctx) return -1;
+
+    printf("[rk_camera] isp_set_from_ini: restoring ISP parameters from INI\n");
+
+    // image adjustment (默认 50, 对标 rkipc isp.c rk_isp_set_from_ini)
+    rk_isp_set_contrast(cam_id,    rk_param_get_int("isp.0.adjustment:contrast", 50));
+    rk_isp_set_brightness(cam_id,  rk_param_get_int("isp.0.adjustment:brightness", 50));
+    rk_isp_set_saturation(cam_id,  rk_param_get_int("isp.0.adjustment:saturation", 50));
+    rk_isp_set_sharpness(cam_id,   rk_param_get_int("isp.0.adjustment:sharpness", 50));
+    rk_isp_set_hue(cam_id,         rk_param_get_int("isp.0.adjustment:hue", 50));
+
+    // video_adjustment (image_flip, 默认为 close)
+    {
+        const char *flip_val = rk_param_get_string("isp.0.video_adjustment:image_flip", "close");
+        rk_isp_set_image_flip(cam_id, flip_val);
+    }
+
+    printf("[rk_camera] isp_set_from_ini done\n");
+    return 0;
 }
 
 // ============================================================
 // INI 参数持久化 (rk_param_*) — 简易 key=value 文件存储
-// 参考 rkipc rk_param_* 接口语义。控制通道单任务串行调用,
-// get_string 返回静态缓冲区指针 (Rust 侧调用后立即拷贝, 无需释放)。
+// 参考 rkipc rk_param_* 接口语义 (common/param/param.c)。
+// 控制通道单任务串行调用, get_string 返回静态缓冲区指针
+// (Rust 侧调用后立即拷贝, 无需释放)。
 // ============================================================
 
 #define RK_PARAM_FILE       "/userdata/device-cam.ini"
@@ -1371,15 +1796,19 @@ int rk_param_set_string(const char *key, const char *value) {
 
 // ============================================================
 // 系统操作 (rk_system_*)
+// 对标 rkipc common/system/system.c
 // ============================================================
 
 int rk_system_reboot(void) {
+    // 对标 rkipc: sync 后 reboot (rkipc 用 reboot -f)
     sync();
     return system("reboot");
 }
 
 int rk_system_factory_reset(void) {
-    // 删除持久化配置, 恢复默认后重启
+    // 删除持久化配置, 恢复所有默认后重启
+    // 对标 rkipc: cp /tmp/rkipc-factory-config.ini → sync → reboot -f
+    // 本实现无出厂默认 INI, 直接删除等价于复位到编译期默认值
     remove(RK_PARAM_FILE);
     sync();
     return system("reboot");

@@ -102,6 +102,34 @@ pub struct VideoConfig {
     pub third: StreamConfig,
 }
 
+/// LCD 显示配置 (VO → MIPI 接口)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LcdConfig {
+    /// 是否启用 LCD 显示
+    #[serde(default = "default_lcd_enabled")]
+    pub enabled: bool,
+    /// LCD 宽度 (0 = 自动检测)
+    #[serde(default = "default_lcd_width")]
+    pub width: u32,
+    /// LCD 高度 (0 = 自动检测)
+    #[serde(default = "default_lcd_height")]
+    pub height: u32,
+}
+
+fn default_lcd_enabled() -> bool { false }
+fn default_lcd_width() -> u32 { 800 }
+fn default_lcd_height() -> u32 { 480 }
+
+impl Default for LcdConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            width: 800,
+            height: 480,
+        }
+    }
+}
+
 impl Default for StreamConfig {
     fn default() -> Self {
         Self {
@@ -257,6 +285,10 @@ pub struct Config {
     #[serde(default)]
     pub video: VideoConfig,
 
+    /// LCD 显示配置 (VO → MIPI 接口)
+    #[serde(default)]
+    pub lcd: LcdConfig,
+
     /// sensor 原生输出帧率 (摄像头模组实际产出率, 如 30)。
     /// 注意: 这是 VI/编码器的输入源帧率, 与各码流的目标帧率(dst_frame_rate)不同。
     /// 帧率控制逻辑(对标 rkipc isp.0.adjustment:fps): VENC 的 u32SrcFrameRate 必须等于此值,
@@ -287,6 +319,7 @@ impl Default for Config {
             audio: AudioConfig::default(),
             udp_port: None,
             video: VideoConfig::default(),
+            lcd: LcdConfig::default(),
             sensor_frame_rate: default_sensor_frame_rate(),
             video_file: None,
         }

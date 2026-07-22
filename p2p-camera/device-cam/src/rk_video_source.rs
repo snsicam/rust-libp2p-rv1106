@@ -51,6 +51,10 @@ extern "C" {
     fn rk_camera_request_idr_all() -> std::ffi::c_int;
     fn rk_camera_deinit();
 
+    // VO (LCD) 配置
+    fn rk_camera_set_vo_config(width: std::ffi::c_int, height: std::ffi::c_int,
+                                fps: std::ffi::c_int);
+
     fn rk_audio_init(
         sample_rate: std::ffi::c_int,
         card_name: *const std::ffi::c_char,
@@ -186,6 +190,11 @@ pub struct RkVideoSource {
     /// 必须等于 VENC 实际接收帧率, 编码器才能按目标帧率正确丢帧;
     /// 不能用某码流的配置 fps 充当, 否则 ratio=1 不丢帧、实测跑满原生帧率。
     sensor_frame_rate: u32,
+    /// 是否启用 LCD 显示 (VO)
+    enable_lcd: bool,
+    /// LCD 分辨率 (0 表示自动检测)
+    lcd_width: u32,
+    lcd_height: u32,
 }
 
 impl RkVideoSource {
@@ -200,13 +209,28 @@ impl RkVideoSource {
             sub_params: sub,
             third_params: third,
             sensor_frame_rate: if sensor_frame_rate > 0 { sensor_frame_rate } else { 30 },
+            enable_lcd: false,
+            lcd_width: 800,
+            lcd_height: 480,
         }
     }
 
+    /// 启用 LCD 显示 (RV1106 MIPI 接口)
+    pub fn with_lcd(mut self, width: u32, height: u32) -> Self {
+        self.enable_lcd = true;
+        if width > 0 { self.lcd_width = width; }
+        if height > 0 { self.lcd_height = height; }
+        self
+    }
+
     /// 在独立线程中启动摄像头 (三码流)
-    /// 返回 (JoinHandle, Vec<(StreamType, Sender<()>)>)
+    /// 返回 (JoinHandle, start-tx)
+    ///
+    /// **重要**: spawn 以 &self 借用而非所有权。这样 RkVideoSource 的 Drop 不会
+    /// 在 spawn 返回时触发，GLOBAL_SENDERS 不会过早被清空。调用方必须持有
+    /// RkVideoSource 实例直到需要停止摄像头时才 drop。
     pub fn spawn(
-        self,
+        &self,
         main_sender: Sender<MediaPacket>,
         sub_sender: Option<Sender<MediaPacket>>,
         third_sender: Option<Sender<MediaPacket>>,
@@ -215,6 +239,10 @@ impl RkVideoSource {
         let main = self.main_params.clone();
         let sub = self.sub_params.clone();
         let third = self.third_params.clone();
+        let enable_lcd = self.enable_lcd;
+        let lcd_width = self.lcd_width;
+        let lcd_height = self.lcd_height;
+        let sensor_frame_rate = self.sensor_frame_rate;
 
         let handle = thread::spawn(move || {
             let _ = start_rx.recv();
@@ -328,16 +356,30 @@ impl RkVideoSource {
                 }
             }
 
+            // 启用 LCD 显示 (需要在 rk_camera_init 前调用)
+            if enable_lcd {
+                let lcd_fps = main.dst_fps_num / main.dst_fps_den.max(1);
+                unsafe {
+                    rk_camera_set_vo_config(
+                        lcd_width as i32,
+                        lcd_height as i32,
+                        lcd_fps as i32,
+                    );
+                }
+                println!("[RkVideoSource] LCD enabled: {}x{} @{}fps",
+                         lcd_width, lcd_height, lcd_fps);
+            }
+
             // 初始化摄像头硬件
             let main_fps = main.dst_fps_num / main.dst_fps_den.max(1);
             // sensor 原生帧率 (来自配置 sensor_frame_rate, 默认 30), 而非某码流配置 fps。
             // 这是 VENC 的实际输入帧率, 编码器据此按目标帧率丢帧 (对标 rkipc isp.0.adjustment:fps)。
-            let sensor_fps = self.sensor_frame_rate;
+            let sensor_fps_val = sensor_frame_rate;
             let ret = unsafe {
                 rk_camera_init(
                     main.width as i32, main.height as i32,
                     main_fps as i32, main.bitrate_kbps as i32,
-                    sensor_fps as i32,
+                    sensor_fps_val as i32,
                 )
             };
             if ret != 0 {

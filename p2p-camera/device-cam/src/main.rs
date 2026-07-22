@@ -139,6 +139,13 @@ async fn main() -> Result<()> {
     #[allow(unused_variables)]
     let third_enabled = config.video.third.enabled;
 
+    // RkVideoSource 必须在整个 main() 生命周期内保持存活，因为：
+    //   spawn(&self) 后 self 仍被借用 → Drop 不清空 GLOBAL_SENDERS。
+    //   若在 cfg 块内 drop, GLOBAL_SENDERS → None → 线程探测到后立即退出
+    //   → rk_camera_deinit 段错误。
+    #[cfg(feature = "rv1106")]
+    let mut _cam_source: Option<rk_video_source::RkVideoSource> = None;
+
     #[cfg(feature = "rv1106")]
     {
         if main_enabled {
@@ -172,10 +179,14 @@ async fn main() -> Result<()> {
                          p.bitrate_kbps, p.codec);
             }
 
-            let source = rk_video_source::RkVideoSource::new(
+            let mut source = rk_video_source::RkVideoSource::new(
                 main_params, sub_params, third_params,
                 config.sensor_frame_rate,
             );
+            // TODO: LCD/FB 暂屏蔽，先验证三码流编码正常
+            // if config.lcd.enabled {
+            //     source = source.with_lcd(config.lcd.width, config.lcd.height);
+            // }
             let (_, start_tx) = source.spawn(
                 broadcast_sender_to_crossbeam(main_tx.clone()),
                 if sub_enabled { Some(broadcast_sender_to_crossbeam(sub_tx.clone())) } else { None },
@@ -185,6 +196,9 @@ async fn main() -> Result<()> {
             // 必须发送开始信号才会初始化摄像头并开始取流 (rk_camera_init)。
             // 否则 on_frame 回调永不触发，main_tx 永远为空，viewer 收不到任何视频帧。
             let _ = start_tx.send(());
+
+            // 将 source 移出块作用域: 它必须在整个 main() 生命周期保持存活
+            _cam_source = Some(source);
         }
     }
 
