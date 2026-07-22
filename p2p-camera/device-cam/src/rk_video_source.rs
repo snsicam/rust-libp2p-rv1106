@@ -13,7 +13,7 @@
 use bytes::Bytes;
 use crossbeam_channel::Sender;
 use proto::media_packet::MediaPacket;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Mutex;
 use std::thread;
 use std::time::Instant;
@@ -142,14 +142,66 @@ static GLOBAL_START_TIMES: [Mutex<Option<Instant>>; MAX_CHN] = [
     Mutex::new(None),
 ];
 
-/// C 帧回调 — 在 VENC 取流线程中调用
-/// chn_id: 0=main, 1=sub, 2=third
+/// 每个通道是否已打印过首帧诊断 (仅首帧打印, 避免刷屏)
+static ON_FRAME_FIRST_LOG: [AtomicBool; MAX_CHN] = [
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+];
+
+/// C 帧回调入口 (extern "C") — 在 VENC 取流线程中调用。
+///
+/// **重要**: 此函数在 C 的 pthread 调用栈上运行。Rust panic 若在 C 栈上
+/// unwind 是未定义行为 (UB), 可能直接导致进程崩溃甚至内核 oops。
+/// 因此必须用 `catch_unwind` 包裹, 将任何 panic 就地捕获, 绝不让其跨越 FFI 边界。
+/// 同时首帧诊断日志在 catch_unwind 之前打印到 stderr (无缓冲), 用于定位崩溃
+/// 究竟发生在回调之前 (SDK/GetStream/RGA) 还是回调之内。
 extern "C" fn on_frame(
+    chn_id: std::ffi::c_int, data: *const u8, len: u32,
+    pts_us: u64,
+) {
+    log_on_frame_first(chn_id, data, len);
+
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        on_frame_inner(chn_id, data, len, pts_us);
+    }));
+}
+
+/// 首帧诊断打印 (每个通道仅一次), 在 catch_unwind 之前调用
+fn log_on_frame_first(chn_id: std::ffi::c_int, data: *const u8, len: u32) {
+    let chn = chn_id as usize;
+    if chn >= MAX_CHN { return; }
+    if ON_FRAME_FIRST_LOG[chn].swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let head = unsafe {
+        if len >= 4 && !data.is_null() {
+            let s = std::slice::from_raw_parts(data, 4);
+            format!("{:02x} {:02x} {:02x} {:02x}", s[0], s[1], s[2], s[3])
+        } else {
+            "n/a".to_string()
+        }
+    };
+    eprintln!(
+        "[on_frame] FIRST chn={} len={} ptr={:?} head=[{}]",
+        chn_id, len, data, head
+    );
+}
+
+/// 真正处理一帧 (在 catch_unwind 内运行, 可安全 panic 而不会跨越 FFI 边界)
+fn on_frame_inner(
     chn_id: std::ffi::c_int, data: *const u8, len: u32,
     pts_us: u64,
 ) {
     let chn = chn_id as usize;
     if chn >= MAX_CHN { return; }
+
+    // 防御: 单帧长度超过 8MiB 视为异常 (任何 H265/H264 单帧都不应超过此值),
+    // 直接丢弃, 避免 copy_from_slice 分配过大内存或读越界。
+    if len > 8 * 1024 * 1024 {
+        eprintln!("[on_frame] chn={} DROP abnormal len={}", chn_id, len);
+        return;
+    }
 
     let slice = unsafe { std::slice::from_raw_parts(data, len as usize) };
 

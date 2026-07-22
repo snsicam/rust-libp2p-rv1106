@@ -507,36 +507,60 @@ static int bind_vpss_to_venc(int vpss_chn, int venc_chn) {
 // 完全独立于 MPP 管线, 避免与 VPSS/VENC 争抢同一 Group 的 buffer pool。
 // 参考 Luckfox Pico retinaface/facenet 示例的做法。
 
-// RGA 硬件 NV12→BGRA 转换 + 缩放 (毫秒级, 替代软件 YUV→RGB)
-// src: V4L2 mmap 的 NV12 buffer (1920x1080)
-// dst: g_fb_work_buf (720x720 BGRA)
-static int g_rga_inited = 0;
+// 软件 NV12→BGRA 转换 + 最近邻缩放 (替代 RGA 硬件 DMA)
+// 原因: RGA 硬件做 DMA 写入裸堆内存(malloc 的 g_fb_work_buf, fd=-1)会触发
+//       内核 Bad rss-counter / pgtables_bytes panic (DMA 越界破坏页表元数据)。
+//       软件路径虽然略慢, 但完全安全; 且 LCD 实际为 720x720 1:1, 负担很小。
+// src: V4L2 mmap 的 NV12 buffer
+// dst: g_fb_work_buf (BGRA8888)
+static void nv12_to_bgra_sw(const uint8_t *nv12, int src_w, int src_h, int src_stride,
+                            uint8_t *bgra, int dst_w, int dst_h) {
+    if (!nv12 || !bgra || src_w <= 0 || src_h <= 0 || dst_w <= 0 || dst_h <= 0)
+        return;
 
-static int rga_nv12_to_bgra(void *nv12_buf, int src_w, int src_h, int src_stride,
-                             void *bgra_buf, int dst_w, int dst_h) {
-    rga_info_t src_info, dst_info;
-    memset(&src_info, 0, sizeof(src_info));
-    memset(&dst_info, 0, sizeof(dst_info));
+    const uint8_t *y_plane = nv12;
+    const uint8_t *uv_plane = nv12 + (size_t)src_stride * src_h;
+    const int uv_stride = src_stride;  // NV12 色度与亮度 stride 相同
 
-    // 源: NV12 (YCrCb 420 SP)
-    src_info.fd = -1;
-    src_info.virAddr = nv12_buf;
-    src_info.format = RK_FORMAT_YCrCb_420_SP;
-    rga_set_rect(&src_info.rect, 0, 0, src_w, src_h, src_stride, src_h,
-                 RK_FORMAT_YCrCb_420_SP);
+    // 预计算列映射, 避免内层整数除法 (优化)
+    uint16_t *xmap = (uint16_t *)malloc(sizeof(uint16_t) * dst_w);
+    if (!xmap) return;
+    for (int dx = 0; dx < dst_w; dx++) {
+        int sx = (dx * src_w) / dst_w;
+        xmap[dx] = (sx >= src_w) ? (uint16_t)(src_w - 1) : (uint16_t)sx;
+    }
 
-    // 目标: BGRA8888, RGA 自动做缩放
-    dst_info.fd = -1;
-    dst_info.virAddr = bgra_buf;
-    dst_info.format = RK_FORMAT_BGRA_8888;
-    rga_set_rect(&dst_info.rect, 0, 0, dst_w, dst_h, dst_w, dst_h,
-                 RK_FORMAT_BGRA_8888);
+    for (int dy = 0; dy < dst_h; dy++) {
+        int sy = (dy * src_h) / dst_h;
+        if (sy >= src_h) sy = src_h - 1;
+        const uint8_t *y_row = y_plane + (size_t)sy * src_stride;
+        const uint8_t *uv_row = uv_plane + (size_t)(sy >> 1) * uv_stride;
+        uint8_t *out = bgra + (size_t)dy * dst_w * 4;
 
-    // 同步模式: 确保 RGA 操作完成后才返回
-    dst_info.sync_mode = RGA_BLIT_SYNC;
+        for (int dx = 0; dx < dst_w; dx++) {
+            int sx = xmap[dx];
+            int Y = y_row[sx] - 16;
+            int uv_off = sx & ~1;
+            int Cb = uv_row[uv_off] - 128;
+            int Cr = uv_row[uv_off + 1] - 128;
 
-    int ret = c_RkRgaBlit(&src_info, &dst_info, NULL);
-    return ret;
+            // BT.601 limited→full range, 固定点 (×256)
+            int r = Y + ((359 * Cr) >> 8);                 // 1.402
+            int g = Y - ((88 * Cb + 183 * Cr) >> 8);       // 0.344 / 0.714
+            int b = Y + ((454 * Cb) >> 8);                 // 1.772
+            if (r < 0) r = 0; else if (r > 255) r = 255;
+            if (g < 0) g = 0; else if (g > 255) g = 255;
+            if (b < 0) b = 0; else if (b > 255) b = 255;
+
+            out[0] = (uint8_t)b;
+            out[1] = (uint8_t)g;
+            out[2] = (uint8_t)r;
+            out[3] = 0xFF;
+            out += 4;
+        }
+    }
+
+    free(xmap);
 }
 
 // Framebuffer 初始化: 打开 /dev/fb0, mmap
@@ -747,21 +771,12 @@ static void *lcd_display_thread(void *arg) {
         return NULL;
     }
 
-    // 初始化 RGA (硬件 2D 加速器: NV12→BGRA 转换 + 缩放)
-    if (c_RkRgaInit() == 0) {
-        g_rga_inited = 1;
-        printf("[rk_camera] LCD RGA initialized (HW NV12→BGRA+scale)\n");
-    } else {
-        printf("[rk_camera] LCD RGA init failed, LCD disabled\n");
-        lcd_v4l2_deinit(v4l2_fd);
-        g_fb_enabled = 0;
-        return NULL;
-    }
+    // 软件 NV12→BGRA 路径 (不再使用 RGA 硬件 DMA, 避免内核 panic)
+    printf("[rk_camera] LCD using software NV12→BGRA (no RGA)\n");
 
     // 初始化 framebuffer
     if (fb_init(g_lcd_width, g_lcd_height) < 0) {
         printf("[rk_camera] LCD fb init failed, LCD disabled\n");
-        c_RkRgaDeInit();
         lcd_v4l2_deinit(v4l2_fd);
         g_fb_enabled = 0;
         return NULL;
@@ -794,9 +809,9 @@ static void *lcd_display_thread(void *arg) {
             continue;
         }
 
-        // RGA 硬件: NV12(1920x1080) → BGRA(720x720) 带缩放, <1ms
-        rga_nv12_to_bgra(data, v4l2_w, v4l2_h, v4l2_stride,
-                         g_fb_work_buf, output_w, output_h);
+        // 软件 NV12→BGRA (安全, 无硬件 DMA)
+        nv12_to_bgra_sw((const uint8_t *)data, v4l2_w, v4l2_h, v4l2_stride,
+                        g_fb_work_buf, output_w, output_h);
 
         size_t copy_size = (size_t)output_w * output_h * pixel_size;
         if (copy_size <= g_fb_size) {
@@ -811,8 +826,6 @@ static void *lcd_display_thread(void *arg) {
         }
     }
 
-    c_RkRgaDeInit();
-    g_rga_inited = 0;
     fb_deinit();
     lcd_v4l2_deinit(v4l2_fd);
     printf("[rk_camera] LCD thread stopped\n");
