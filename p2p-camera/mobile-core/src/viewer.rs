@@ -765,13 +765,24 @@ impl MediaPlayer {
                                             false
                                         }
                                     })
-                                    .filter(|a| {
-                                        if let Some(Protocol::Ip4(remote_ip)) = a.iter().find(|p| matches!(p, Protocol::Ip4(_))) {
-                                            local_ips.iter().any(|local_ip| is_same_subnet(*local_ip, remote_ip))
+                                .filter(|a| {
+                                    if let Some(Protocol::Ip4(remote_ip)) = a.iter().find(|p| matches!(p, Protocol::Ip4(_))) {
+                                        // 本端能拿到本地 IP 时仍要求同子网; 拿不到时(典型为 Android
+                                        // 绑 0.0.0.0, NewListenAddr 上报 0.0.0.0 被 is_unspecified 跳过
+                                        // → local_ips 为空)则只要对端是私网地址就尝试局域网直连。
+                                        // 否则会漏掉"真机与 cam 同 LAN 却一直走 relay 拿 sub"的场景:
+                                        // 桌面 viewer 靠 mDNS 直连拿 main, 手机 mDNS 在 Android 上不可靠,
+                                        // 仅靠此处 Identify 后续的局域网直连升级, 旧逻辑因 local_ips 空
+                                        // 被判为非 LAN → 永远卡在 sub。
+                                        if local_ips.is_empty() {
+                                            true
                                         } else {
-                                            false
+                                            local_ips.iter().any(|local_ip| is_same_subnet(*local_ip, remote_ip))
                                         }
-                                    })
+                                    } else {
+                                        false
+                                    }
+                                })
                                     .cloned()
                                     .collect();
 
