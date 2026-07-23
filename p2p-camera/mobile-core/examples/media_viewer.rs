@@ -10,21 +10,20 @@
 //!   cargo build --example media_viewer --features player
 //!   media_viewer --relay ... --camera ... --play
 //!
+//! GUI 模式 (play=true):
+//!   窗口左侧为设备管理面板，显示 viewer.toml 中 cameras 列表；
+//!   - 单击选中设备，双击设备开始连接并在右侧播放视频
+//!   - [+ Add] 添加设备 (键入或 Ctrl+V 粘贴 PeerId，Enter 确认，Esc 取消)
+//!   - [- Del] 删除选中设备
+//!   - 增删自动保存回 viewer.toml (注意: 保存会丢失配置文件中的注释)
+//!   启动时不自动连接，双击设备才连接。
+//!
 //! 自动重连: 连接断开时自动重新连接 Relay + DeviceCam + 打开 stream，
 //!           播放器和输出文件持续运行不中断。
 //!
 //! 多 Relay + mDNS 支持:
 //!   --relay 可多次使用: --relay /ip4/.../p2p/A --relay /ip4/.../p2p/B
 //!   --enable-mdns (默认 true): 启用 mDNS 局域网发现，优先于 Relay
-//!
-//! 验证流程:
-//!   1. 同时拨号所有 Relay Server
-//!   2. 如果启用 mDNS，并行监听局域网发现事件 (5 秒超时)
-//!   3. mDNS 发现目标 DeviceCam 时，优先使用 LAN 直连
-//!   4. 否则通过第一个成功连接的 Relay circuit 拨号 DeviceCam
-//!   5. 打开视频 stream 接收帧
-//!   6. 保存到文件 (可用 ffplay 播放) 或 SDL 实时播放 (--play, 需 --features player)
-//!   7. 打印接收统计
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -37,7 +36,6 @@ use mobile_core::viewer::{
 };
 #[cfg(feature = "player")]
 use mobile_core::viewer::IDR_WAIT_TIMEOUT;
-use mobile_core::net_diag::NatType;
 use proto::media_packet::MediaPacket;
 use serde::{Deserialize, Serialize};
 use tracing_subscriber::EnvFilter;
@@ -75,16 +73,13 @@ async fn main() -> Result<()> {
     // stream CLI arg always overrides config (unless it's the default "auto")
     if opt.stream != "auto" { config.stream = opt.stream.clone(); }
 
-    // 解析 relays (兼容旧格式 relay 字段)
+    // 解析 relays (兼容旧格式 relay 字段) / cameras (兼容旧格式 camera 字段)
     config.resolve_relays();
+    config.resolve_cameras();
 
     // ---- 参数校验 ----
     if config.relays.is_empty() && !config.enable_mdns {
         eprintln!("[Viewer] Error: no relay addresses and mDNS is disabled. Edit {} or use --relay / --enable-mdns", opt.config.display());
-        std::process::exit(1);
-    }
-    if config.camera.is_empty() {
-        eprintln!("[Viewer] Error: camera PeerId is empty. Edit {} or use --camera", opt.config.display());
         std::process::exit(1);
     }
     {
@@ -110,26 +105,25 @@ async fn main() -> Result<()> {
         tracing::info!("[Viewer] mDNS disabled");
     }
 
-    // ---- 初始化播放器/输出 (独立于 P2P 连接，重连期间不中断) ----
+    // GUI 模式: 左侧设备管理面板 + 右侧视频, 双击设备才连接
     #[cfg(feature = "player")]
-    let mut player = if config.play {
-        println!("[Viewer] Initializing SDL player...");
-        Some(player::VideoPlayer::new()?)
-    } else {
-        None
-    };
+    if config.play {
+        return run_gui(opt, config).await;
+    }
 
-    #[cfg(feature = "player")]
-    let mut audio_player = if config.play && !config.no_audio {
-        match player::AudioPlayer::new(16000) {
-            Ok(p) => Some(p),
-            Err(e) => {
-                println!("[Viewer] Audio player init failed (non-fatal): {e}");
-                None
-            }
+    // headless 模式: 直连配置中的 camera (旧行为)
+    run_headless(opt, config).await
+}
+
+// ---- headless 模式 (无窗口: 保存文件/统计) ----
+
+async fn run_headless(opt: Opt, config: ViewerConfig) -> Result<()> {
+    let device_cam_str = match config.primary_camera() {
+        Some(c) => c.to_string(),
+        None => {
+            eprintln!("[Viewer] Error: camera PeerId is empty. Edit {} or use --camera", opt.config.display());
+            std::process::exit(1);
         }
-    } else {
-        None
     };
 
     let mut output_file = if let Some(path) = &config.output {
@@ -139,7 +133,6 @@ async fn main() -> Result<()> {
     };
 
     let relay_addrs = config.relays.clone();
-    let device_cam_str = config.camera.clone();
     let no_audio = config.no_audio;
     let udp_port = config.udp_port.unwrap_or(0);
     let enable_mdns = config.enable_mdns;
@@ -149,13 +142,8 @@ async fn main() -> Result<()> {
     let mut frame_count: u64 = 0;
     let mut bytes_received: u64 = 0;
     let mut _audio_count: u64 = 0;
-    let mut _direct_upgraded = false;
-    let mut _direct_via_lan = false;
-    let mut _local_nat_type: Option<NatType> = None;
-    let mut _remote_nat_hint: Option<String> = None;
     let mut video_start: Option<std::time::Instant> = None;
     let mut stream_disconnected = false;
-    let mut window_minimized = false;
     // DCUtR 是否启用：默认启用（锥形/EIM NAT 可打洞成功，省中继带宽）。
     let enable_dcutr = network_type != "4g";
 
@@ -220,101 +208,29 @@ async fn main() -> Result<()> {
         // 轮询事件
         while let Some(event) = viewer.poll_event() {
             match event {
-                MediaPlayerEvent::Disconnected { reason } => {
+                MediaPlayerEvent::Disconnected { reason }
+                | MediaPlayerEvent::StreamEOF { reason } => {
                     if stream_disconnected {
                         continue;
                     }
-                    eprintln!("[Viewer] Session disconnected: {reason}");
+                    eprintln!("[Viewer] Session lost: {reason}");
                     stream_disconnected = true;
-
-                    #[cfg(not(feature = "player"))]
-                    {
-                        eprintln!("[Viewer] Reconnecting in {}s...", RECONNECT_DELAY.as_secs());
-                        reset_stats(&mut frame_count, &mut bytes_received, &mut video_start);
-                        match viewer.reconnect().await {
-                            Ok(()) => {
-                                stream_disconnected = false;
-                            }
-                            Err(e) => {
-                                eprintln!("[Viewer] Reconnect failed: {e}");
-                            }
+                    eprintln!("[Viewer] Reconnecting in {}s...", RECONNECT_DELAY.as_secs());
+                    reset_stats(&mut frame_count, &mut bytes_received, &mut video_start);
+                    match viewer.reconnect().await {
+                        Ok(()) => {
+                            stream_disconnected = false;
                         }
-                    }
-                    #[cfg(feature = "player")]
-                    {
-                        // 先轮询 SDL 事件，检查窗口是否已最小化
-                        if let Some(p) = player.as_mut() {
-                            let action = p.poll_events();
-                            if let RenderAction::WindowMinimized = action {
-                                window_minimized = true;
-                            } else if let RenderAction::Quit = action {
-                                std::process::exit(0);
-                            }
-                        }
-                        if !window_minimized {
-                            eprintln!("[Viewer] Reconnecting in {}s...", RECONNECT_DELAY.as_secs());
-                            reset_stats(&mut frame_count, &mut bytes_received, &mut video_start);
-                            if let Some(p) = player.as_mut() {
-                                p.reset_decoder();
-                            }
-                            match viewer.reconnect().await {
-                                Ok(()) => {
-                                    stream_disconnected = false;
-                                }
-                                Err(e) => {
-                                    eprintln!("[Viewer] Reconnect failed: {e}");
-                                }
-                            }
-                        }
-                    }
-                }
-                MediaPlayerEvent::StreamEOF { reason } => {
-                    if stream_disconnected {
-                        continue;
-                    }
-                    eprintln!("[Viewer] Stream EOF: {reason}");
-                    stream_disconnected = true;
-                    #[cfg(not(feature = "player"))]
-                    {
-                        eprintln!("[Viewer] Reconnecting in {}s...", RECONNECT_DELAY.as_secs());
-                        reset_stats(&mut frame_count, &mut bytes_received, &mut video_start);
-                        match viewer.reconnect().await {
-                            Ok(()) => {
-                                stream_disconnected = false;
-                            }
-                            Err(e) => {
-                                eprintln!("[Viewer] Reconnect failed: {e}");
-                            }
-                        }
-                    }
-                    #[cfg(feature = "player")]
-                    {
-                        if !window_minimized {
-                            eprintln!("[Viewer] Reconnecting in {}s...", RECONNECT_DELAY.as_secs());
-                            reset_stats(&mut frame_count, &mut bytes_received, &mut video_start);
-                            if let Some(p) = player.as_mut() {
-                                p.reset_decoder();
-                            }
-                            match viewer.reconnect().await {
-                                Ok(()) => {
-                                    stream_disconnected = false;
-                                }
-                                Err(e) => {
-                                    eprintln!("[Viewer] Reconnect failed: {e}");
-                                }
-                            }
+                        Err(e) => {
+                            eprintln!("[Viewer] Reconnect failed: {e}");
                         }
                     }
                 }
                 MediaPlayerEvent::DirectUpgraded { via_lan } => {
-                    _direct_upgraded = true;
-                    _direct_via_lan = via_lan;
                     let via = if via_lan { "LAN direct" } else { "DCUtR hole punch" };
                     println!("[Viewer] Direct connection established via {via}, streams upgraded");
                 }
                 MediaPlayerEvent::NatDiagnosis { local_nat, remote_nat } => {
-                    _local_nat_type = Some(local_nat);
-                    _remote_nat_hint = remote_nat.clone();
                     println!("[Viewer] NAT diagnosis: local={}, remote={}",
                         local_nat.short_name(),
                         remote_nat.as_deref().unwrap_or("Unknown"));
@@ -328,71 +244,295 @@ async fn main() -> Result<()> {
 
         // 轮询视频帧
         while let Some(packet) = viewer.poll_video_frame() {
-            match process_video_frame(
-                packet, &mut frame_count, &mut bytes_received, &mut video_start, &mut output_file,
-                #[cfg(feature = "player")]
-                player.as_mut(),
+            if let Err(e) = handle_video_packet(
+                &packet, &mut frame_count, &mut bytes_received, &mut video_start, &mut output_file,
             ) {
-                RenderAction::Quit => {
-                    if let Some(path) = &opt.output {
+                eprintln!("[Viewer] Output write failed: {e}");
+                if let Some(path) = &config.output {
+                    println!("[Viewer] Output saved to: {}", path.display());
+                    println!("[Viewer] Play with: ffplay -f hevc {}", path.display());
+                }
+                return Ok(());
+            }
+        }
+
+        // 轮询音频帧
+        while let Some(_packet) = viewer.poll_audio_frame() {
+            _audio_count += 1;
+        }
+
+        // 短暂让出 CPU，避免 busy loop
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+
+// ---- GUI 模式 (设备管理面板 + SDL 播放) ----
+
+#[cfg(feature = "player")]
+async fn run_gui(opt: Opt, mut config: ViewerConfig) -> Result<()> {
+    use player::UiAction;
+    use std::time::Instant;
+
+    println!("[Viewer] Initializing SDL player...");
+    let mut player = player::VideoPlayer::new(config.cameras.clone())?;
+
+    let mut audio_player = if !config.no_audio {
+        match player::AudioPlayer::new(16000) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                println!("[Viewer] Audio player init failed (non-fatal): {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let mut output_file = if let Some(path) = &config.output {
+        Some(std::fs::File::create(path).context("Failed to create output file")?)
+    } else {
+        None
+    };
+
+    let relay_addrs = config.relays.clone();
+    let no_audio = config.no_audio;
+    let udp_port = config.udp_port.unwrap_or(0);
+    let enable_mdns = config.enable_mdns;
+    let stream_type = config.stream.clone();
+    let network_type = config.network_type.clone();
+    // DCUtR 是否启用：默认启用（锥形/EIM NAT 可打洞成功，省中继带宽）。
+    let enable_dcutr = network_type != "4g";
+
+    // 会话状态: 双击设备后才创建 MediaPlayer 并连接
+    let mut session: Option<MediaPlayer> = None;
+    let mut current_cam: Option<String> = None;   // 最近一次选择连接的设备
+    let mut pending_cam: Option<String> = None;   // 待连接设备 (重试机制)
+    let mut next_attempt = Instant::now();
+    let mut attempt: u32 = 0;
+    let mut stream_disconnected = false;
+    let mut window_minimized = false;
+
+    let mut frame_count: u64 = 0;
+    let mut bytes_received: u64 = 0;
+    let mut _audio_count: u64 = 0;
+    let mut video_start: Option<std::time::Instant> = None;
+
+    player.set_status("Double-click a device to connect");
+    println!("[Viewer] Window ready. Double-click a device in the left panel to connect.");
+
+    loop {
+        // ---- 1. UI 事件 ----
+        for action in player.pump_events() {
+            match action {
+                UiAction::Quit => {
+                    if let Some(path) = &config.output {
                         println!("[Viewer] Output saved to: {}", path.display());
                         println!("[Viewer] Play with: ffplay -f hevc {}", path.display());
                     }
                     return Ok(());
                 }
-                RenderAction::WindowMinimized => {
+                UiAction::ConnectDevice(cam) => {
+                    println!("[Viewer] Device selected: {cam}");
+                    if let Some(s) = session.as_mut() {
+                        s.shutdown();
+                    }
+                    session = None;
+                    stream_disconnected = false;
+                    current_cam = Some(cam.clone());
+                    pending_cam = Some(cam.clone());
+                    attempt = 0;
+                    next_attempt = Instant::now();
+                    reset_stats(&mut frame_count, &mut bytes_received, &mut video_start);
+                    player.reset_decoder();
+                    player.set_connected(None);
+                    player.set_status(format!("Connecting {} ...", short_id(&cam)));
+                }
+                UiAction::DevicesChanged => {
+                    config.cameras = player.devices().to_vec();
+                    config.camera.clear(); // 旧格式字段已迁移到 cameras
+                    match config.save(&opt.config) {
+                        Ok(()) => println!("[Viewer] Config saved: {}", opt.config.display()),
+                        Err(e) => eprintln!("[Viewer] Failed to save config: {e}"),
+                    }
+                }
+                UiAction::Minimized => {
                     window_minimized = true;
-                    // 最小化时关闭连接节约资源
-                    viewer.shutdown();
-                    stream_disconnected = true;
+                    if let Some(s) = session.as_mut() {
+                        // 最小化时关闭连接节约资源
+                        s.shutdown();
+                        stream_disconnected = true;
+                    }
+                    player.set_status("Minimized: connection closed");
                 }
-                RenderAction::WindowRestored => {
+                UiAction::Restored => {
+                    if !window_minimized {
+                        continue;
+                    }
                     window_minimized = false;
-                }
-                _ => {}
-            }
-        }
-
-        // 轮询音频帧
-        while let Some(packet) = viewer.poll_audio_frame() {
-            _audio_count += 1;
-            #[cfg(feature = "player")]
-            if let Some(ap) = audio_player.as_mut() {
-                ap.write(&packet.data);
-            }
-        }
-
-        // 窗口恢复时重连
-        #[cfg(feature = "player")]
-        if window_minimized {
-            if let Some(p) = player.as_mut() {
-                let action = p.poll_events();
-                match action {
-                    RenderAction::WindowRestored => {
+                    if session.is_some() {
                         eprintln!("[Viewer] Window restored, reconnecting...");
-                        window_minimized = false;
+                        player.set_status("Reconnecting...");
+                        player.draw_now();
                         reset_stats(&mut frame_count, &mut bytes_received, &mut video_start);
-                        p.reset_decoder();
-                        match viewer.reconnect().await {
+                        player.reset_decoder();
+                        let ok = match session.as_mut().unwrap().reconnect().await {
                             Ok(()) => {
                                 stream_disconnected = false;
+                                player.set_status("Connected");
+                                true
                             }
                             Err(e) => {
                                 eprintln!("[Viewer] Reconnect failed: {e}");
+                                false
                             }
+                        };
+                        if !ok {
+                            // 转入 pending 重试机制 (新建 MediaPlayer)
+                            session = None;
+                            pending_cam = current_cam.clone();
+                            attempt = 0;
+                            next_attempt = Instant::now() + RECONNECT_DELAY;
                         }
                     }
-                    RenderAction::Quit => {
-                        if let Some(path) = &opt.output {
-                            println!("[Viewer] Output saved to: {}", path.display());
-                            println!("[Viewer] Play with: ffplay -f hevc {}", path.display());
-                        }
-                        return Ok(());
-                    }
-                    _ => {}
                 }
             }
         }
+
+        // ---- 2. 待连接设备 (带重试, 不阻塞 UI 退出) ----
+        if !window_minimized && session.is_none() {
+            if let Some(cam) = pending_cam.clone() {
+                if Instant::now() >= next_attempt {
+                    attempt += 1;
+                    player.set_status(format!("Connecting {} (attempt {})", short_id(&cam), attempt));
+                    player.draw_now(); // 拨号会阻塞事件循环, 先刷新 UI 显示状态
+                    let result = async {
+                        let mut v = MediaPlayer::new_with_options(
+                            enable_dcutr,
+                            ConnectOptions {
+                                udp_port,
+                                network_type: network_type.clone(),
+                                no_audio,
+                            },
+                        ).await?;
+                        v.connect_with_options(
+                            &relay_addrs,
+                            &cam,
+                            enable_mdns,
+                            &stream_type,
+                            ConnectOptions {
+                                udp_port,
+                                network_type: network_type.clone(),
+                                no_audio,
+                            },
+                        ).await?;
+                        Ok::<MediaPlayer, anyhow::Error>(v)
+                    }.await;
+                    match result {
+                        Ok(v) => {
+                            println!("[Viewer] Connected to DeviceCam (attempt #{attempt})");
+                            session = Some(v);
+                            pending_cam = None;
+                            stream_disconnected = false;
+                            player.set_connected(Some(&cam));
+                            player.set_status("Connected");
+                        }
+                        Err(e) => {
+                            eprintln!("[Viewer] Connect attempt #{attempt} failed: {e}");
+                            player.set_status(format!("Connect failed ({attempt}), retry in {}s", RECONNECT_DELAY.as_secs()));
+                            next_attempt = Instant::now() + RECONNECT_DELAY;
+                        }
+                    }
+                }
+            }
+        }
+
+        // ---- 3. 会话轮询: Swarm + 事件 + 帧 ----
+        let mut drop_session = false;
+        if let Some(viewer) = session.as_mut() {
+            viewer.poll_swarm().await;
+
+            let mut need_reconnect = false;
+            while let Some(event) = viewer.poll_event() {
+                match event {
+                    MediaPlayerEvent::Disconnected { reason }
+                    | MediaPlayerEvent::StreamEOF { reason } => {
+                        if !stream_disconnected {
+                            eprintln!("[Viewer] Session lost: {reason}");
+                            stream_disconnected = true;
+                            need_reconnect = true;
+                        }
+                    }
+                    MediaPlayerEvent::DirectUpgraded { via_lan } => {
+                        let via = if via_lan { "LAN direct" } else { "DCUtR hole punch" };
+                        println!("[Viewer] Direct connection established via {via}, streams upgraded");
+                        // 流从 sub 升级到 main 后，cam 侧会对新 main 流 request_idr 产出
+                        // 新 GOP 的 IDR，但新流开头仍是 GOP 中段帧。重置解码器门控，等待
+                        // 新 IDR 再解码，避免把无参考的 P 帧喂给 ffmpeg 导致
+                        // "PPS id out of range" / 花屏 / 卡死（见 viewer.log 升级后的报错）。
+                        player.reset_decoder();
+                    }
+                    MediaPlayerEvent::NatDiagnosis { local_nat, remote_nat } => {
+                        println!("[Viewer] NAT diagnosis: local={}, remote={}",
+                            local_nat.short_name(),
+                            remote_nat.as_deref().unwrap_or("Unknown"));
+                    }
+                    MediaPlayerEvent::DcutrBackoff => {
+                        tracing::warn!("[Viewer] DCUtR backoff detected, disabling DCUtR for next reconnect");
+                        viewer.set_enable_dcutr(false);
+                    }
+                }
+            }
+
+            if need_reconnect && !window_minimized {
+                eprintln!("[Viewer] Reconnecting in {}s...", RECONNECT_DELAY.as_secs());
+                player.set_status("Disconnected, reconnecting...");
+                player.draw_now();
+                reset_stats(&mut frame_count, &mut bytes_received, &mut video_start);
+                player.reset_decoder();
+                match viewer.reconnect().await {
+                    Ok(()) => {
+                        stream_disconnected = false;
+                        player.set_status("Connected");
+                    }
+                    Err(e) => {
+                        eprintln!("[Viewer] Reconnect failed: {e}");
+                        drop_session = true;
+                    }
+                }
+            }
+
+            // 轮询视频帧
+            while let Some(packet) = viewer.poll_video_frame() {
+                if let Err(e) = handle_video_packet(
+                    &packet, &mut frame_count, &mut bytes_received, &mut video_start, &mut output_file,
+                ) {
+                    eprintln!("[Viewer] Output write failed: {e}");
+                    return Ok(());
+                }
+                if let Err(e) = player.render(&packet.data, packet.is_keyframe()) {
+                    tracing::error!("[Viewer] Player error: {e}");
+                }
+            }
+
+            // 轮询音频帧
+            while let Some(packet) = viewer.poll_audio_frame() {
+                _audio_count += 1;
+                if let Some(ap) = audio_player.as_mut() {
+                    ap.write(&packet.data);
+                }
+            }
+        }
+        if drop_session {
+            // 会话内重连失败, 转入 pending 机制新建 MediaPlayer 重试
+            session = None;
+            player.set_connected(None);
+            pending_cam = current_cam.clone();
+            attempt = 0;
+            next_attempt = Instant::now() + RECONNECT_DELAY;
+        }
+
+        // ---- 4. UI 重绘 (面板变化或空闲刷新) ----
+        player.maybe_draw();
 
         // 短暂让出 CPU，避免 busy loop
         tokio::time::sleep(Duration::from_millis(1)).await;
@@ -406,16 +546,24 @@ fn reset_stats(frame_count: &mut u64, bytes_received: &mut u64, video_start: &mu
     *video_start = None;
 }
 
-/// 处理单个视频帧，返回 RenderAction 表示渲染结果和窗口状态
-#[allow(unused_variables)]
-fn process_video_frame(
-    packet: MediaPacket,
+/// PeerId 截断显示: 前 8 + ".." + 后 6
+#[cfg(feature = "player")]
+fn short_id(s: &str) -> String {
+    if s.len() > 20 && s.is_ascii() {
+        format!("{}..{}", &s[..8], &s[s.len() - 6..])
+    } else {
+        s.to_string()
+    }
+}
+
+/// 处理单个视频帧: 统计 + 可选写文件 (GUI 与 headless 共用)
+fn handle_video_packet(
+    packet: &MediaPacket,
     frame_count: &mut u64,
     bytes_received: &mut u64,
     video_start: &mut Option<std::time::Instant>,
     output_file: &mut Option<std::fs::File>,
-    #[cfg(feature = "player")] player: Option<&mut player::VideoPlayer>,
-) -> RenderAction {
+) -> Result<()> {
     *frame_count += 1;
     *bytes_received += packet.data.len() as u64;
 
@@ -424,7 +572,7 @@ fn process_video_frame(
         *video_start = Some(std::time::Instant::now());
     }
 
-    // 帧率统计（在渲染之前输出，确保不受渲染返回值影响）
+    // 帧率统计
     if *frame_count % 100 == 0 {
         if let Some(start) = video_start {
             let elapsed = start.elapsed().as_secs_f64();
@@ -440,66 +588,119 @@ fn process_video_frame(
 
     if let Some(file) = output_file {
         use std::io::Write;
-        if file.write_all(&packet.data).is_err() {
-            return RenderAction::Quit;
-        }
+        file.write_all(&packet.data).context("write output file")?;
         let _ = file.flush();
     }
 
-    #[cfg(feature = "player")]
-    if let Some(p) = player {
-        match p.render(
-            &packet.data,
-            packet.is_keyframe(),
-        ) {
-            Ok(action) => return action,
-            Err(e) => {
-                tracing::error!("[Viewer] Player error: {e}");
-            }
-        }
-    }
-
-    RenderAction::Continue
+    Ok(())
 }
 
 // ---- SDL Player (player feature) ----
 
-/// VideoPlayer::render() / process_video_frame() 的返回动作
-enum RenderAction {
-    /// 正常渲染，继续主循环
-    Continue,
-    /// 窗口已最小化
-    WindowMinimized,
-    /// 窗口已恢复（从最小化）
-    WindowRestored,
-    /// 用户关闭窗口，退出主循环
-    Quit,
-}
-
 #[cfg(feature = "player")]
 mod player {
-    use super::RenderAction;
+    use std::collections::HashMap;
+    use std::time::Instant;
+
     use anyhow::{Context, Result};
     use ffmpeg_next as ffmpeg;
-    use sdl2::event::Event;
-    use sdl2::event::WindowEvent;
-
-    use sdl2::keyboard::Keycode;
-    use sdl2::pixels::PixelFormatEnum;
+    use sdl2::event::{Event, WindowEvent};
+    use sdl2::keyboard::{Keycode, Mod};
+    use sdl2::mouse::MouseButton;
+    use sdl2::pixels::{Color, PixelFormatEnum};
     use sdl2::rect::Rect;
+
+    /// 左侧设备管理面板宽度 (px)
+    pub const PANEL_W: u32 = 260;
+    /// 设备列表首行 y
+    const ROWS_Y0: i32 = 44;
+    /// 设备行高
+    const ROW_H: i32 = 24;
+
+    // 面板配色 (RGBA)
+    const COL_BG: [u8; 4] = [30, 31, 38, 255];
+    const COL_BORDER: [u8; 4] = [70, 72, 84, 255];
+    const COL_ROW_SEL: [u8; 4] = [52, 86, 138, 255];
+    const COL_BTN: [u8; 4] = [58, 60, 72, 255];
+    const COL_INPUT_BG: [u8; 4] = [18, 18, 22, 255];
+    const COL_ACCENT_BG: [u8; 4] = [240, 200, 90, 255];
+    // 文字配色 (RGB)
+    const COL_TEXT: [u8; 3] = [222, 222, 226];
+    const COL_TEXT_DIM: [u8; 3] = [145, 147, 155];
+    const COL_GREEN: [u8; 3] = [110, 220, 130];
+    const COL_TITLE: [u8; 3] = [255, 255, 255];
+    const COL_ACCENT: [u8; 3] = [240, 200, 90];
+
+    /// UI 事件动作 (pump_events 返回给主循环)
+    pub enum UiAction {
+        /// 用户关闭窗口 / Esc
+        Quit,
+        /// 窗口最小化
+        Minimized,
+        /// 窗口从最小化恢复
+        Restored,
+        /// 双击设备, 开始连接该 PeerId
+        ConnectDevice(String),
+        /// 设备列表已增删, 需要保存配置
+        DevicesChanged,
+    }
 
     /// 将 sdl2 的各种错误类型统一转为 anyhow::Error
     fn map_sdl<T, E: std::string::ToString>(r: std::result::Result<T, E>, ctx: &str) -> Result<T> {
         r.map_err(|e| anyhow::anyhow!("SDL {ctx}: {}", e.to_string()))
     }
 
-    /// H.265 解码 + SDL2 渲染的实时播放器
+    fn btn_add_rect(h: u32) -> (i32, i32, i32, i32) { (8, h as i32 - 44, 118, 30) }
+    fn btn_del_rect(h: u32) -> (i32, i32, i32, i32) { (134, h as i32 - 44, 118, 30) }
+    fn rows_end(h: u32) -> i32 { (h as i32 - 130).max(ROWS_Y0) }
+    fn in_rect(px: i32, py: i32, r: (i32, i32, i32, i32)) -> bool {
+        px >= r.0 && px < r.0 + r.2 && py >= r.1 && py < r.1 + r.3
+    }
+
+    /// 在 RGBA 缓冲上填充矩形 (带裁剪)
+    fn fill_rect(buf: &mut [u8], buf_w: u32, buf_h: u32, x: i32, y: i32, w: u32, h: u32, c: [u8; 4]) {
+        let x0 = x.max(0) as u32;
+        let y0 = y.max(0) as u32;
+        let x1 = ((x + w as i32).max(0) as u32).min(buf_w);
+        let y1 = ((y + h as i32).max(0) as u32).min(buf_h);
+        for py in y0..y1 {
+            for px in x0..x1 {
+                let idx = ((py * buf_w + px) * 4) as usize;
+                buf[idx..idx + 4].copy_from_slice(&c);
+            }
+        }
+    }
+
+    /// 加载系统 TTF 字体 (fontdue 纯 Rust 光栅化, 无需 SDL2_ttf)
+    fn load_font() -> Result<fontdue::Font> {
+        const CANDIDATES: &[&str] = &[
+            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+            "/usr/share/fonts/truetype/freefont/FreeMono.ttf",
+        ];
+        for p in CANDIDATES {
+            if let Ok(bytes) = std::fs::read(p) {
+                if let Ok(f) = fontdue::Font::from_bytes(bytes, fontdue::FontSettings::default()) {
+                    println!("[Player] UI font: {p}");
+                    return Ok(f);
+                }
+            }
+        }
+        anyhow::bail!("No usable TTF font found for UI panel (tried: {CANDIDATES:?})")
+    }
+
+    /// H.265 解码 + SDL2 渲染的实时播放器 (左侧设备管理面板 + 右侧视频)
     ///
-    /// SAFETY: `texture` 字段使用 `Texture<'static>`，实际生命周期绑定到 `canvas`。
-    /// Rust 保证 struct 字段按声明顺序 drop，因此 texture (在前) 先于 canvas drop。
+    /// SAFETY: `texture`/`panel_texture` 字段使用 `Texture<'static>`，实际生命周期
+    /// 绑定到 `canvas`。Rust 保证 struct 字段按声明顺序 drop，因此 texture (在前)
+    /// 先于 canvas drop。
     pub struct VideoPlayer {
         texture: Option<sdl2::render::Texture<'static>>,
+        panel_texture: Option<sdl2::render::Texture<'static>>,
         canvas: sdl2::render::Canvas<sdl2::video::Window>,
+        video_subsystem: sdl2::VideoSubsystem,
         decoder: ffmpeg::decoder::Video,
         event_pump: sdl2::EventPump,
         scaler: Option<ffmpeg::software::scaling::Context>,
@@ -514,51 +715,29 @@ mod player {
         /// 进入 waiting_for_keyframe 的时间，用于超时兜底（避免 cam 关键帧标记
         /// 异常时播放器门控永久不开 → 黑屏）
         waiting_since: Option<std::time::Instant>,
-        /// 显示屏可用区域最大尺寸，用于限制窗口初始尺寸不超过屏幕
+        /// 显示屏可用区域最大尺寸，用于限制窗口初始尺寸不超过显示屏
         display_max: (u32, u32),
         /// 是否已根据视频分辨率设置过初始窗口尺寸（只在首帧设置一次，之后尊重用户拖动/最大化）
         window_sized: bool,
+        /// 是否已执行过运行时 maximize()：在首次 present 后调用一次，确保窗口启动即最大化
+        maximize_applied: bool,
+
+        // ---- 设备管理面板状态 ----
+        font: fontdue::Font,
+        glyph_cache: HashMap<(char, u32), (fontdue::Metrics, Vec<u8>)>,
+        devices: Vec<String>,
+        selected: Option<usize>,
+        connected_cam: Option<String>,
+        adding: bool,
+        input: String,
+        status: String,
+        panel_dirty: bool,
+        panel_h: u32,
+        last_present: Instant,
     }
 
     impl VideoPlayer {
-        /// 重置解码器状态，在重连后调用以清除旧的参考帧缓冲区
-        /// 避免旧参考帧导致马赛克
-        pub fn reset_decoder(&mut self) {
-            // 使用 avcodec_flush_buffers 清除解码器内部缓冲区
-            // 这会重置解码器状态，使下一帧必须从关键帧开始
-            self.decoder.flush();
-            self.waiting_for_keyframe = true;
-            self.waiting_since = Some(std::time::Instant::now());
-            eprintln!("[Player] Decoder flushed, waiting for keyframe");
-        }
-
-        /// 仅轮询 SDL 事件，不做解码/渲染
-        /// 用于最小化期间检测窗口恢复事件
-        pub fn poll_events(&mut self) -> RenderAction {
-            for event in self.event_pump.poll_iter() {
-                match event {
-                    Event::Quit { .. }
-                    | Event::KeyDown {
-                        keycode: Some(Keycode::Escape),
-                        ..
-                    } => return RenderAction::Quit,
-                    Event::Window { win_event, .. } => {
-                        match win_event {
-                            WindowEvent::Restored => {
-                                eprintln!("[Player] SDL window event (poll): Restored");
-                                self.minimized = false;
-                                return RenderAction::WindowRestored;
-                            }
-                            _ => {}
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            RenderAction::Continue
-        }
-
-        pub fn new() -> Result<Self> {
+        pub fn new(devices: Vec<String>) -> Result<Self> {
             ffmpeg::init()?;
 
             let codec = ffmpeg::decoder::find(ffmpeg::codec::Id::HEVC)
@@ -578,28 +757,37 @@ mod player {
                 .map(|r| (r.width(), r.height()))
                 .unwrap_or((1920, 1080));
 
-            // 初始窗口尺寸不超过屏幕可用区域
-            let init_w = 1280u32.min(display_max.0);
+            // 初始窗口尺寸: 面板 + 1280x720 视频区, 不超过屏幕可用区域
+            let init_w = (1280 + PANEL_W).min(display_max.0).max(PANEL_W + 320);
             let init_h = 720u32.min(display_max.1);
 
             let window = video_subsystem
                 .window("P2P Camera Viewer", init_w, init_h)
                 .position_centered()
                 .resizable()
+                .maximized()
                 .build()
                 .map_err(|e| anyhow::anyhow!("SDL window: {e}"))?;
-            let canvas = window
+            let mut canvas = window
                 .into_canvas()
                 .accelerated()
                 .present_vsync()
                 .build()
                 .map_err(|e| anyhow::anyhow!("SDL canvas: {e}"))?;
+            // 确保窗口在软件启动时即最大化。WindowBuilder::maximized() 标志在部分
+            // 窗口管理器(尤其 Linux/X11)上不会让窗口一出现就真正最大化，必须在
+            // build 后通过运行时 maximize() 强制生效。
+            canvas.window_mut().maximize();
 
             let event_pump = map_sdl(sdl_context.event_pump(), "event_pump")?;
 
+            let font = load_font()?;
+
             Ok(Self {
                 texture: None,
+                panel_texture: None,
                 canvas,
+                video_subsystem,
                 decoder,
                 event_pump,
                 scaler: None,
@@ -617,49 +805,222 @@ mod player {
                 waiting_since: Some(std::time::Instant::now()),
                 display_max,
                 window_sized: false,
+                maximize_applied: false,
+                font,
+                glyph_cache: HashMap::new(),
+                devices,
+                selected: None,
+                connected_cam: None,
+                adding: false,
+                input: String::new(),
+                status: String::new(),
+                panel_dirty: true,
+                panel_h: 0,
+                last_present: Instant::now(),
             })
         }
 
-        /// 渲染一个 H.265 access unit, 返回 RenderAction 表示渲染结果和窗口状态。
-        /// `is_keyframe` 由调用方从 MediaPacket 标志传入(RK VENC 硬编码, 可靠),
-        /// 无需播放器再扫描 NAL。
-        pub fn render(&mut self, au: &[u8], is_keyframe: bool) -> Result<RenderAction> {
-            for event in self.event_pump.poll_iter() {
+        // ---- 面板状态访问 ----
+
+        pub fn devices(&self) -> &[String] {
+            &self.devices
+        }
+
+        pub fn set_connected(&mut self, cam: Option<&str>) {
+            self.connected_cam = cam.map(|s| s.to_string());
+            self.panel_dirty = true;
+        }
+
+        pub fn set_status(&mut self, s: impl Into<String>) {
+            self.status = s.into();
+            self.panel_dirty = true;
+        }
+
+        /// 重置解码器状态，在重连后调用以清除旧的参考帧缓冲区
+        /// 避免旧参考帧导致马赛克
+        pub fn reset_decoder(&mut self) {
+            // 使用 avcodec_flush_buffers 清除解码器内部缓冲区
+            // 这会重置解码器状态，使下一帧必须从关键帧开始
+            self.decoder.flush();
+            self.waiting_for_keyframe = true;
+            self.waiting_since = Some(std::time::Instant::now());
+            eprintln!("[Player] Decoder flushed, waiting for keyframe");
+        }
+
+        // ---- 事件处理 ----
+
+        /// 轮询所有 SDL 事件 (窗口/鼠标/键盘/文本输入), 返回需要主循环处理的动作
+        pub fn pump_events(&mut self) -> Vec<UiAction> {
+            let mut actions = Vec::new();
+            let events: Vec<Event> = self.event_pump.poll_iter().collect();
+            for event in events {
                 match event {
-                    Event::Quit { .. }
-                    | Event::KeyDown {
-                        keycode: Some(Keycode::Escape),
-                        ..
-                    } => return Ok(RenderAction::Quit),
-                    Event::Window { win_event, .. } => {
-                        match win_event {
-                            WindowEvent::Minimized => {
-                                eprintln!("[Player] SDL window event: Minimized");
-                                self.minimized = true;
-                                return Ok(RenderAction::WindowMinimized);
+                    Event::Quit { .. } => actions.push(UiAction::Quit),
+                    Event::KeyDown { keycode: Some(key), keymod, .. } => {
+                        if self.adding {
+                            match key {
+                                Keycode::Return | Keycode::KpEnter => {
+                                    if let Some(a) = self.finish_add() {
+                                        actions.push(a);
+                                    }
+                                }
+                                Keycode::Escape => self.cancel_add(),
+                                Keycode::Backspace => {
+                                    self.input.pop();
+                                    self.panel_dirty = true;
+                                }
+                                Keycode::V if keymod.intersects(Mod::LCTRLMOD | Mod::RCTRLMOD) => {
+                                    if let Ok(t) = self.video_subsystem.clipboard().clipboard_text() {
+                                        let t: String = t.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+                                        self.input.push_str(&t);
+                                        self.panel_dirty = true;
+                                    }
+                                }
+                                _ => {}
                             }
-                            WindowEvent::Restored => {
-                                eprintln!("[Player] SDL window event: Restored");
-                                self.minimized = false;
-                                return Ok(RenderAction::WindowRestored);
-                            }
-                            _ => {}
+                        } else if key == Keycode::Escape {
+                            actions.push(UiAction::Quit);
                         }
                     }
+                    Event::TextInput { text, .. } if self.adding => {
+                        let t: String = text.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+                        self.input.push_str(&t);
+                        self.panel_dirty = true;
+                    }
+                    Event::MouseButtonDown { mouse_btn: MouseButton::Left, x, y, clicks, .. } => {
+                        if (x as u32) < PANEL_W {
+                            self.on_panel_click(x, y, clicks, &mut actions);
+                        }
+                    }
+                    Event::Window { win_event, .. } => match win_event {
+                        WindowEvent::Minimized => {
+                            eprintln!("[Player] SDL window event: Minimized");
+                            self.minimized = true;
+                            actions.push(UiAction::Minimized);
+                        }
+                        WindowEvent::Restored => {
+                            // 注意: 取消最大化也会触发 Restored, 仅在此前确实最小化过才上报
+                            if self.minimized {
+                                eprintln!("[Player] SDL window event: Restored");
+                                self.minimized = false;
+                                actions.push(UiAction::Restored);
+                            }
+                            self.panel_dirty = true;
+                        }
+                        WindowEvent::SizeChanged(..) | WindowEvent::Resized(..) | WindowEvent::Maximized => {
+                            self.panel_dirty = true;
+                        }
+                        _ => {}
+                    },
                     _ => {}
                 }
             }
+            actions
+        }
 
-            // 窗口最小化时跳过 SDL 渲染
-            // 最小化时 session 已被 abort，不会有新帧进来，此处仅作防御性处理
-            let skip_render = self.minimized;
+        /// 面板区域鼠标点击: 设备行选中/双击连接, 按钮 Add/Del
+        fn on_panel_click(&mut self, x: i32, y: i32, clicks: u8, actions: &mut Vec<UiAction>) {
+            let (_, h) = self.canvas.window().size();
+
+            if in_rect(x, y, btn_add_rect(h)) {
+                self.start_add();
+                return;
+            }
+            if in_rect(x, y, btn_del_rect(h)) {
+                if self.adding {
+                    return;
+                }
+                if let Some(i) = self.selected {
+                    if i < self.devices.len() {
+                        let removed = self.devices.remove(i);
+                        self.selected = if self.devices.is_empty() {
+                            None
+                        } else {
+                            Some(i.min(self.devices.len() - 1))
+                        };
+                        self.status = format!("Deleted {}", super::short_id(&removed));
+                        self.panel_dirty = true;
+                        actions.push(UiAction::DevicesChanged);
+                    }
+                } else {
+                    self.status = "Select a device to delete".to_string();
+                    self.panel_dirty = true;
+                }
+                return;
+            }
+
+            // 设备行: 单击选中, 双击连接
+            if y >= ROWS_Y0 && y < rows_end(h) {
+                let idx = ((y - ROWS_Y0) / ROW_H) as usize;
+                if idx < self.devices.len() {
+                    self.selected = Some(idx);
+                    self.panel_dirty = true;
+                    if clicks >= 2 {
+                        actions.push(UiAction::ConnectDevice(self.devices[idx].clone()));
+                    }
+                }
+            }
+        }
+
+        fn start_add(&mut self) {
+            self.adding = true;
+            self.input.clear();
+            self.video_subsystem.text_input().start();
+            self.status = "Enter=OK  Esc=Cancel  Ctrl+V=Paste".to_string();
+            self.panel_dirty = true;
+        }
+
+        fn cancel_add(&mut self) {
+            self.adding = false;
+            self.input.clear();
+            self.video_subsystem.text_input().stop();
+            self.status = "Add cancelled".to_string();
+            self.panel_dirty = true;
+        }
+
+        fn finish_add(&mut self) -> Option<UiAction> {
+            let cam = self.input.trim().to_string();
+            if cam.is_empty() {
+                self.cancel_add();
+                return None;
+            }
+            // 轻量校验: base58 PeerId (ed25519 约 52 字符)
+            if cam.len() < 40 || !cam.chars().all(|c| c.is_ascii_alphanumeric()) {
+                self.status = "Invalid PeerId (base58, ~52 chars)".to_string();
+                self.panel_dirty = true;
+                return None; // 停留在输入态, 让用户修改
+            }
+            if self.devices.contains(&cam) {
+                self.status = "Device already exists".to_string();
+                self.panel_dirty = true;
+                return None;
+            }
+            self.devices.push(cam);
+            self.selected = Some(self.devices.len() - 1);
+            self.adding = false;
+            self.input.clear();
+            self.video_subsystem.text_input().stop();
+            self.status = "Device added (double-click to connect)".to_string();
+            self.panel_dirty = true;
+            Some(UiAction::DevicesChanged)
+        }
+
+        // ---- 渲染 ----
+
+        /// 解码一个 H.265 access unit 并渲染。
+        /// SDL 事件由 pump_events 统一处理, 此处只做解码 + 绘制。
+        pub fn render(&mut self, au: &[u8], is_keyframe: bool) -> Result<()> {
+            // 窗口最小化时跳过解码渲染 (最小化时 session 已 shutdown, 防御性处理)
+            if self.minimized {
+                return Ok(());
+            }
 
             // 解码器 flush 后等待关键帧：跳过非关键帧避免花屏
             if self.waiting_for_keyframe {
                 let waited = self.waiting_since.map(|t| t.elapsed());
                 // 收到关键帧，或等待超时（cam 关键帧标记异常时强制开门，避免永久黑屏）
                 if !is_keyframe && !waited.map_or(false, |w| w >= super::IDR_WAIT_TIMEOUT) {
-                    return Ok(RenderAction::Continue);
+                    return Ok(());
                 }
                 self.waiting_for_keyframe = false;
                 if is_keyframe {
@@ -679,21 +1040,25 @@ mod player {
             self.decoder.send_packet(&packet)?;
 
             let mut frame = ffmpeg::frame::Video::empty();
+            let mut got_frame = false;
             loop {
                 match self.decoder.receive_frame(&mut frame) {
                     Ok(()) => {
-                        if !skip_render {
-                            self.render_frame(&frame)?;
-                        }
+                        self.upload_frame(&frame)?;
+                        got_frame = true;
                     }
                     Err(_) => break,
                 }
             }
 
-            Ok(RenderAction::Continue)
+            if got_frame {
+                self.draw()?;
+            }
+            Ok(())
         }
 
-        fn render_frame(&mut self, frame: &ffmpeg::frame::Video) -> Result<()> {
+        /// 将解码帧上传到视频纹理 (不负责 present)
+        fn upload_frame(&mut self, frame: &ffmpeg::frame::Video) -> Result<()> {
             use ffmpeg::format::pixel::Pixel;
 
             let w = frame.width();
@@ -711,22 +1076,37 @@ mod player {
                     unsafe { std::mem::transmute::<sdl2::render::Texture<'_>, sdl2::render::Texture<'static>>(tex) };
                 self.texture = Some(tex);
 
-                // 仅在首次确定视频分辨率时设置一次窗口初始尺寸: 使用视频原始尺寸,
-                // 但等比缩小到不超过屏幕可用区域; 之后尊重用户的拖动/最大化, 不再强制改窗口大小
+                // 仅在首次确定视频分辨率时设置一次窗口初始尺寸: 面板 + 视频原始尺寸,
+                // 等比缩小到不超过屏幕可用区域; 之后尊重用户的拖动/最大化
                 if !self.window_sized {
-                    let (max_w, max_h) = self.display_max;
-                    let scale = (max_w as f32 / w as f32)
-                        .min(max_h as f32 / h as f32)
-                        .min(1.0);
-                    let win_w = ((w as f32) * scale).round().max(1.0) as u32;
-                    let win_h = ((h as f32) * scale).round().max(1.0) as u32;
-                    let win = self.canvas.window_mut();
-                    let _ = win.set_size(win_w, win_h);
-                    win.set_position(
-                        sdl2::video::WindowPos::Centered,
-                        sdl2::video::WindowPos::Centered,
-                    );
+                    // 若窗口处于最大化状态，不强行改变窗口尺寸（否则会取消最大化），
+                    // 视频区域按当前窗口尺寸做 letterbox 即可。
+                    // SDL_WINDOW_MAXIMIZED = 0x00000080 (window_flags() 返回原始 u32 标志位)
+                    const SDL_WINDOW_MAXIMIZED: u32 = 0x00000080;
+                    let flags = self.canvas.window().window_flags();
+                    let (cur_w, cur_h) = self.canvas.window().size();
+                    // 已最大化（标志位置位），或窗口尺寸已接近全屏可用区，都视为最大化，
+                    // 跳过 set_size，避免把启动即最大化的窗口改回视频原始尺寸。
+                    let maximized = (flags & SDL_WINDOW_MAXIMIZED != 0)
+                        || (cur_w >= self.display_max.0 * 9 / 10
+                            && cur_h >= self.display_max.1 * 9 / 10);
+                    if !maximized {
+                        let (max_w, max_h) = self.display_max;
+                        let avail_w = max_w.saturating_sub(PANEL_W).max(320);
+                        let scale = (avail_w as f32 / w as f32)
+                            .min(max_h as f32 / h as f32)
+                            .min(1.0);
+                        let vid_w = ((w as f32) * scale).round().max(1.0) as u32;
+                        let vid_h = ((h as f32) * scale).round().max(1.0) as u32;
+                        let win = self.canvas.window_mut();
+                        let _ = win.set_size(vid_w + PANEL_W, vid_h);
+                        win.set_position(
+                            sdl2::video::WindowPos::Centered,
+                            sdl2::video::WindowPos::Centered,
+                        );
+                    }
                     self.window_sized = true;
+                    self.panel_dirty = true;
                 }
                 println!("[Player] Video: {w}x{h} ({:?})", frame.format());
             }
@@ -771,37 +1151,204 @@ mod player {
                 }
             }
 
-            // 以黑色填充背景, 再把视频等比缩放居中绘制(letterbox), 随窗口大小/最大化自适应
-            self.canvas.set_draw_color(sdl2::pixels::Color::RGB(0, 0, 0));
-            self.canvas.clear();
-
-            let (win_w, win_h) = self
-                .canvas
-                .output_size()
-                .map_err(|e| anyhow::anyhow!("SDL output_size: {e}"))?;
-            let scale = (win_w as f32 / self.width as f32)
-                .min(win_h as f32 / self.height as f32);
-            let dst_w = ((self.width as f32) * scale).round().max(1.0) as u32;
-            let dst_h = ((self.height as f32) * scale).round().max(1.0) as u32;
-            let dst_x = (win_w.saturating_sub(dst_w) / 2) as i32;
-            let dst_y = (win_h.saturating_sub(dst_h) / 2) as i32;
-
-            map_sdl(
-                self.canvas.copy(
-                    self.texture.as_ref().unwrap(),
-                    None,
-                    Some(Rect::new(dst_x, dst_y, dst_w, dst_h)),
-                ),
-                "copy",
-            )?;
-            self.canvas.present();
-
             self.frame_count += 1;
             if self.frame_count % 100 == 0 {
                 println!("[Player] Rendered {} frames", self.frame_count);
             }
 
             Ok(())
+        }
+
+        /// 整窗绘制: 背景 + 视频 (右侧 letterbox) + 设备面板 (左侧), 然后 present
+        pub fn draw(&mut self) -> Result<()> {
+            if self.panel_dirty {
+                self.rebuild_panel()?;
+            }
+
+            self.canvas.set_draw_color(Color::RGB(10, 10, 12));
+            self.canvas.clear();
+
+            let (win_w, win_h) = map_sdl(self.canvas.output_size(), "output_size")?;
+
+            // 视频: 右侧区域内等比缩放居中 (letterbox)
+            if self.width > 0 && win_w > PANEL_W {
+                if let Some(tex) = &self.texture {
+                    let avail_w = win_w - PANEL_W;
+                    let scale = (avail_w as f32 / self.width as f32)
+                        .min(win_h as f32 / self.height as f32);
+                    let dst_w = ((self.width as f32) * scale).round().max(1.0) as u32;
+                    let dst_h = ((self.height as f32) * scale).round().max(1.0) as u32;
+                    let dst_x = PANEL_W as i32 + (avail_w.saturating_sub(dst_w) / 2) as i32;
+                    let dst_y = (win_h.saturating_sub(dst_h) / 2) as i32;
+                    map_sdl(
+                        self.canvas.copy(tex, None, Some(Rect::new(dst_x, dst_y, dst_w, dst_h))),
+                        "copy video",
+                    )?;
+                }
+            }
+
+            // 左侧设备面板
+            if let Some(pt) = &self.panel_texture {
+                map_sdl(
+                    self.canvas.copy(pt, None, Some(Rect::new(0, 0, PANEL_W, self.panel_h))),
+                    "copy panel",
+                )?;
+            }
+
+            self.canvas.present();
+            self.last_present = Instant::now();
+
+            // 首次 present 后窗口已被窗口管理器映射，此时调用 maximize() 最可靠
+            // （部分 WM 会忽略 build 阶段尚未映射窗口的 maximize）。仅执行一次。
+            if !self.maximize_applied {
+                self.canvas.window_mut().maximize();
+                self.maximize_applied = true;
+            }
+            Ok(())
+        }
+
+        /// 立即重绘 (忽略错误), 用于阻塞操作前刷新状态提示
+        pub fn draw_now(&mut self) {
+            let _ = self.draw();
+        }
+
+        /// 空闲重绘: 面板有变化立即绘制, 否则限频 ~10fps 刷新
+        /// (有视频帧时 render() 已经在 present, 此处不会频繁触发)
+        pub fn maybe_draw(&mut self) {
+            if self.panel_dirty || self.last_present.elapsed().as_millis() > 100 {
+                let _ = self.draw();
+            }
+        }
+
+        // ---- 面板绘制 ----
+
+        /// 重建面板纹理 (CPU RGBA 缓冲绘制后上传, 仅在状态变化时调用)
+        fn rebuild_panel(&mut self) -> Result<()> {
+            let (_, win_h) = self.canvas.window().size();
+            let h = win_h.max(240);
+
+            if self.panel_texture.is_none() || self.panel_h != h {
+                let tc = self.canvas.texture_creator();
+                let tex = map_sdl(
+                    tc.create_texture_streaming(PixelFormatEnum::ABGR8888, PANEL_W, h),
+                    "create panel texture",
+                )?;
+                let tex: sdl2::render::Texture<'static> =
+                    unsafe { std::mem::transmute::<sdl2::render::Texture<'_>, sdl2::render::Texture<'static>>(tex) };
+                self.panel_texture = Some(tex);
+                self.panel_h = h;
+            }
+
+            let mut buf = vec![0u8; (PANEL_W * h * 4) as usize];
+            fill_rect(&mut buf, PANEL_W, h, 0, 0, PANEL_W, h, COL_BG);
+            fill_rect(&mut buf, PANEL_W, h, PANEL_W as i32 - 2, 0, 2, h, COL_BORDER);
+
+            // 标题
+            self.draw_text(&mut buf, h, 12, 26, 16.0, "Devices", COL_TITLE);
+            fill_rect(&mut buf, PANEL_W, h, 8, 34, PANEL_W - 16, 1, COL_BORDER);
+
+            // 设备列表
+            let devices = self.devices.clone();
+            let connected = self.connected_cam.clone();
+            let re = rows_end(h);
+            if devices.is_empty() {
+                self.draw_text(&mut buf, h, 12, ROWS_Y0 + 17, 12.0, "No devices.", COL_TEXT_DIM);
+                self.draw_text(&mut buf, h, 12, ROWS_Y0 + 35, 12.0, "Click [+ Add] below.", COL_TEXT_DIM);
+            }
+            for (i, dev) in devices.iter().enumerate() {
+                let ry = ROWS_Y0 + i as i32 * ROW_H;
+                if ry + ROW_H > re {
+                    self.draw_text(&mut buf, h, 12, ry + 14, 12.0, "...", COL_TEXT_DIM);
+                    break;
+                }
+                if self.selected == Some(i) {
+                    fill_rect(&mut buf, PANEL_W, h, 4, ry, PANEL_W - 10, (ROW_H - 2) as u32, COL_ROW_SEL);
+                }
+                let is_conn = connected.as_deref() == Some(dev.as_str());
+                let color = if is_conn { COL_GREEN } else { COL_TEXT };
+                let marker = if is_conn { ">" } else { " " };
+                let label = format!("{} {}", marker, super::short_id(dev));
+                self.draw_text(&mut buf, h, 8, ry + 17, 13.0, &label, color);
+            }
+
+            // 状态行
+            let status = self.status.clone();
+            let status_col = if self.adding { COL_ACCENT } else { COL_TEXT_DIM };
+            self.draw_text(&mut buf, h, 8, h as i32 - 84, 11.0, &status, status_col);
+
+            // 添加设备输入框
+            if self.adding {
+                let bx = 8i32;
+                let by = h as i32 - 76;
+                let bw = PANEL_W - 16;
+                let bh = 24u32;
+                fill_rect(&mut buf, PANEL_W, h, bx, by, bw, bh, COL_INPUT_BG);
+                // 边框 (accent)
+                fill_rect(&mut buf, PANEL_W, h, bx, by, bw, 1, COL_ACCENT_BG);
+                fill_rect(&mut buf, PANEL_W, h, bx, by + bh as i32 - 1, bw, 1, COL_ACCENT_BG);
+                fill_rect(&mut buf, PANEL_W, h, bx, by, 1, bh, COL_ACCENT_BG);
+                fill_rect(&mut buf, PANEL_W, h, bx + bw as i32 - 1, by, 1, bh, COL_ACCENT_BG);
+                // 输入内容 (过长时显示尾部) + 光标
+                let shown = if self.input.len() > 26 {
+                    format!("..{}_", &self.input[self.input.len() - 24..])
+                } else {
+                    format!("{}_", self.input)
+                };
+                self.draw_text(&mut buf, h, 12, h as i32 - 58, 13.0, &shown, COL_TEXT);
+            }
+
+            // 按钮
+            let (ax, ay, aw, ah) = btn_add_rect(h);
+            fill_rect(&mut buf, PANEL_W, h, ax, ay, aw as u32, ah as u32, COL_BTN);
+            self.draw_text(&mut buf, h, ax + 32, ay + 20, 13.0, "+ Add", COL_TEXT);
+            let (dx, dy, dw, dh) = btn_del_rect(h);
+            fill_rect(&mut buf, PANEL_W, h, dx, dy, dw as u32, dh as u32, COL_BTN);
+            self.draw_text(&mut buf, h, dx + 32, dy + 20, 13.0, "- Del", COL_TEXT);
+
+            // 上传到纹理
+            if let Some(t) = &mut self.panel_texture {
+                map_sdl(t.update(None, &buf, (PANEL_W * 4) as usize), "panel update")?;
+            }
+            self.panel_dirty = false;
+            Ok(())
+        }
+
+        /// 在 RGBA 缓冲上绘制一行文字 (fontdue 光栅化 + 灰度 alpha 混合)
+        fn draw_text(&mut self, buf: &mut [u8], buf_h: u32, x: i32, baseline: i32, px: f32, text: &str, color: [u8; 3]) {
+            let mut pen = x as f32;
+            for ch in text.chars() {
+                let key = (ch, px as u32);
+                if !self.glyph_cache.contains_key(&key) {
+                    let g = self.font.rasterize(ch, px);
+                    self.glyph_cache.insert(key, g);
+                }
+                let (m, bitmap) = self.glyph_cache.get(&key).unwrap();
+                let gx = pen.round() as i32 + m.xmin;
+                let gy = baseline - m.height as i32 - m.ymin;
+                for row in 0..m.height {
+                    let py = gy + row as i32;
+                    if py < 0 || py >= buf_h as i32 {
+                        continue;
+                    }
+                    for col in 0..m.width {
+                        let pxx = gx + col as i32;
+                        if pxx < 0 || pxx >= PANEL_W as i32 {
+                            continue;
+                        }
+                        let cov = bitmap[row * m.width + col] as u32;
+                        if cov == 0 {
+                            continue;
+                        }
+                        let idx = ((py as u32 * PANEL_W + pxx as u32) * 4) as usize;
+                        for c in 0..3 {
+                            let dst = buf[idx + c] as u32;
+                            buf[idx + c] = ((color[c] as u32 * cov + dst * (255 - cov)) / 255) as u8;
+                        }
+                        buf[idx + 3] = 255;
+                    }
+                }
+                pen += m.advance_width;
+            }
         }
     }
 
@@ -930,6 +1477,11 @@ struct ViewerConfig {
     /// 是否启用 mDNS 局域网发现 (默认 true)
     #[serde(default = "default_enable_mdns")]
     enable_mdns: bool,
+    /// 设备列表 (新格式): 多个 DeviceCam PeerId, GUI 设备管理面板可增删
+    #[serde(default)]
+    cameras: Vec<String>,
+    /// 单设备 PeerId (旧格式, 向后兼容, 解析时合并到 cameras)
+    #[serde(default)]
     camera: String,
     /// 视频流类型: "main" | "sub" | "third" (默认 main)
     #[serde(default = "default_stream")]
@@ -958,6 +1510,7 @@ impl Default for ViewerConfig {
             relays: Vec::new(),
             relay: String::new(),
             enable_mdns: default_enable_mdns(),
+            cameras: Vec::new(),
             camera: String::new(),
             stream: default_stream(),
             output: None,
@@ -992,6 +1545,19 @@ impl ViewerConfig {
         }
     }
 
+    /// 保存配置回文件 (GUI 增删设备后调用)
+    /// 注意: toml 序列化会丢失原文件中的注释
+    #[cfg_attr(not(feature = "player"), allow(dead_code))]
+    fn save(&self, path: &PathBuf) -> anyhow::Result<()> {
+        let mut c = self.clone();
+        c.camera = String::new(); // 旧格式字段已迁移到 cameras
+        let content = toml::to_string_pretty(&c)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize config: {e}"))?;
+        std::fs::write(path, content)
+            .map_err(|e| anyhow::anyhow!("Failed to write config file {}: {e}", path.display()))?;
+        Ok(())
+    }
+
     /// 解析 Relay 地址列表: 处理旧格式 relay 与新格式 relays 的兼容
     ///
     /// 规则:
@@ -1000,6 +1566,22 @@ impl ViewerConfig {
     fn resolve_relays(&mut self) {
         if self.relays.is_empty() && !self.relay.is_empty() {
             self.relays.push(self.relay.clone());
+        }
+    }
+
+    /// 解析设备列表: 旧格式 camera 字段合并进 cameras (去重, 置于列表首位)
+    fn resolve_cameras(&mut self) {
+        if !self.camera.is_empty() && !self.cameras.contains(&self.camera) {
+            self.cameras.insert(0, self.camera.clone());
+        }
+    }
+
+    /// headless 模式使用的单设备: 优先旧格式 camera 字段, 否则 cameras 列表第一个
+    fn primary_camera(&self) -> Option<&str> {
+        if !self.camera.is_empty() {
+            Some(&self.camera)
+        } else {
+            self.cameras.first().map(|s| s.as_str())
         }
     }
 }

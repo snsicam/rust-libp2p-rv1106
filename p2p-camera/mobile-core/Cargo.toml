@@ -10,7 +10,7 @@ crate-type = ["cdylib", "staticlib", "rlib"]  # .so for Android, .a for iOS, rli
 [features]
 # SDL2 + ffmpeg 实时播放 (media_viewer --play)
 # 编译: cargo build --example media_viewer --features player
-player = ["dep:ffmpeg-next", "dep:sdl2"]
+player = ["dep:ffmpeg-next", "dep:sdl2", "dep:fontdue"]
 
 [dependencies]
 libp2p = { workspace = true, features = [
@@ -41,6 +41,8 @@ proto = { path = "../proto" }
 #                                      libavdevice-dev libsdl2-dev clang
 ffmpeg-next = { version = "6", optional = true }
 sdl2 = { version = "0.37", optional = true }
+# 纯 Rust 字体光栅化, 用于 media_viewer 设备管理面板文字绘制 (系统未装 SDL2_ttf)
+fontdue = { version = "0.9", optional = true }
 
 [dev-dependencies]
 clap = { version = "4", features = ["derive"] }
