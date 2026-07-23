@@ -40,7 +40,7 @@ pub async fn handle_control_stream(peer_id: PeerId, mut stream: libp2p::swarm::S
         tracing::debug!("[ControlHandler] Request from {peer_id}: {:?}", req);
 
         // 处理请求
-        let resp = handle_request(req);
+        let resp = handle_request(req).await;
 
         // 发送响应
         if let Err(e) = send_response(&mut stream, &resp).await {
@@ -53,11 +53,11 @@ pub async fn handle_control_stream(peer_id: PeerId, mut stream: libp2p::swarm::S
 }
 
 /// 分发控制请求到对应的处理函数
-fn handle_request(req: ControlRequest) -> ControlResponse {
+async fn handle_request(req: ControlRequest) -> ControlResponse {
     match req {
         // ---- 编码参数 ----
         ControlRequest::GetEncoderConfig { stream } => get_encoder_config(&stream),
-        ControlRequest::SetEncoderConfig { stream, config } => set_encoder_config(&stream, &config),
+        ControlRequest::SetEncoderConfig { stream, config } => set_encoder_config(&stream, &config).await,
 
         // ---- 图像参数 ----
         ControlRequest::GetImageConfig { cam_id } => get_image_config(cam_id),
@@ -92,21 +92,34 @@ fn stream_name_to_id(stream: &str) -> Option<u32> {
 }
 
 fn get_encoder_config(stream: &str) -> ControlResponse {
+    tracing::info!("[ControlHandler] >>> GetEncoderConfig stream={stream}");
     let chn_id = match stream_name_to_id(stream) {
         Some(id) => id,
-        None => return ControlResponse::err("invalid stream name"),
+        None => {
+            tracing::warn!("[ControlHandler] GetEncoderConfig invalid stream name: {stream}");
+            return ControlResponse::err("invalid stream name");
+        }
     };
 
     #[cfg(feature = "rv1106")]
     {
         match crate::rk_video_source::get_encoder_config(chn_id) {
-            Some(config) => ControlResponse {
-                ok: true,
-                error: None,
-                encoder_config: Some(config),
-                image_config: None,
-                system_config: None,
-            },
+            Some(config) => {
+                tracing::info!(
+                    "[ControlHandler] <<< GetEncoderConfig response stream={stream}: {} {}x{} fps={}/{} bitrate={}kbps gop={} rc={}/{} gop_mode={} h264_profile={} smart={} rotation={}",
+                    config.output_data_type, config.width, config.height,
+                    config.dst_frame_rate_num, config.dst_frame_rate_den, config.max_rate,
+                    config.gop, config.rc_mode, config.rc_quality, config.gop_mode,
+                    config.h264_profile, config.smart, config.rotation
+                );
+                ControlResponse {
+                    ok: true,
+                    error: None,
+                    encoder_config: Some(config),
+                    image_config: None,
+                    system_config: None,
+                }
+            }
             None => ControlResponse::err("stream not enabled"),
         }
     }
@@ -118,7 +131,14 @@ fn get_encoder_config(stream: &str) -> ControlResponse {
     }
 }
 
-fn set_encoder_config(stream: &str, config: &EncoderConfig) -> ControlResponse {
+async fn set_encoder_config(stream: &str, config: &EncoderConfig) -> ControlResponse {
+    tracing::info!(
+        "[ControlHandler] >>> SetEncoderConfig stream={stream}: {} {}x{} fps={}/{} bitrate={}kbps gop={} rc={}/{} gop_mode={} h264_profile={} smart={} rotation={}",
+        config.output_data_type, config.width, config.height,
+        config.dst_frame_rate_num, config.dst_frame_rate_den, config.max_rate,
+        config.gop, config.rc_mode, config.rc_quality, config.gop_mode,
+        config.h264_profile, config.smart, config.rotation
+    );
     let chn_id = match stream_name_to_id(stream) {
         Some(id) => id,
         None => return ControlResponse::err("invalid stream name"),
@@ -126,14 +146,21 @@ fn set_encoder_config(stream: &str, config: &EncoderConfig) -> ControlResponse {
 
     // 参数校验
     if let Err(e) = validate_encoder_config(config) {
+        tracing::warn!("[ControlHandler] SetEncoderConfig validation failed: {e}");
         return ControlResponse::err(&e);
     }
 
     #[cfg(feature = "rv1106")]
     {
-        match crate::rk_video_source::set_encoder_config(chn_id, config) {
-            Ok(()) => ControlResponse::ok(),
-            Err(e) => ControlResponse::err(&e.to_string()),
+        match crate::rk_video_source::set_encoder_config(chn_id, config).await {
+            Ok(()) => {
+                tracing::info!("[ControlHandler] <<< SetEncoderConfig applied stream={stream}");
+                ControlResponse::ok()
+            }
+            Err(e) => {
+                tracing::error!("[ControlHandler] SetEncoderConfig failed stream={stream}: {e}");
+                ControlResponse::err(&e.to_string())
+            }
         }
     }
 

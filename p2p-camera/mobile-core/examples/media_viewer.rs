@@ -409,6 +409,45 @@ async fn run_gui(opt: Opt, mut config: ViewerConfig) -> Result<()> {
             }
         }
 
+        // ---- 1.5 配置窗体: 通过控制通道真正读取/下发编码参数 ----
+        // 不依赖 is_config_open() 守卫: 保存按钮会立即关闭窗体(config_peer=None),
+        // 若在此守卫内处理, apply/fetch 请求会在关闭后被丢弃, 导致下发不生效。
+        {
+            if let Some(_peer) = player.take_config_fetch_request() {
+                if let Some(viewer) = session.as_mut() {
+                    let stream = player.config_stream();
+                    match viewer.get_encoder_config(&stream).await {
+                        Ok(ec) => {
+                            player.apply_encoder_config(ec);
+                            player.set_status(format!("已读取 {} 编码参数", stream));
+                        }
+                        Err(e) => {
+                            player.set_status(format!("读取编码参数失败: {e}"));
+                            eprintln!("[Viewer] GetEncoderConfig failed: {e}");
+                        }
+                    }
+                } else {
+                    player.set_status("未连接，无法读取参数".to_string());
+                }
+            }
+            if let Some((_peer, stream, ec)) = player.take_config_apply_request() {
+                if let Some(viewer) = session.as_mut() {
+                    match viewer.set_encoder_config(&stream, &ec).await {
+                        Ok(()) => {
+                            player.set_status(format!("编码参数已下发: {}", stream));
+                            println!("[Viewer] Encoder config applied to '{stream}' stream");
+                        }
+                        Err(e) => {
+                            player.set_status(format!("下发失败: {e}"));
+                            eprintln!("[Viewer] SetEncoderConfig failed: {e}");
+                        }
+                    }
+                } else {
+                    player.set_status("未连接，无法下发参数".to_string());
+                }
+            }
+        }
+
         // ---- 2. 待连接设备 (带重试, 不阻塞 UI 退出) ----
         if !window_minimized && session.is_none() {
             if let Some(cam) = pending_cam.clone() {
@@ -620,6 +659,7 @@ mod player {
     use sdl2::mouse::MouseButton;
     use sdl2::pixels::{Color, PixelFormatEnum};
     use sdl2::rect::Rect;
+    use proto::control::EncoderConfig;
 
     /// 左侧设备管理面板宽度 (px)
     pub const PANEL_W: u32 = 260;
@@ -670,10 +710,17 @@ mod player {
         fn label(self) -> &'static str {
             match self { CodecType::H265 => "H.265", CodecType::H264 => "H.264" }
         }
+        fn from_proto(s: &str) -> Self {
+            if s == "H.264" { CodecType::H264 } else { CodecType::H265 }
+        }
+        fn to_proto(self) -> String {
+            match self { CodecType::H265 => "H.265".to_string(), CodecType::H264 => "H.264".to_string() }
+        }
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub enum Resolution { R1080p, R720p, R540p }
+    #[allow(dead_code)]
     impl Resolution {
         fn cycle(self) -> Self {
             match self {
@@ -687,6 +734,20 @@ mod player {
                 Resolution::R1080p => "1920x1080",
                 Resolution::R720p => "1280x720",
                 Resolution::R540p => "960x540",
+            }
+        }
+        fn from_wh(w: u32, h: u32) -> Self {
+            match (w, h) {
+                (1920, 1080) => Resolution::R1080p,
+                (960, 540) => Resolution::R540p,
+                _ => Resolution::R720p,
+            }
+        }
+        fn to_wh(self) -> (u32, u32) {
+            match self {
+                Resolution::R1080p => (1920, 1080),
+                Resolution::R720p => (1280, 720),
+                Resolution::R540p => (960, 540),
             }
         }
     }
@@ -709,7 +770,7 @@ mod player {
     /// 可编辑配置字段标识 (用于布局/点击命中)
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum ConfigField {
-        Codec, Resolution, Fps, Bitrate, Gop,
+        Stream, Codec, Resolution, Fps, Bitrate, Gop,
         Brightness, Contrast, Saturation, Exposure,
         DeviceName,
     }
@@ -781,6 +842,37 @@ mod player {
             if let Ok(s) = serde_json::to_string_pretty(self) {
                 let _ = std::fs::write(&p, s);
             }
+        }
+    }
+
+    /// 编码参数默认值 (当摄像头未返回或读取失败时, 用于构造完整 EncoderConfig)
+    fn default_encoder() -> EncoderConfig {
+        EncoderConfig {
+            output_data_type: "H.265".to_string(),
+            width: 1280,
+            height: 720,
+            rc_mode: "CBR".to_string(),
+            rc_quality: "high".to_string(),
+            gop: 50,
+            gop_mode: "normalP".to_string(),
+            max_rate: 2000,
+            dst_frame_rate_num: 25,
+            dst_frame_rate_den: 1,
+            h264_profile: "high".to_string(),
+            smart: "close".to_string(),
+            rotation: 0,
+        }
+    }
+
+    /// 将摄像头返回的 EncoderConfig 转换为 UI 用的 DeviceConfig (保留图像/系统字段)
+    fn device_config_from_encoder(ec: &EncoderConfig, base: DeviceConfig) -> DeviceConfig {
+        DeviceConfig {
+            codec: CodecType::from_proto(&ec.output_data_type),
+            resolution: Resolution::from_wh(ec.width, ec.height),
+            fps: ec.dst_frame_rate_num,
+            bitrate_kbps: ec.max_rate,
+            gop: ec.gop,
+            ..base
         }
     }
 
@@ -905,6 +997,16 @@ mod player {
         /// 设备名文本编辑缓冲
         config_text: String,
 
+        // ---- 编码参数读取/下发 (控制通道) 状态 ----
+        /// 当前编辑的码流: main / sub / third
+        config_stream: String,
+        /// 从摄像头读取的完整编码配置 (保留未编辑字段, 下发时回写)
+        encoder_raw: Option<EncoderConfig>,
+        /// 待从摄像头读取编码参数的设备 PeerId (主循环异步处理)
+        config_fetch_pending: Option<String>,
+        /// 待下发到摄像头的编码参数 (peer, stream, config)
+        config_apply_pending: Option<(String, String, EncoderConfig)>,
+
         /// 右键菜单 / 配置窗体共用的 overlay 纹理 (ABGR8888)
         overlay_texture: Option<sdl2::render::Texture<'static>>,
 
@@ -1000,6 +1102,10 @@ mod player {
                 config_tab: 0,
                 config_editing_name: false,
                 config_text: String::new(),
+                config_stream: "main".to_string(),
+                encoder_raw: None,
+                config_fetch_pending: None,
+                config_apply_pending: None,
                 overlay_texture: None,
                 font,
                 font_cjk: load_cjk_font(),
@@ -1030,6 +1136,44 @@ mod player {
         pub fn set_status(&mut self, s: impl Into<String>) {
             self.status = s.into();
             self.panel_dirty = true;
+        }
+
+        // ---- 编码参数控制通道辅助 ----
+
+        /// 当前编辑的码流
+        pub fn config_stream(&self) -> String {
+            self.config_stream.clone()
+        }
+
+        /// 取出待读取请求 (取出后清空)
+        pub fn take_config_fetch_request(&mut self) -> Option<String> {
+            self.config_fetch_pending.take()
+        }
+
+        /// 取出待下发请求 (取出后清空)
+        pub fn take_config_apply_request(&mut self) -> Option<(String, String, EncoderConfig)> {
+            self.config_apply_pending.take()
+        }
+
+        /// 用从摄像头读取到的编码配置刷新 UI 显示 (保留图像/系统字段)
+        pub fn apply_encoder_config(&mut self, ec: EncoderConfig) {
+            self.encoder_raw = Some(ec.clone());
+            let base = self.config.clone().unwrap_or_default();
+            self.config = Some(device_config_from_encoder(&ec, base));
+            self.panel_dirty = true;
+        }
+
+        /// 根据 UI 编辑结果构造待下发的完整 EncoderConfig
+        /// (分辨率当前只读, 保留摄像头原始值; 其余未暴露字段沿用摄像头返回值)
+        fn build_encoder_config(&self) -> Option<EncoderConfig> {
+            let cfg = self.config.as_ref()?;
+            let mut ec = self.encoder_raw.clone().unwrap_or_else(default_encoder);
+            ec.output_data_type = cfg.codec.to_proto();
+            ec.dst_frame_rate_num = cfg.fps;
+            ec.dst_frame_rate_den = 1;
+            ec.max_rate = cfg.bitrate_kbps;
+            ec.gop = cfg.gop;
+            Some(ec)
         }
 
         /// 重置解码器状态，在重连后调用以清除旧的参考帧缓冲区
@@ -1303,11 +1447,15 @@ mod player {
                 if idx < self.devices.len() {
                     let peer = self.devices[idx].clone();
                     let cfg = DeviceConfig::load(&peer);
-                    self.config_peer = Some(peer);
+                    self.config_peer = Some(peer.clone());
                     self.config = Some(cfg);
+                    self.config_stream = "main".to_string();
+                    self.encoder_raw = None;
                     self.config_tab = 0;
                     self.config_editing_name = false;
                     self.config_text.clear();
+                    // 打开即真正从摄像头读取当前编码参数 (而非仅本地缓存)
+                    self.config_fetch_pending = Some(peer);
                     self.panel_dirty = true;
                 }
             }
@@ -1330,7 +1478,7 @@ mod player {
                 (x0 + 12 + (tab_w + 8) * 2, tab_y, tab_w, tab_h),
             ];
             let fields: Vec<ConfigField> = match self.config_tab {
-                0 => vec![ConfigField::Codec, ConfigField::Resolution, ConfigField::Fps, ConfigField::Bitrate, ConfigField::Gop],
+                0 => vec![ConfigField::Stream, ConfigField::Codec, ConfigField::Resolution, ConfigField::Fps, ConfigField::Bitrate, ConfigField::Gop],
                 1 => vec![ConfigField::Brightness, ConfigField::Contrast, ConfigField::Saturation, ConfigField::Exposure],
                 _ => vec![ConfigField::DeviceName],
             };
@@ -1356,6 +1504,7 @@ mod player {
         /// 配置参数显示标签
         fn field_label(f: ConfigField) -> &'static str {
             match f {
+                ConfigField::Stream => "码流",
                 ConfigField::Codec => "编码格式",
                 ConfigField::Resolution => "分辨率",
                 ConfigField::Fps => "帧率",
@@ -1373,8 +1522,11 @@ mod player {
         fn field_value(&self, f: ConfigField) -> String {
             let cfg = self.config.as_ref().unwrap();
             match f {
+                ConfigField::Stream => self.config_stream.clone(),
                 ConfigField::Codec => cfg.codec.label().to_string(),
-                ConfigField::Resolution => cfg.resolution.label().to_string(),
+                ConfigField::Resolution => self.encoder_raw.as_ref()
+                    .map(|ec| format!("{}x{}", ec.width, ec.height))
+                    .unwrap_or_else(|| cfg.resolution.label().to_string()),
                 ConfigField::Fps => format!("{} fps", cfg.fps),
                 ConfigField::Bitrate => format!("{} kbps", cfg.bitrate_kbps),
                 ConfigField::Gop => format!("{} 帧", cfg.gop),
@@ -1388,22 +1540,39 @@ mod player {
 
         /// 调整数值/枚举参数 (+1 / -1 步进)
         fn adjust(&mut self, field: ConfigField, dir: i32) {
-            let cfg = match self.config.as_mut() {
-                Some(c) => c,
-                None => return,
-            };
             let d = if dir > 0 { 1 } else { -1 };
             match field {
-                ConfigField::Codec => cfg.codec = cfg.codec.cycle(),
-                ConfigField::Resolution => cfg.resolution = cfg.resolution.cycle(),
-                ConfigField::Exposure => cfg.exposure_mode = cfg.exposure_mode.cycle(),
-                ConfigField::Fps => cfg.fps = (cfg.fps as i32 + d * 5).clamp(5, 60) as u32,
-                ConfigField::Bitrate => cfg.bitrate_kbps = (cfg.bitrate_kbps as i32 + d * 500).clamp(100, 8000) as u32,
-                ConfigField::Gop => cfg.gop = (cfg.gop as i32 + d * 10).clamp(1, 300) as u32,
-                ConfigField::Brightness => cfg.brightness = (cfg.brightness + d * 10).clamp(-100, 100),
-                ConfigField::Contrast => cfg.contrast = (cfg.contrast + d * 10).clamp(-100, 100),
-                ConfigField::Saturation => cfg.saturation = (cfg.saturation + d * 10).clamp(-100, 100),
-                ConfigField::DeviceName => {}
+                ConfigField::Stream => {
+                    self.config_stream = match self.config_stream.as_str() {
+                        "main" => "sub".to_string(),
+                        "sub" => "third".to_string(),
+                        _ => "main".to_string(),
+                    };
+                    // 切换码流后重新从摄像头读取该码流参数
+                    if let Some(peer) = self.config_peer.clone() {
+                        self.config_fetch_pending = Some(peer);
+                    }
+                }
+                _ => {
+                    let cfg = match self.config.as_mut() {
+                        Some(c) => c,
+                        None => return,
+                    };
+                    match field {
+                        ConfigField::Codec => cfg.codec = cfg.codec.cycle(),
+                        // 分辨率当前只读 (避免预设不匹配覆盖摄像头实际分辨率), 后续再放开编辑
+                        ConfigField::Resolution => {}
+                        ConfigField::Exposure => cfg.exposure_mode = cfg.exposure_mode.cycle(),
+                        ConfigField::Fps => cfg.fps = (cfg.fps as i32 + d * 5).clamp(5, 60) as u32,
+                        ConfigField::Bitrate => cfg.bitrate_kbps = (cfg.bitrate_kbps as i32 + d * 500).clamp(100, 8000) as u32,
+                        ConfigField::Gop => cfg.gop = (cfg.gop as i32 + d * 10).clamp(1, 300) as u32,
+                        ConfigField::Brightness => cfg.brightness = (cfg.brightness + d * 10).clamp(-100, 100),
+                        ConfigField::Contrast => cfg.contrast = (cfg.contrast + d * 10).clamp(-100, 100),
+                        ConfigField::Saturation => cfg.saturation = (cfg.saturation + d * 10).clamp(-100, 100),
+                        ConfigField::DeviceName => {}
+                        ConfigField::Stream => unreachable!(),
+                    }
+                }
             }
             self.panel_dirty = true;
         }
@@ -1453,6 +1622,12 @@ mod player {
                                     "[Viewer] Device config saved: {} -> device_configs/{}.json",
                                     super::short_id(&peer), peer
                                 );
+                            }
+                            // 编码 tab: 实际下发到摄像头 (热改 + 持久化)
+                            if self.config_tab == 0 {
+                                if let (Some(peer), Some(ec)) = (self.config_peer.clone(), self.build_encoder_config()) {
+                                    self.config_apply_pending = Some((peer, self.config_stream.clone(), ec));
+                                }
                             }
                             self.config = None;
                             self.config_peer = None;

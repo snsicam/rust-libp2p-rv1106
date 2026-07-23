@@ -620,7 +620,6 @@ impl Drop for RkAudioSource {
 
 extern "C" {
     // INI 持久化 (参考 rkipc rk_param_* 接口)
-    fn rk_param_get_int(key: *const std::ffi::c_char, default: std::ffi::c_int) -> std::ffi::c_int;
     fn rk_param_set_int(key: *const std::ffi::c_char, value: std::ffi::c_int) -> std::ffi::c_int;
     fn rk_param_get_string(key: *const std::ffi::c_char, default: *const std::ffi::c_char) -> *mut std::ffi::c_char;
     fn rk_param_set_string(key: *const std::ffi::c_char, value: *const std::ffi::c_char) -> std::ffi::c_int;
@@ -654,58 +653,118 @@ extern "C" {
         gop_mode: *const std::ffi::c_char,
         h264_profile: *const std::ffi::c_char,
     ) -> std::ffi::c_int;
+
+    // 读取当前运行时真实编码参数 (从 g_chn_attr, 而非 INI)。
+    // 返回 0 成功, -1 通道未启用/无效。
+    fn rk_video_get_config(
+        chn_id: std::ffi::c_int,
+        codec_buf: *mut std::ffi::c_char, codec_buf_len: std::ffi::c_int,
+        width: *mut std::ffi::c_int, height: *mut std::ffi::c_int,
+        dst_fps_num: *mut std::ffi::c_int, dst_fps_den: *mut std::ffi::c_int,
+        bitrate_kbps: *mut std::ffi::c_int,
+        gop: *mut std::ffi::c_int,
+        rc_mode_buf: *mut std::ffi::c_char, rc_mode_buf_len: std::ffi::c_int,
+        rc_quality_buf: *mut std::ffi::c_char, rc_quality_buf_len: std::ffi::c_int,
+        gop_mode_buf: *mut std::ffi::c_char, gop_mode_buf_len: std::ffi::c_int,
+        h264_profile_buf: *mut std::ffi::c_char, h264_profile_buf_len: std::ffi::c_int,
+        smart_buf: *mut std::ffi::c_char, smart_buf_len: std::ffi::c_int,
+        rotation: *mut std::ffi::c_int,
+    ) -> std::ffi::c_int;
 }
 
 use proto::control::{EncoderConfig, ImageConfig, ImageAdjustment, SystemConfig, SystemConfigSet};
 
-/// 获取编码参数 (从 INI 配置读取)
+/// 获取编码参数 (从运行时真实配置 g_chn_attr 读取, 而非 INI)
+///
+/// 必须用运行时状态而非 INI: INI 只持久化被 set 过的通道,
+/// 从未改过的 sub/third 在 INI 中不存在, 从 INI 读会回退到固定默认值,
+/// 导致三个码流 GetEncoderConfig 返回"都一样"的垃圾值。
 pub fn get_encoder_config(chn_id: u32) -> Option<EncoderConfig> {
-    let stream_prefix = match chn_id {
-        0 => "video.0",
-        1 => "video.1",
-        2 => "video.2",
-        _ => return None,
-    };
+    #[cfg(feature = "rv1106")]
+    {
+        let mut codec_buf = vec![0u8; 16];
+        let mut rc_mode_buf = vec![0u8; 16];
+        let mut rc_quality_buf = vec![0u8; 16];
+        let mut gop_mode_buf = vec![0u8; 16];
+        let mut h264_profile_buf = vec![0u8; 16];
+        let mut smart_buf = vec![0u8; 16];
+        let mut width: i32 = 0;
+        let mut height: i32 = 0;
+        let mut dst_num: i32 = 0;
+        let mut dst_den: i32 = 0;
+        let mut bitrate: i32 = 0;
+        let mut gop: i32 = 0;
+        let mut rotation: i32 = 0;
 
-        let output_data_type = param_get_string(&format!("{stream_prefix}.output_data_type"), "H.265");
-        let width = param_get_int(&format!("{stream_prefix}.width"), 2304) as u32;
-        let height = param_get_int(&format!("{stream_prefix}.height"), 1296) as u32;
-        let rc_mode = param_get_string(&format!("{stream_prefix}.rc_mode"), "CBR");
-        let rc_quality = param_get_string(&format!("{stream_prefix}.rc_quality"), "high");
-        let gop = param_get_int(&format!("{stream_prefix}.gop"), 50) as u32;
-        let gop_mode = param_get_string(&format!("{stream_prefix}.gop_mode"), "normalP");
-        let max_rate = param_get_int(&format!("{stream_prefix}.max_rate"), 2048) as u32;
-        let dst_frame_rate_num = param_get_int(&format!("{stream_prefix}.dst_frame_rate_num"), 25) as u32;
-        let dst_frame_rate_den = param_get_int(&format!("{stream_prefix}.dst_frame_rate_den"), 1) as u32;
-        let h264_profile = param_get_string(&format!("{stream_prefix}.h264_profile"), "high");
-        let smart = param_get_string(&format!("{stream_prefix}.smart"), "close");
-        let rotation = param_get_int(&format!("{stream_prefix}.rotation"), 0) as u32;
+        let ret = unsafe {
+            rk_video_get_config(
+                chn_id as i32,
+                codec_buf.as_mut_ptr() as *mut std::ffi::c_char, codec_buf.len() as i32,
+                &mut width, &mut height,
+                &mut dst_num, &mut dst_den,
+                &mut bitrate,
+                &mut gop,
+                rc_mode_buf.as_mut_ptr() as *mut std::ffi::c_char, rc_mode_buf.len() as i32,
+                rc_quality_buf.as_mut_ptr() as *mut std::ffi::c_char, rc_quality_buf.len() as i32,
+                gop_mode_buf.as_mut_ptr() as *mut std::ffi::c_char, gop_mode_buf.len() as i32,
+                h264_profile_buf.as_mut_ptr() as *mut std::ffi::c_char, h264_profile_buf.len() as i32,
+                smart_buf.as_mut_ptr() as *mut std::ffi::c_char, smart_buf.len() as i32,
+                &mut rotation,
+            )
+        };
+        if ret != 0 {
+            return None;
+        }
+
+        let cstr = |buf: &[u8]| -> String {
+            unsafe {
+                std::ffi::CStr::from_ptr(buf.as_ptr() as *const std::ffi::c_char)
+                    .to_string_lossy()
+                    .into_owned()
+            }
+        };
 
         Some(EncoderConfig {
-            output_data_type,
-            width,
-            height,
-            rc_mode,
-            rc_quality,
-            gop,
-            gop_mode,
-            max_rate,
-            dst_frame_rate_num,
-            dst_frame_rate_den,
-            h264_profile,
-            smart,
-            rotation,
+            output_data_type: cstr(&codec_buf),
+            width: width as u32,
+            height: height as u32,
+            rc_mode: cstr(&rc_mode_buf),
+            rc_quality: cstr(&rc_quality_buf),
+            gop: gop as u32,
+            gop_mode: cstr(&gop_mode_buf),
+            max_rate: bitrate as u32,
+            dst_frame_rate_num: dst_num as u32,
+            dst_frame_rate_den: dst_den as u32,
+            h264_profile: cstr(&h264_profile_buf),
+            smart: cstr(&smart_buf),
+            rotation: rotation as u32,
         })
+    }
+
+    #[cfg(not(feature = "rv1106"))]
+    {
+        let _ = chn_id;
+        None
+    }
 }
 
 /// 设置编码参数 (写入 INI 持久化 + 热改实时生效)
-pub fn set_encoder_config(chn_id: u32, config: &EncoderConfig) -> anyhow::Result<()> {
+pub async fn set_encoder_config(chn_id: u32, config: &EncoderConfig) -> anyhow::Result<()> {
     let stream_prefix = match chn_id {
         0 => "video.0",
         1 => "video.1",
         2 => "video.2",
         _ => return Err(anyhow::anyhow!("invalid chn_id: {chn_id}")),
     };
+
+    // 在持久化之前读取旧配置, 用于判定本次变更是否需要"断视频"重建
+    // (codec/宽/高任一变化 -> rk_camera_update_chn_config 内部 DestroyChn+venc_init_single,
+    //  期间视频必然中断; 其余码率/GOP/帧率/rc 等仅极短 Stop/Start 热改)。
+    let need_rebuild = get_encoder_config(chn_id).map_or(false, |old| {
+        old.output_data_type != config.output_data_type
+            || old.width != config.width
+            || old.height != config.height
+    });
 
     // 1) 持久化到 INI (重启后由 rk_video_set_from_ini 恢复)
     param_set_string(&format!("{stream_prefix}.output_data_type"), &config.output_data_type);
@@ -723,24 +782,72 @@ pub fn set_encoder_config(chn_id: u32, config: &EncoderConfig) -> anyhow::Result
     param_set_int(&format!("{stream_prefix}.rotation"), config.rotation as i32);
 
     // 2) 热改: 实时生效 (仅 rv1106 且摄像头已初始化时)
+    // 关键: rk_camera_update_chn_config 内部会 StopRecvFrame(阻塞, 等 C 取流线程退出
+    // GetStream 窗口)。若直接在 tokio worker 线程同步调用 -> 阻塞视频消费任务 ->
+    // C 取流线程在 on_frame 回调的 mpsc 推送处卡死 -> StopRecvFrame 永远返回不了 ->
+    // 死锁(视频永久卡死 + 控制响应超时)。故必须用 spawn_blocking 放到独立 OS 线程执行。
+    //
+    // 两类变更区别对待:
+    //  - need_rebuild (codec/宽/高变更): 必然断视频(DestroyChn+venc_init_single), 重建耗时长
+    //    且本就会断流。无需在控制响应里等待 -> spawn_blocking 后**不 await**, 后台执行重建,
+    //    控制立即返回 OK, viewer 不必等数秒、不会超时。重建结果由 C 侧 printf 记录。
+    //  - 其余热改 (码率/GOP/帧率/rc 等): 仅极短 Stop/Start, 视频无缝续传 -> await 结果以回报错误。
     #[cfg(feature = "rv1106")]
     {
-        unsafe {
-            let codec_c = std::ffi::CString::new(config.output_data_type.as_str()).unwrap_or_default();
-            let rc_c = std::ffi::CString::new(config.rc_mode.as_str()).unwrap_or_default();
-            let q_c = std::ffi::CString::new(config.rc_quality.as_str()).unwrap_or_default();
-            let gm_c = std::ffi::CString::new(config.gop_mode.as_str()).unwrap_or_default();
-            let prof_c = std::ffi::CString::new(config.h264_profile.as_str()).unwrap_or_default();
-            rk_camera_update_chn_config(
-                chn_id as i32,
-                codec_c.as_ptr(),
-                config.width as i32, config.height as i32,
-                config.dst_frame_rate_num as i32, config.dst_frame_rate_den as i32,
-                config.max_rate as i32,
-                rc_c.as_ptr(), q_c.as_ptr(),
-                config.gop as i32,
-                gm_c.as_ptr(), prof_c.as_ptr(),
-            );
+        let codec = config.output_data_type.clone();
+        let rc = config.rc_mode.clone();
+        let q = config.rc_quality.clone();
+        let gm = config.gop_mode.clone();
+        let prof = config.h264_profile.clone();
+        let (w, h) = (config.width as i32, config.height as i32);
+        let (num, den) = (config.dst_frame_rate_num as i32, config.dst_frame_rate_den as i32);
+        let br = config.max_rate as i32;
+        let gop = config.gop as i32;
+        let chn = chn_id as i32;
+
+        if need_rebuild {
+            // 断视频类变更: 后台重建, 立即返回, 不等 FFI
+            tokio::task::spawn_blocking(move || unsafe {
+                let codec_c = std::ffi::CString::new(codec.as_str()).unwrap_or_default();
+                let rc_c = std::ffi::CString::new(rc.as_str()).unwrap_or_default();
+                let q_c = std::ffi::CString::new(q.as_str()).unwrap_or_default();
+                let gm_c = std::ffi::CString::new(gm.as_str()).unwrap_or_default();
+                let prof_c = std::ffi::CString::new(prof.as_str()).unwrap_or_default();
+                rk_camera_update_chn_config(
+                    chn,
+                    codec_c.as_ptr(),
+                    w, h,
+                    num, den,
+                    br,
+                    rc_c.as_ptr(), q_c.as_ptr(),
+                    gop,
+                    gm_c.as_ptr(), prof_c.as_ptr(),
+                );
+            });
+        } else {
+            // 热改类变更: 等待结果, 回报错误
+            let ret = tokio::task::spawn_blocking(move || unsafe {
+                let codec_c = std::ffi::CString::new(codec.as_str()).unwrap_or_default();
+                let rc_c = std::ffi::CString::new(rc.as_str()).unwrap_or_default();
+                let q_c = std::ffi::CString::new(q.as_str()).unwrap_or_default();
+                let gm_c = std::ffi::CString::new(gm.as_str()).unwrap_or_default();
+                let prof_c = std::ffi::CString::new(prof.as_str()).unwrap_or_default();
+                rk_camera_update_chn_config(
+                    chn,
+                    codec_c.as_ptr(),
+                    w, h,
+                    num, den,
+                    br,
+                    rc_c.as_ptr(), q_c.as_ptr(),
+                    gop,
+                    gm_c.as_ptr(), prof_c.as_ptr(),
+                )
+            }).await;
+            match ret {
+                Ok(0) => {}
+                Ok(e) => return Err(anyhow::anyhow!("rk_camera_update_chn_config failed: {e}")),
+                Err(_) => return Err(anyhow::anyhow!("hot-update thread cancelled (panic?)")),
+            }
         }
     }
 
@@ -874,14 +981,6 @@ pub fn factory_reset() -> anyhow::Result<()> {
 }
 
 // ---- INI 参数读写辅助 ----
-
-/// 从 INI 读取整数
-fn param_get_int(key: &str, default: i32) -> i32 {
-    unsafe {
-        let key_c = std::ffi::CString::new(key).unwrap();
-        rk_param_get_int(key_c.as_ptr(), default)
-    }
-}
 
 /// 写入 INI 整数
 fn param_set_int(key: &str, value: i32) {

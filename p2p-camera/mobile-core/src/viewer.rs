@@ -1072,7 +1072,7 @@ impl MediaPlayer {
         &mut self,
         req: &proto::control::ControlRequest,
     ) -> Result<proto::control::ControlResponse> {
-        use proto::control::{encode_request, read_frame, write_frame};
+        use proto::control::{read_frame, write_frame};
 
         // 若控制流断开, 下次请求时尝试重新打开 (满足 spec §5.1.3)
         if self.control_stream.is_none() {
@@ -1092,9 +1092,9 @@ impl MediaPlayer {
         let stream = self.control_stream.as_mut()
             .ok_or_else(|| anyhow::anyhow!("control stream not ready"))?;
 
-        // 编码并发送请求
-        let frame = encode_request(req)?;
-        write_frame(stream, &frame).await?;
+        // 编码并发送请求 (write_frame 自带 [4B len] 帧头, 直接传 JSON, 勿再套 encode_request 以免双重封装)
+        let json = serde_json::to_vec(req)?;
+        write_frame(stream, &json).await?;
 
         // 读取响应 (5s 超时)
         let payload = tokio::time::timeout(
@@ -1105,6 +1105,54 @@ impl MediaPlayer {
 
         let resp: proto::control::ControlResponse = serde_json::from_slice(&payload)?;
         Ok(resp)
+    }
+
+    /// 通过控制通道从摄像头读取当前编码参数 (真正读取设备端配置, 非本地缓存)
+    pub async fn get_encoder_config(&mut self, stream: &str) -> Result<proto::control::EncoderConfig> {
+        let req = proto::control::ControlRequest::GetEncoderConfig { stream: stream.to_string() };
+        tracing::info!("[Viewer] >>> GetEncoderConfig stream={stream}");
+        let resp = self.send_control(&req).await?;
+        if !resp.ok {
+            let err = resp.error.clone().unwrap_or_else(|| "unknown error".to_string());
+            tracing::warn!("[Viewer] <<< GetEncoderConfig failed: {err}");
+            return Err(anyhow::anyhow!(err));
+        }
+        match resp.encoder_config {
+            Some(cfg) => {
+                tracing::info!(
+                    "[Viewer] <<< GetEncoderConfig response stream={stream}: {} {}x{} fps={}/{} bitrate={}kbps gop={} rc={}/{} gop_mode={} h264_profile={} smart={} rotation={}",
+                    cfg.output_data_type, cfg.width, cfg.height,
+                    cfg.dst_frame_rate_num, cfg.dst_frame_rate_den, cfg.max_rate,
+                    cfg.gop, cfg.rc_mode, cfg.rc_quality, cfg.gop_mode,
+                    cfg.h264_profile, cfg.smart, cfg.rotation
+                );
+                Ok(cfg)
+            }
+            None => Err(anyhow::anyhow!("control response missing encoder_config")),
+        }
+    }
+
+    /// 通过控制通道把编码参数下发到摄像头 (热改 + INI 持久化, 由 DeviceCam 端执行)
+    pub async fn set_encoder_config(&mut self, stream: &str, config: &proto::control::EncoderConfig) -> Result<()> {
+        let req = proto::control::ControlRequest::SetEncoderConfig {
+            stream: stream.to_string(),
+            config: config.clone(),
+        };
+        tracing::info!(
+            "[Viewer] >>> SetEncoderConfig stream={stream}: {} {}x{} fps={}/{} bitrate={}kbps gop={} rc={}/{} gop_mode={} h264_profile={} smart={} rotation={}",
+            config.output_data_type, config.width, config.height,
+            config.dst_frame_rate_num, config.dst_frame_rate_den, config.max_rate,
+            config.gop, config.rc_mode, config.rc_quality, config.gop_mode,
+            config.h264_profile, config.smart, config.rotation
+        );
+        let resp = self.send_control(&req).await?;
+        if !resp.ok {
+            let err = resp.error.clone().unwrap_or_else(|| "unknown error".to_string());
+            tracing::warn!("[Viewer] <<< SetEncoderConfig failed: {err}");
+            return Err(anyhow::anyhow!(err));
+        }
+        tracing::info!("[Viewer] <<< SetEncoderConfig applied stream={stream}");
+        Ok(())
     }
 
     /// 获取本地 IP 列表

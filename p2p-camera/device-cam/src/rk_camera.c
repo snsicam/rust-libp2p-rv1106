@@ -700,7 +700,21 @@ int rk_camera_init(int main_w, int main_h, int fps, int bitrate, int sensor_fps)
 
     if (sensor_fps <= 0) sensor_fps = fps;  // 回退: sensor_fps 未知时使用 target fps
 
-    printf("[rk_camera] init: VI=%dx%d @%dfps sensor_fps=%d\n", main_w, main_h, fps, sensor_fps);
+    // [FIX] 必须在 VI/VPSS/VENC 初始化之前恢复 INI 持久化参数。
+    // 否则: toml 解析的 main 分辨率(如 1920x1080)已用于初始化 VI/VPSS, 之后
+    // rk_video_set_from_ini 又把 g_chn_attr[0] 覆盖为 INI 值(如 2304x1296), 导致
+    // VPSS 主通道输出(1920x1080) 与 VENC chn0 请求分辨率(2304x1296) 不一致,
+    // 该码流 VENC 产出 0 帧 → cam 端不发数据 (viewer 卡黑屏)。
+    // 根因: 本次引入的 INI 持久化 (set_encoder_config 写盘 + 此处恢复)。
+    rk_video_set_from_ini();
+
+    // VI/VPSS 主分辨率采用 INI 覆盖后的 main 通道实际分辨率(回退到入参 main_w/h)。
+    int main_res_w = (g_chn_enabled[VENC_CHN_MAIN] && g_chn_attr[VENC_CHN_MAIN].width > 0)
+                         ? g_chn_attr[VENC_CHN_MAIN].width : main_w;
+    int main_res_h = (g_chn_enabled[VENC_CHN_MAIN] && g_chn_attr[VENC_CHN_MAIN].height > 0)
+                         ? g_chn_attr[VENC_CHN_MAIN].height : main_h;
+
+    printf("[rk_camera] init: VI=%dx%d @%dfps sensor_fps=%d\n", main_res_w, main_res_h, fps, sensor_fps);
 
     if (ensure_sys_init() != 0) return -1;
 
@@ -711,7 +725,7 @@ int rk_camera_init(int main_w, int main_h, int fps, int bitrate, int sensor_fps)
     // (对标 rkipc: 单 VI 共享时无法按单路控速, 改由 VENC 控速, 见 venc_init_single)。
     int ret = vi_dev_init();
     if (ret != 0) { printf("[rk_camera] vi_dev_init failed\n"); return -1; }
-    ret = vi_chn_init(main_w, main_h, sensor_fps, sensor_fps);
+    ret = vi_chn_init(main_res_w, main_res_h, sensor_fps, sensor_fps);
     if (ret != 0) { printf("[rk_camera] vi_chn_init failed\n"); return -1; }
 
     // 2. VPSS 初始化 — 从 g_chn_attr 读取每通道的分辨率
@@ -722,9 +736,9 @@ int rk_camera_init(int main_w, int main_h, int fps, int bitrate, int sensor_fps)
         int third_h = g_chn_enabled[VENC_CHN_THIRD] ? g_chn_attr[VENC_CHN_THIRD].height : 540;
 
         printf("[rk_camera] VPSS: main=%dx%d sub=%dx%d third=%dx%d\n",
-               main_w, main_h, sub_w, sub_h, third_w, third_h);
+               main_res_w, main_res_h, sub_w, sub_h, third_w, third_h);
 
-        ret = vpss_init(main_w, main_h, sub_w, sub_h, third_w, third_h);
+        ret = vpss_init(main_res_w, main_res_h, sub_w, sub_h, third_w, third_h);
         if (ret != 0) { printf("[rk_camera] vpss_init failed\n"); return -1; }
     }
 
@@ -734,9 +748,6 @@ int rk_camera_init(int main_w, int main_h, int fps, int bitrate, int sensor_fps)
         printf("[rk_camera] bind VI->VPSS failed: %x\n", ret);
         return -1;
     }
-
-    // 从 INI 恢复上次持久化的 encoder 参数 (控制通道 set 时写入)
-    rk_video_set_from_ini();
 
     // 4. 初始化已启用的 VENC 通道并绑定 (从 g_chn_attr 读取全部参数)
     int venc_chns[] = {VENC_CHN_MAIN, VENC_CHN_SUB, VENC_CHN_THIRD};
@@ -1053,6 +1064,65 @@ int rk_camera_update_chn_config(int chn_id,
            chn_id, new_w, new_h, new_dst_num, new_dst_den, new_br, new_gop,
            rc_mode ? rc_mode : "-", new_rc_quality);
     return ret;
+}
+
+// 读取当前运行时真实生效的编码参数 (从 g_chn_attr, 而非 INI)。
+// g_chn_attr 在 init 时由 toml 填充, 再由 rk_video_set_from_ini 覆盖(set 过的通道),
+// 最后由 rk_camera_update_chn_config 热改回写 —— 始终为真实生效配置。
+// GetEncoderConfig 必须用此函数, 否则从未被 set 过的 sub/third 在 INI 中不存在,
+// 从 INI 读会回退到固定默认值, 导致三个码流读出来"都一样"。
+// 返回 0 成功; -1 通道未启用/无效。
+int rk_video_get_config(int chn_id,
+                        char *codec_buf, int codec_buf_len,
+                        int *width, int *height,
+                        int *dst_fps_num, int *dst_fps_den,
+                        int *bitrate_kbps,
+                        int *gop,
+                        char *rc_mode_buf, int rc_mode_buf_len,
+                        char *rc_quality_buf, int rc_quality_buf_len,
+                        char *gop_mode_buf, int gop_mode_buf_len,
+                        char *h264_profile_buf, int h264_profile_buf_len,
+                        char *smart_buf, int smart_buf_len,
+                        int *rotation) {
+    if (chn_id < 0 || chn_id >= VENC_MAX_CHN) return -1;
+    if (!g_chn_enabled[chn_id]) return -1;
+    ChnEncAttr *a = &g_chn_attr[chn_id];
+
+    const char *codec_str = (a->codec == RK_VIDEO_ID_AVC) ? "H.264" : "H.265";
+    snprintf(codec_buf, codec_buf_len, "%s", codec_str);
+
+    *width = a->width;
+    *height = a->height;
+    *dst_fps_num = a->dst_fps_num > 0 ? a->dst_fps_num : 1;
+    *dst_fps_den = a->dst_fps_den > 0 ? a->dst_fps_den : 1;
+    *bitrate_kbps = a->bitrate_kbps;
+    *gop = a->gop;
+
+    int is_vbr = (a->rc_mode == VENC_RC_MODE_H264VBR || a->rc_mode == VENC_RC_MODE_H265VBR);
+    snprintf(rc_mode_buf, rc_mode_buf_len, "%s", is_vbr ? "VBR" : "CBR");
+
+    static const char *rc_q_str[] = {"lowest","lower","low","medium","high","higher","highest"};
+    int qi = a->rc_quality;
+    if (qi < 0) qi = 4;
+    if (qi > 6) qi = 6;
+    snprintf(rc_quality_buf, rc_quality_buf_len, "%s", rc_q_str[qi]);
+
+    snprintf(gop_mode_buf, gop_mode_buf_len, "%s",
+             (a->gop_mode == VENC_GOPMODE_SMARTP) ? "smartP" : "normalP");
+
+    // h264_profile: 仅 AVC 有意义; HEVC 固定 high (与 set 路径默认一致)
+    if (a->codec == RK_VIDEO_ID_AVC) {
+        const char *p = (a->profile == 100) ? "high" : (a->profile == 0 ? "main" : "baseline");
+        snprintf(h264_profile_buf, h264_profile_buf_len, "%s", p);
+    } else {
+        snprintf(h264_profile_buf, h264_profile_buf_len, "%s", "high");
+    }
+
+    // smart/rotation 当前未接入运行时 (g_chn_attr 不保存), 返回与 set 路径一致的默认值
+    snprintf(smart_buf, smart_buf_len, "%s", "close");
+    *rotation = 0;
+
+    return 0;
 }
 
 // rk_param_* 定义在文件末尾, 此处前向声明供本函数调用 (避免隐式声明)
