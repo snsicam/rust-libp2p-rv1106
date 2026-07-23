@@ -76,27 +76,19 @@ static volatile int g_quit = 0;
 static volatile int g_initialized = 0;
 static rk_aiq_sys_ctx_t *g_aiq_ctx = NULL;
 
-// LCD 显示 — V4L2 + framebuffer (独立于 MPP 管线, 参考 Luckfox Pico 示例)
-// 为什么不用 VPSS: RV1106 仅 1 个 VPSS Group, 同一 Group 内不能混用
-// AUTO(绑定 VENC) 和 USER(GetChnFrame) 模式, 会导致 MPP buffer 崩溃。
-static volatile int g_fb_enabled = 0;
+// LCD 显示 — MPP VO 模块 (VOP 硬件 CSC, 零 CPU 转换)
+// 管线: VI selfpath(chn1) --RK_MPI_VI_GetChnFrame--> RK_MPI_VO_SendFrame --> VOP
+// VOP 显示控制器硬件完成 NV12→RGB CSC + 缩放, 完全不占 CPU。
+// 【为何不另起 RGA】librga 在同一进程内是单例上下文, SDK 的 VPSS/VENC/VO 内部已
+// 共用同一个 RGA 单例做缩放/CSC; 进程内若再有第二个 RGA 使用者并发操作同一上下文
+// 会破坏其内部 dma_buf/fd 记账, 触发 kernel panic。VO 路径全程走 MPP 自己的 RGA
+// 上下文, 不存在第二使用者, 故安全且不占额外 CPU。
+static volatile int g_fb_enabled = 0;  // LCD 显示使能 (1=已启用 VO 预览)
 static int g_lcd_width = 720;
 static int g_lcd_height = 720;
-static int g_fb_fd = -1;
-static uint8_t *g_framebuffer = NULL;
-static size_t g_fb_size = 0;
-static int g_fb_bpp = 16;
-static uint8_t *g_fb_work_buf = NULL;
+static int g_lcd_fps = 20;             // LCD(VO) 显示帧率, 用于限速喂帧 + u32DispFrmRt
+static int g_sensor_fps = 30;          // sensor 原生帧率, 供 selfpath VI 通道设源帧率
 static pthread_t g_lcd_thread = 0;
-
-// LCD NV12→BGRA 一律走软件路径 (nv12_to_bgra_sw)。
-// 【为何不用 RGA 硬件 CSC】librga 在同一进程内是单例上下文 (RockchipRga)，
-// 而 SDK 的 VPSS/VENC 内部已在用同一个 RGA 单例做编码缩放。若我们在 LCD 线程
-// 另起 c_RkRgaInit/Alloc/Blit，两个使用者并发操作同一 RGA 上下文会破坏其内部
-// dma_buf/fd 记账表，导致 SDK 编码任务拿到失效 dst fd → dma_buf_get 失败 →
-// 失败清理路径过度释放物理页 (mapcount:-128 use-after-free) → 污染页分配器 →
-// 随机 kernel panic (实测崩在网络栈 kfree/arp, dst=960x540 正是 VENC chn2)。
-// 结论: 进程内只能有一个 RGA 使用者 (SDK 自己)，LCD 保持纯软件转换。
 
 // MPP 系统引用计数 (与 audio 共享)
 static volatile int g_sys_init_count = 0;
@@ -265,6 +257,7 @@ static int vi_chn_init(int width, int height, int fps, int sensor_fps) {
     // VI 全速运行在 sensor 原生帧率 (src=dst=sensor_fps), 不做丢帧;
     // 各码流的帧率控制由各 VENC 的 fr32DstFrameRate 完成 (见 venc_init_single)。
     if (sensor_fps <= 0) sensor_fps = fps;  // 回退: sensor_fps 未知时使用 target fps
+    g_sensor_fps = sensor_fps;
     vi_chn_attr.stFrameRate.s32SrcFrameRate = sensor_fps;
     vi_chn_attr.stFrameRate.s32DstFrameRate = sensor_fps;
 
@@ -513,277 +506,8 @@ static int bind_vpss_to_venc(int vpss_chn, int venc_chn) {
     return RK_MPI_SYS_Bind(&stSrcChn, &stDestChn);
 }
 
-// ---- LCD 显示: V4L2 (ISP mainpath) + framebuffer ----
-// 完全独立于 MPP 管线, 避免与 VPSS/VENC 争抢同一 Group 的 buffer pool。
-// 参考 Luckfox Pico retinaface/facenet 示例的做法。
-
-// 软件 NV12→BGRA 转换 + 最近邻缩放 (替代 RGA 硬件 DMA)
-// 原因: RGA 硬件做 DMA 写入裸堆内存(malloc 的 g_fb_work_buf, fd=-1)会触发
-//       内核 Bad rss-counter / pgtables_bytes panic (DMA 越界破坏页表元数据)。
-//       软件路径虽然略慢, 但完全安全; 且 LCD 实际为 720x720 1:1, 负担很小。
-// src: V4L2 mmap 的 NV12 buffer
-// dst: g_fb_work_buf (BGRA8888)
-static void nv12_to_bgra_sw(const uint8_t *nv12, int src_w, int src_h, int src_stride,
-                            uint8_t *bgra, int dst_w, int dst_h) {
-    if (!nv12 || !bgra || src_w <= 0 || src_h <= 0 || dst_w <= 0 || dst_h <= 0)
-        return;
-
-    const uint8_t *y_plane = nv12;
-    const uint8_t *uv_plane = nv12 + (size_t)src_stride * src_h;
-    const int uv_stride = src_stride;  // NV12 色度与亮度 stride 相同
-
-    // 预计算列映射, 避免内层整数除法 (优化)
-    // 提升为函数内静态缓存: 只在目标宽度变化时重分配, 避免每帧 malloc/free
-    // 带来的开销与延迟抖动 (预览场景 dst_w 恒定, 实际只分配一次)。
-    static uint16_t *s_xmap = NULL;
-    static int s_xmap_w = 0;
-    if (s_xmap_w != dst_w) {
-        free(s_xmap);
-        s_xmap = (uint16_t *)malloc(sizeof(uint16_t) * dst_w);
-        s_xmap_w = dst_w;
-    }
-    uint16_t *xmap = s_xmap;
-    if (!xmap) return;
-    for (int dx = 0; dx < dst_w; dx++) {
-        int sx = (dx * src_w) / dst_w;
-        xmap[dx] = (sx >= src_w) ? (uint16_t)(src_w - 1) : (uint16_t)sx;
-    }
-
-    for (int dy = 0; dy < dst_h; dy++) {
-        int sy = (dy * src_h) / dst_h;
-        if (sy >= src_h) sy = src_h - 1;
-        const uint8_t *y_row = y_plane + (size_t)sy * src_stride;
-        const uint8_t *uv_row = uv_plane + (size_t)(sy >> 1) * uv_stride;
-        uint8_t *out = bgra + (size_t)dy * dst_w * 4;
-
-        for (int dx = 0; dx < dst_w; dx++) {
-            int sx = xmap[dx];
-            int Y = y_row[sx] - 16;
-            int uv_off = sx & ~1;
-            int Cb = uv_row[uv_off] - 128;
-            int Cr = uv_row[uv_off + 1] - 128;
-
-            // BT.601 limited→full range, 固定点 (×256)
-            int r = Y + ((359 * Cr) >> 8);                 // 1.402
-            int g = Y - ((88 * Cb + 183 * Cr) >> 8);       // 0.344 / 0.714
-            int b = Y + ((454 * Cb) >> 8);                 // 1.772
-            if (r < 0) r = 0; else if (r > 255) r = 255;
-            if (g < 0) g = 0; else if (g > 255) g = 255;
-            if (b < 0) b = 0; else if (b > 255) b = 255;
-
-            out[0] = (uint8_t)b;
-            out[1] = (uint8_t)g;
-            out[2] = (uint8_t)r;
-            out[3] = 0xFF;
-            out += 4;
-        }
-    }
-}
-
-// NV12→BGRA (VPSS 帧专用): Y/UV 为独立指针, 支持 stride。
-// VPSS CHN3 已由硬件缩放到 LCD 分辨率, 故 src==dst 为 1:1, 无需缩放表,
-// 每帧零堆分配, 转换极快 (~720x720 仅需数 ms)。软件路径安全 (无 RGA DMA panic)。
-// Framebuffer 初始化: 打开 /dev/fb0, mmap
-static int fb_init(int width, int height) {
-    struct fb_var_screeninfo vinfo;
-    struct fb_fix_screeninfo finfo;
-
-    g_fb_fd = open("/dev/fb0", O_RDWR);
-    if (g_fb_fd < 0) {
-        printf("[rk_camera] LCD fb0 open failed: %s\n", strerror(errno));
-        return -1;
-    }
-
-    if (ioctl(g_fb_fd, FBIOGET_VSCREENINFO, &vinfo) < 0 ||
-        ioctl(g_fb_fd, FBIOGET_FSCREENINFO, &finfo) < 0) {
-        printf("[rk_camera] LCD fb0 ioctl failed\n");
-        close(g_fb_fd); g_fb_fd = -1;
-        return -1;
-    }
-
-    g_fb_bpp = vinfo.bits_per_pixel;
-    g_fb_size = finfo.smem_len;
-    if (g_fb_size < (size_t)(vinfo.xres * vinfo.yres * (g_fb_bpp / 8)))
-        g_fb_size = (size_t)vinfo.xres * vinfo.yres * (g_fb_bpp / 8);
-
-    g_framebuffer = (uint8_t *)mmap(NULL, g_fb_size, PROT_READ | PROT_WRITE,
-                                    MAP_SHARED, g_fb_fd, 0);
-    if (g_framebuffer == MAP_FAILED) {
-        printf("[rk_camera] LCD fb0 mmap failed: %s\n", strerror(errno));
-        close(g_fb_fd); g_fb_fd = -1;
-        return -1;
-    }
-
-    // 工作缓冲: LCD 分辨率 × 最大 4 字节/pixel
-    g_fb_work_buf = (uint8_t *)malloc((size_t)width * height * 4);
-    if (!g_fb_work_buf) {
-        printf("[rk_camera] LCD work buf alloc failed\n");
-        munmap(g_framebuffer, g_fb_size); g_framebuffer = NULL;
-        close(g_fb_fd); g_fb_fd = -1;
-        return -1;
-    }
-
-    printf("[rk_camera] LCD fb0: %dx%d bpp=%d (panel %dx%d)\n",
-           width, height, g_fb_bpp, vinfo.xres, vinfo.yres);
-    return 0;
-}
-
-static void fb_deinit(void) {
-    if (g_fb_work_buf) { free(g_fb_work_buf); g_fb_work_buf = NULL; }
-    if (g_framebuffer && g_framebuffer != MAP_FAILED) {
-        munmap(g_framebuffer, g_fb_size); g_framebuffer = NULL;
-    }
-    if (g_fb_fd >= 0) { close(g_fb_fd); g_fb_fd = -1; }
-}
 
 
-// V4L2 抓帧缓冲数 (ISP selfpath /dev/video12)。
-// 这是 LCD 预览延时的头号来源: 驱动把 N 个 buffer 轮流填充, DQBUF 拿到的是
-// 最旧的一个, 其余 N-1 个已在驱动里"囤"着。改为 2 (MMAP streaming 最小安全值):
-// DQBUF 拿到最新帧, 队列延时降到 ~1 帧 (~33ms), 且落后时自动丢旧帧而非追帧。
-#define LCD_V4L2_BUF_CNT 2
-static void *g_lcd_v4l2_bufs[LCD_V4L2_BUF_CNT];
-static size_t g_lcd_v4l2_buf_sizes[LCD_V4L2_BUF_CNT];
-
-// 尝试在单个 V4L2 设备上完成初始化 (G_FMT→S_FMT→REQBUFS→QBUF→STREAMON)
-static int lcd_v4l2_try_device(int fd, const char *dev_name,
-                                int *out_width, int *out_height, int *out_stride) {
-    memset(g_lcd_v4l2_bufs, 0, sizeof(g_lcd_v4l2_bufs));
-    memset(g_lcd_v4l2_buf_sizes, 0, sizeof(g_lcd_v4l2_buf_sizes));
-
-    printf("[rk_camera] LCD trying %s...\n", dev_name);
-
-    struct v4l2_format fmt;
-    memset(&fmt, 0, sizeof(fmt));
-    fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-    if (ioctl(fd, VIDIOC_G_FMT, &fmt) < 0) {
-        printf("[rk_camera] LCD %s G_FMT failed: %s\n", dev_name, strerror(errno));
-        return -1;
-    }
-
-    // 尝试设置目标分辨率 + NV12
-    fmt.fmt.pix_mp.width = g_lcd_width;
-    fmt.fmt.pix_mp.height = g_lcd_height;
-    fmt.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_NV12;
-    fmt.fmt.pix_mp.field = V4L2_FIELD_NONE;
-    fmt.fmt.pix_mp.num_planes = 1;
-    fmt.fmt.pix_mp.plane_fmt[0].bytesperline = g_lcd_width;
-    fmt.fmt.pix_mp.plane_fmt[0].sizeimage = g_lcd_width * g_lcd_height * 3 / 2;
-
-    if (ioctl(fd, VIDIOC_S_FMT, &fmt) < 0) {
-        printf("[rk_camera] LCD %s S_FMT %dx%d failed, using existing format\n",
-               dev_name, g_lcd_width, g_lcd_height);
-        memset(&fmt, 0, sizeof(fmt));
-        fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-        ioctl(fd, VIDIOC_G_FMT, &fmt);
-    }
-
-    int v4l2_w = (int)fmt.fmt.pix_mp.width;
-    int v4l2_h = (int)fmt.fmt.pix_mp.height;
-    int v4l2_stride = (int)fmt.fmt.pix_mp.plane_fmt[0].bytesperline;
-    if (v4l2_stride <= 0) v4l2_stride = v4l2_w;
-
-    printf("[rk_camera] LCD %s format: %dx%d stride=%d fmt=%c%c%c%c\n",
-           dev_name, v4l2_w, v4l2_h, v4l2_stride,
-           (char)(fmt.fmt.pix_mp.pixelformat & 0xff),
-           (char)((fmt.fmt.pix_mp.pixelformat >> 8) & 0xff),
-           (char)((fmt.fmt.pix_mp.pixelformat >> 16) & 0xff),
-           (char)((fmt.fmt.pix_mp.pixelformat >> 24) & 0xff));
-
-    // 请求 buffer
-    struct v4l2_requestbuffers req;
-    memset(&req, 0, sizeof(req));
-    req.count = LCD_V4L2_BUF_CNT;
-    req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-    req.memory = V4L2_MEMORY_MMAP;
-    if (ioctl(fd, VIDIOC_REQBUFS, &req) < 0) {
-        printf("[rk_camera] LCD %s REQBUFS failed: %s\n", dev_name, strerror(errno));
-        return -1;
-    }
-
-    // mmap 全部 buffer + QBUF
-    for (unsigned int i = 0; i < req.count; i++) {
-        struct v4l2_buffer buf;
-        struct v4l2_plane plane;
-        memset(&buf, 0, sizeof(buf));
-        memset(&plane, 0, sizeof(plane));
-        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-        buf.memory = V4L2_MEMORY_MMAP;
-        buf.index = i;
-        buf.m.planes = &plane;
-        buf.length = 1;
-
-        if (ioctl(fd, VIDIOC_QUERYBUF, &buf) < 0) {
-            printf("[rk_camera] LCD %s QUERYBUF[%d] failed\n", dev_name, i);
-            continue;
-        }
-
-        void *ptr = mmap(NULL, plane.length, PROT_READ | PROT_WRITE,
-                         MAP_SHARED, fd, plane.m.mem_offset);
-        if (ptr == MAP_FAILED) {
-            printf("[rk_camera] LCD %s mmap[%d] failed\n", dev_name, i);
-            continue;
-        }
-
-        g_lcd_v4l2_bufs[i] = ptr;
-        g_lcd_v4l2_buf_sizes[i] = plane.length;
-
-        if (ioctl(fd, VIDIOC_QBUF, &buf) < 0) {
-            printf("[rk_camera] LCD %s QBUF[%d] failed\n", dev_name, i);
-        }
-    }
-
-    // 开始流
-    int type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-    if (ioctl(fd, VIDIOC_STREAMON, &type) < 0) {
-        printf("[rk_camera] LCD %s STREAMON failed: %s\n", dev_name, strerror(errno));
-        return -1;
-    }
-
-    printf("[rk_camera] LCD %s OK: %dx%d stride=%d\n",
-           dev_name, v4l2_w, v4l2_h, v4l2_stride);
-    *out_width = v4l2_w;
-    *out_height = v4l2_h;
-    *out_stride = v4l2_stride;
-    return 0;
-}
-
-// 初始化 V4L2 抓帧: 使用 ISP selfpath (/dev/video12)
-// RV1106 仅 1 个 VPSS Group, 不能混用 AUTO(绑定 VENC) 与 USER(GetChnFrame),
-// 故 LCD 必须走 ISP selfpath 独立抓帧, 不能走 VPSS 通道 (否则 MPP buffer 崩溃)。
-static int lcd_v4l2_init(int *out_width, int *out_height, int *out_stride) {
-    const char *dev_path = "/dev/video12";
-    const char *dev_name = "selfpath(/dev/video12)";
-
-    int fd = open(dev_path, O_RDWR);
-    if (fd < 0) {
-        printf("[rk_camera] LCD %s open failed: %s\n", dev_name, strerror(errno));
-        return -1;
-    }
-
-    int ret = lcd_v4l2_try_device(fd, dev_name, out_width, out_height, out_stride);
-    if (ret != 0) {
-        close(fd);
-        printf("[rk_camera] LCD selfpath init failed\n");
-        return -1;
-    }
-
-    return fd;
-}
-
-// 释放 V4L2
-static void lcd_v4l2_deinit(int fd) {
-    int type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-    ioctl(fd, VIDIOC_STREAMOFF, &type);
-    for (int i = 0; i < LCD_V4L2_BUF_CNT; i++) {
-        if (g_lcd_v4l2_bufs[i]) {
-            munmap(g_lcd_v4l2_bufs[i], g_lcd_v4l2_buf_sizes[i]);
-            g_lcd_v4l2_bufs[i] = NULL;
-            g_lcd_v4l2_buf_sizes[i] = 0;
-        }
-    }
-    close(fd);
-}
 
 // ---- LCD 显示后端 B: VO 模块 (VOP 硬件 CSC, 零 CPU 转换) ----
 // 官方示例参考:
@@ -792,7 +516,7 @@ static void lcd_v4l2_deinit(int fd) {
 // VOP 硬件完成 NV12→RGB CSC + 缩放, 完全不占 CPU, 也不碰 RGA 单例
 // (RGA 仅由 MPP/SDK 内部在 VPSS/VENC/VO 复用同一个上下文, 无第二使用者, 见文件顶部说明)。
 // 与旧 "fb" 后端(软件 NV12→BGRA ~60% CPU)互斥: 二者都吃 ISP selfpath 资源,
-// 故由 env LCD_BACKEND 二选一, 启动时定一次 (默认 "vo")。
+// VO 为 LCD 唯一显示路径 (VOP 硬件 CSC, 零 CPU, 不碰 RGA 单例)。
 static int g_lcd_use_vo = 0;
 static int g_lcd_vo_layer = 0;
 static int g_lcd_vo_dev   = 0;
@@ -811,6 +535,11 @@ static int lcd_vo_init(void) {
     vi_attr.enPixelFormat = RK_FMT_YUV420SP;
     vi_attr.enCompressMode = COMPRESS_MODE_NONE;
     vi_attr.u32Depth = 2;  // 必须 < u32BufCount, 否则 GetChnFrame 失败
+    // 显式设 selfpath 帧率: 源=sensor 原生帧率, 目的=LCD 显示帧率。
+    // 不设会触发 "illegal param s32SrcFrameRate(0) s32DstFrameRate(0)", selfpath 跑在
+    // 不受控默认速率(~30fps), 与 VO 合成速率(u32DispFrmRt=g_lcd_fps)不匹配。
+    vi_attr.stFrameRate.s32SrcFrameRate = g_sensor_fps > 0 ? g_sensor_fps : 30;
+    vi_attr.stFrameRate.s32DstFrameRate = g_lcd_fps > 0 ? g_lcd_fps : 20;
     ret = RK_MPI_VI_SetChnAttr(VI_DEV_ID, g_lcd_vi_selfpath_chn, &vi_attr);
     if (ret != RK_SUCCESS) {
         printf("[rk_camera] LCD VO: VI SetChnAttr(selfpath) failed %x\n", ret);
@@ -850,9 +579,14 @@ static int lcd_vo_init(void) {
     layer.stDispRect.u32Height = (uint32_t)g_lcd_height;
     layer.stImageSize.u32Width  = (uint32_t)g_lcd_width;
     layer.stImageSize.u32Height = (uint32_t)g_lcd_height;
-    layer.u32DispFrmRt = 25;
+    layer.u32DispFrmRt = g_lcd_fps > 0 ? g_lcd_fps : 25;
     ret = RK_MPI_VO_SetLayerAttr(g_lcd_vo_layer, &layer);
     if (ret != RK_SUCCESS) { printf("[rk_camera] LCD VO: SetLayerAttr failed %x\n", ret); goto fail_vo; }
+    // 注意: 不调用 RK_MPI_VO_SetLayerDispBufLen 调大显示缓冲池。
+    // 该平台显示缓冲内存有限, 设 8 帧会在 EnableLayer 时报
+    // "not enough displaybuf buf len" 导致 VO 整体初始化失败 -> LCD 黑屏。
+    // 改为在 lcd_vo_thread 用 SendFrame(0) 非阻塞: VO 缓冲满时立即丢帧,
+    // 投喂速率自动跟随 composer 实际消费率, 从源头避免缓冲池堆积/ no free buffer。
     RK_MPI_VO_SetLayerSpliceMode(g_lcd_vo_layer, VO_SPLICE_MODE_RGA);
     ret = RK_MPI_VO_EnableLayer(g_lcd_vo_layer);
     if (ret != RK_SUCCESS) { printf("[rk_camera] LCD VO: EnableLayer failed %x\n", ret); goto fail_vo; }
@@ -901,187 +635,47 @@ static void *lcd_vo_thread(void *arg) {
     VIDEO_FRAME_INFO_S frame;
     long long frames = 0;
     long long start_us = 0;
+    // 紧循环直送 (参照官方 sample simple_vi_get_frame_send_vo_rv1106.c):
+    // SendFrame(-1) 在 VO 内部缓冲满时自动阻塞背压, 不会溢出缓冲池, 无需应用层限速。
+    // selfpath 已在源头设目的帧率=g_lcd_fps(均匀 20fps), 此处每帧直送即可。
+    // 显示缓冲池已在 lcd_vo_init 调大到 8, 吸收重负载下 composer 偶发卡顿,
+    // 消除 "Layer 0 no free buffer to compose"。
+
     while (!g_quit) {
         int ret = RK_MPI_VI_GetChnFrame(VI_DEV_ID, g_lcd_vi_selfpath_chn, &frame, 1000);
         if (ret != RK_SUCCESS) {
             // 超时或暂无可取帧: 继续, 不阻塞编码管线
             continue;
         }
-        // VOP 硬件完成 CSC+缩放, 应用侧零 CPU 转换
-        RK_MPI_VO_SendFrame(g_lcd_vo_layer, g_lcd_vo_chn, &frame, -1);
-        RK_MPI_VI_ReleaseChnFrame(VI_DEV_ID, g_lcd_vi_selfpath_chn, &frame);
 
+        // VOP 硬件完成 CSC+缩放, 应用侧零 CPU 转换
+        // SendFrame 用 0 (非阻塞): VO 显示缓冲满时立即返回失败, 此处直接丢帧。
+        // 实测该平台 LCD/composer 实际消费率约 9~10fps(受限于 LCD 刷新/合成能力),
+        // 若投喂快于消费, 缓冲池会堆积并刷 "Layer 0 no free buffer to compose"。
+        // 非阻塞丢帧使投喂速率自动跟随 composer 消费率, 缓冲池永不堆积, 从根上消除该错误。
+        ret = RK_MPI_VO_SendFrame(g_lcd_vo_layer, g_lcd_vo_chn, &frame, 0);
+        RK_MPI_VI_ReleaseChnFrame(VI_DEV_ID, g_lcd_vi_selfpath_chn, &frame);
+        if (ret != RK_SUCCESS) {
+            // 缓冲满(或暂时不可送): 丢弃此帧继续, 不阻塞、不堆积
+            continue;
+        }
+
+        struct timeval tv; gettimeofday(&tv, NULL);
+        long long now = (long long)tv.tv_sec * 1000000 + tv.tv_usec;
         frames++;
         if (start_us == 0) {
-            struct timeval tv; gettimeofday(&tv, NULL);
-            start_us = (long long)tv.tv_sec * 1000000 + tv.tv_usec;
-        } else {
-            struct timeval tv; gettimeofday(&tv, NULL);
-            long long now = (long long)tv.tv_sec * 1000000 + tv.tv_usec;
-            if (now - start_us >= 5000000) {
-                double fps = frames / ((now - start_us) / 1000000.0);
-                printf("[rk_camera][LCD_STAT] VO: fps=%.1f (VOP hardware CSC, ~0 CPU)\n", fps);
-                fflush(stdout);
-                start_us = now; frames = 0;
-            }
+            start_us = now;
+        } else if (now - start_us >= 5000000) {
+            double fps = frames / ((now - start_us) / 1000000.0);
+            printf("[rk_camera][LCD_STAT] VO: fps=%.1f (VOP hardware CSC, ~0 CPU)\n", fps);
+            fflush(stdout);
+            start_us = now; frames = 0;
         }
     }
     printf("[rk_camera] LCD VO thread stopped\n");
     return NULL;
 }
 
-// LCD 显示线程(fb 后端): V4L2(selfpath) DQBUF → 软件 NV12→BGRA → memcpy(fb0)
-// 架构性代价: selfpath 内部缓冲比 mainpath(编码源) 多 1~2 帧, 故 LCD 预览延时
-// 通常略大于网络流。已用 BUF_CNT=2 + 实时线程优先级压到最低。
-static void *lcd_display_thread(void *arg) {
-    (void)arg;
-    printf("[rk_camera] LCD thread started (V4L2 selfpath + NV12→BGRA + fb0)\n");
-
-    int v4l2_w, v4l2_h, v4l2_stride;
-    int v4l2_fd = lcd_v4l2_init(&v4l2_w, &v4l2_h, &v4l2_stride);
-    if (v4l2_fd < 0) {
-        printf("[rk_camera] LCD V4L2 init failed, LCD disabled\n");
-        g_fb_enabled = 0;
-        return NULL;
-    }
-
-    // 注意: 本线程**不能**用 SCHED_FIFO 实时优先级。
-    // 软件 NV12→BGRA + memcpy 是 CPU 密集型紧循环, 只有在 DQBUF 无帧时才阻塞。
-    // 若设为 SCHED_FIFO 高优先级, 会作为 RT 任务持续占用 CPU, 饿死编码路径中
-    // VPSS VProc 缩放所用的 RGA 实时工作线程 (RGA 也是 RT), 导致 RGA job 提交/等待
-    // 超时, 内核狂刷 "rga: can not find request from id" / "request abort" /
-    // "RGA2 core soft reset", 并触发内核 "sched: RT throttling activated"。
-    // 故保持默认 SCHED_OTHER 普通优先级 (与基线版本一致): LCD 新鲜度由 BUF_CNT=2
-    // 的 V4L2 队列保证 (DQBUF 始终取最新帧), 偶发被编码管线抢占的抖动远小于 RGA 报错的危害。
-    if (fb_init(g_lcd_width, g_lcd_height) < 0) {
-        printf("[rk_camera] LCD fb init failed, LCD disabled\n");
-        lcd_v4l2_deinit(v4l2_fd);
-        g_fb_enabled = 0;
-        return NULL;
-    }
-
-    int output_w = g_lcd_width;
-    int output_h = g_lcd_height;
-    int pixel_size = g_fb_bpp / 8;
-
-    // [TEST] 屏蔽软件 NV12→BGRA: 仅维持 V4L2 取流循环, 跳过转换+写 fb,
-    // 用于测量其余管线(编码/推流)的 CPU 基线。env LCD_SKIP_CONVERT=1 开启。
-    int skip_convert = (getenv("LCD_SKIP_CONVERT") != NULL);
-    if (skip_convert)
-        printf("[rk_camera][TEST] LCD NV12→BGRA SKIPPED (env LCD_SKIP_CONVERT=1)\n");
-
-    // NV12→BGRA 一律走软件路径 (见文件顶部说明: 进程内不能有第二个 RGA 使用者,
-    // 否则与 SDK 内部 VPSS/VENC 的 RGA 单例冲突, 破坏 dma_buf 记账 → kernel panic)。
-
-    // --- 5 秒统计: 量化 LCD 预览延时 ---
-    // 关键拆分: 每帧循环 = (1) DQBUF 阻塞等待 selfpath 投递一帧 (wait)
-    //                       + (2) 软件 NV12→BGRA 转换 + memcpy 到 fb0 (proc)
-    // 两个时间分别累加, 即可判断 13fps 的瓶颈在哪:
-    //   - wait >> proc : selfpath 投递本身被限速 (驱动/ISP 帧率), 非我们能控
-    //   - proc >> wait : 软件转换+拷贝太慢, 是我们的 CPU 瓶颈 (可考虑 RGA/降分辨率)
-    // 注: selfpath 驱动的 buf.timestamp 不可靠(≈0), 故不用它算 queue delay。
-    long long stat_start_us = 0;     // 统计窗口起点
-    long long last_in_us = 0;        // 上一帧循环起点时刻
-    int stat_first = 1;              // 是否首帧(不计入间隔)
-    int stat_frames = 0;             // 窗口内帧数
-    double stat_sum_wait_ms = 0;     // DQBUF 阻塞等待累计
-    double stat_sum_proc_ms = 0;     // 转换+拷贝处理累计
-    double stat_max_proc_ms = 0;     // 处理峰值
-    double stat_sum_interval_ms = 0; // 帧间循环间隔累计
-
-    while (!g_quit) {
-        struct timeval tv_in;
-        gettimeofday(&tv_in, NULL);
-        long long t_in = (long long)tv_in.tv_sec * 1000000 + tv_in.tv_usec;
-
-        struct v4l2_buffer buf;
-        struct v4l2_plane plane;
-        memset(&buf, 0, sizeof(buf));
-        memset(&plane, 0, sizeof(plane));
-        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-        buf.memory = V4L2_MEMORY_MMAP;
-        buf.m.planes = &plane;
-        buf.length = 1;
-
-        if (ioctl(v4l2_fd, VIDIOC_DQBUF, &buf) < 0) {
-            if (errno == EINTR) continue;
-            printf("[rk_camera] LCD DQBUF error: %s\n", strerror(errno));
-            break;
-        }
-
-        struct timeval tv_out;
-        gettimeofday(&tv_out, NULL);
-        long long t_out = (long long)tv_out.tv_sec * 1000000 + tv_out.tv_usec;
-        double wait_ms = (double)(t_out - t_in) / 1000.0;  // DQBUF 阻塞时长
-
-        if (!stat_first) {
-            stat_sum_interval_ms += (double)(t_in - last_in_us) / 1000.0;
-        }
-        last_in_us = t_in;
-        stat_first = 0;
-        if (stat_start_us == 0) stat_start_us = t_in;
-
-        void *data = (buf.index < LCD_V4L2_BUF_CNT) ? g_lcd_v4l2_bufs[buf.index] : NULL;
-        if (!data) {
-            ioctl(v4l2_fd, VIDIOC_QBUF, &buf);
-            continue;
-        }
-
-        size_t copy_size = (size_t)output_w * output_h * pixel_size;
-
-        // NV12→BGRA: 纯软件转换 (进程内不能起第二个 RGA 使用者, 见文件顶部说明)
-        // [TEST] skip_convert=1 时跳过转换+写 fb, 仅维持取流循环测 CPU 基线
-        if (!skip_convert) {
-            nv12_to_bgra_sw((const uint8_t *)data, v4l2_w, v4l2_h, v4l2_stride,
-                            g_fb_work_buf, output_w, output_h);
-            if (copy_size <= g_fb_size)
-                memcpy(g_framebuffer, g_fb_work_buf, copy_size);
-        }
-
-        ioctl(v4l2_fd, VIDIOC_QBUF, &buf);
-
-        struct timeval tv_done;
-        gettimeofday(&tv_done, NULL);
-        long long t_done = (long long)tv_done.tv_sec * 1000000 + tv_done.tv_usec;
-        double proc_ms = (double)(t_done - t_out) / 1000.0;  // 转换+拷贝耗时
-
-        // 累计统计
-        stat_frames++;
-        stat_sum_wait_ms += wait_ms;
-        stat_sum_proc_ms += proc_ms;
-        if (proc_ms > stat_max_proc_ms) stat_max_proc_ms = proc_ms;
-
-        // 每 5 秒打印一次统计值
-        if (t_in - stat_start_us >= 5000000) {
-            double elapsed_s = (double)(t_in - stat_start_us) / 1000000.0;
-            double fps = stat_frames / elapsed_s;
-            double avg_wait = stat_frames > 0 ? stat_sum_wait_ms / (double)stat_frames : 0;
-            double avg_proc = stat_frames > 0 ? stat_sum_proc_ms / (double)stat_frames : 0;
-            double avg_int = stat_frames > 1
-                                 ? stat_sum_interval_ms / (double)(stat_frames - 1)
-                                 : 0;
-            printf("[rk_camera][LCD_STAT] 5s: fps=%.1f interval=%.1fms "
-                   "wait(DQBUF)=%.1fms proc(convert+copy)=%.1fms max_proc=%.1fms "
-                   "[wait>>proc => selfpath capped; proc>>wait => CPU bottleneck]\n",
-                   fps, avg_int, avg_wait, avg_proc, stat_max_proc_ms);
-            // 仅此处单独刷出, 保证 [LCD_STAT] 实时可见, 同时避免全局 _IONBF 导致的串口阻塞假死
-            fflush(stdout);
-            // 重置窗口
-            stat_start_us = t_in;
-            stat_frames = 0;
-            stat_sum_wait_ms = 0;
-            stat_sum_proc_ms = 0;
-            stat_max_proc_ms = 0;
-            stat_sum_interval_ms = 0;
-            stat_first = 1;
-        }
-    }
-
-    fb_deinit();
-    lcd_v4l2_deinit(v4l2_fd);
-    printf("[rk_camera] LCD thread stopped\n");
-    return NULL;
-}
 
 // ---- 公开 API ----
 
@@ -1191,36 +785,22 @@ int rk_camera_init(int main_w, int main_h, int fps, int bitrate, int sensor_fps)
         if (ret != 0) return -1;
     }
 
-    // 5. LCD 显示后端 — env LCD_BACKEND 二选一 (默认 "vo" = VOP 硬件 CSC, 零 CPU):
-    //   "vo": VI selfpath -> RK_MPI_VO_SendFrame (VOP 硬件做 CSC+缩放, 不碰 RGA)
-    //   "fb": 旧路径, ISP selfpath V4L2 -> 软件 NV12→BGRA -> /dev/fb0 (~60% CPU)
+    // 5. LCD 显示 — MPP VO 模块 (VOP 硬件 CSC, 零 CPU 转换, 不碰 RGA 单例)
     if (g_fb_enabled) {
-        const char *backend = getenv("LCD_BACKEND");
-        int use_vo = (backend == NULL) || (strcmp(backend, "vo") == 0);
-        if (use_vo) {
-            if (lcd_vo_init() == 0) {
-                g_lcd_use_vo = 1;
-                ret = pthread_create(&g_lcd_thread, NULL, lcd_vo_thread, NULL);
-                if (ret != 0) {
-                    printf("[rk_camera] WARN: LCD VO thread create failed\n");
-                    lcd_vo_deinit();
-                    g_lcd_use_vo = 0;
-                    g_fb_enabled = 0;
-                } else {
-                    printf("[rk_camera] LCD display thread created (VO hardware CSC)\n");
-                }
-            } else {
-                printf("[rk_camera] LCD VO init failed; set LCD_BACKEND=fb for software path, LCD disabled\n");
+        if (lcd_vo_init() == 0) {
+            g_lcd_use_vo = 1;
+            ret = pthread_create(&g_lcd_thread, NULL, lcd_vo_thread, NULL);
+            if (ret != 0) {
+                printf("[rk_camera] WARN: LCD VO thread create failed\n");
+                lcd_vo_deinit();
+                g_lcd_use_vo = 0;
                 g_fb_enabled = 0;
+            } else {
+                printf("[rk_camera] LCD display thread created (VO hardware CSC)\n");
             }
         } else {
-            ret = pthread_create(&g_lcd_thread, NULL, lcd_display_thread, NULL);
-            if (ret != 0) {
-                printf("[rk_camera] WARN: LCD thread create failed\n");
-                g_fb_enabled = 0;
-            } else {
-                printf("[rk_camera] LCD display thread created (selfpath V4L2)\n");
-            }
+            printf("[rk_camera] LCD VO init failed, LCD disabled\n");
+            g_fb_enabled = 0;
         }
     }
 
@@ -1283,13 +863,14 @@ void rk_camera_set_chn_config(int chn_id,
 }
 
 // 设置 LCD 参数 (在 rk_camera_init 之前调用)
-// width/height: LCD 分辨率 (0 表示使用 framebuffer 自动检测的默认值)
+// width/height: LCD 分辨率 (0 表示使用默认分辨率)
 // fps: 显示帧率
 void rk_camera_set_vo_config(int width, int height, int fps) {
     if (width > 0) g_lcd_width = width;
     if (height > 0) g_lcd_height = height;
+    if (fps > 0) g_lcd_fps = fps;
     g_fb_enabled = 1;
-    printf("[rk_camera] FB enabled: %dx%d @%dfps\n", g_lcd_width, g_lcd_height, fps);
+    printf("[rk_camera] LCD(VO) enabled: %dx%d @%dfps\n", g_lcd_width, g_lcd_height, fps);
 }
 
 // 设置帧回调
