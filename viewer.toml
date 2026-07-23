@@ -1,12 +1,15 @@
-# 仅保留 device 所在、且可达的 relay1；同时给 QUIC(UDP) 与 TCP 两个地址。
-# 4G/蜂窝网络常拦截 UDP/QUIC 但放行 TCP，故加 TCP 4001 作为回退。
-# 原 relay2 (134.175.248.113) 在 viewer 机器上 "Network is unreachable" 且 device 不在其上，删除避免每次重连浪费 ~5s 握手超时。
 relays = [
-  "/ip4/101.35.90.171/udp/4001/quic-v1/p2p/12D3KooWDGUejVsts1G4tGyf8ukkr73eWxCr1EUfCQxgcbSDUie1",
-  "/ip4/101.35.90.171/tcp/4001/p2p/12D3KooWDGUejVsts1G4tGyf8ukkr73eWxCr1EUfCQxgcbSDUie1"
+    "/ip4/101.35.90.171/udp/4001/quic-v1/p2p/12D3KooWDGUejVsts1G4tGyf8ukkr73eWxCr1EUfCQxgcbSDUie1",
+    "/ip4/101.35.90.171/tcp/4001/p2p/12D3KooWDGUejVsts1G4tGyf8ukkr73eWxCr1EUfCQxgcbSDUie1",
 ]
-camera = "12D3KooWG2ihY7Ne75KqkYyYrQWL1ACLUgUN8rp1nTskQB3RNNNt"
+relay = ""
+enable_mdns = true
+cameras = [
+    "12D3KooWG2ihY7Ne75KqkYyYrQWL1ACLUgUN8rp1nTskQB3RNNNt",
+    "12D3KooWG2ihY7Ne75KqkYyYrQWL1ACLUgUN8rp1nTskQB3RNaaa",
+]
+camera = ""
+stream = "auto"
 no_audio = false
 play = true
 network_type = "auto"
-stream = "auto"

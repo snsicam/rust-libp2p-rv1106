@@ -63,7 +63,7 @@ async fn main() -> Result<()> {
 
     // 命令行参数覆盖配置文件
     if !opt.relays.is_empty() { config.relays = opt.relays.clone(); }
-    if let Some(ref camera) = opt.camera { config.camera = camera.clone(); }
+    if let Some(ref camera) = opt.camera { config.cameras.insert(0, camera.clone()); }
     if let Some(ref output) = opt.output { config.output = Some(output.clone()); }
     if opt.no_audio { config.no_audio = true; }
     #[cfg(feature = "player")]
@@ -73,9 +73,8 @@ async fn main() -> Result<()> {
     // stream CLI arg always overrides config (unless it's the default "auto")
     if opt.stream != "auto" { config.stream = opt.stream.clone(); }
 
-    // 解析 relays (兼容旧格式 relay 字段) / cameras (兼容旧格式 camera 字段)
+    // 解析 relays (兼容旧格式 relay 字段)
     config.resolve_relays();
-    config.resolve_cameras();
 
     // ---- 参数校验 ----
     if config.relays.is_empty() && !config.enable_mdns {
@@ -349,11 +348,23 @@ async fn run_gui(opt: Opt, mut config: ViewerConfig) -> Result<()> {
                 }
                 UiAction::DevicesChanged => {
                     config.cameras = player.devices().to_vec();
-                    config.camera.clear(); // 旧格式字段已迁移到 cameras
                     match config.save(&opt.config) {
                         Ok(()) => println!("[Viewer] Config saved: {}", opt.config.display()),
                         Err(e) => eprintln!("[Viewer] Failed to save config: {e}"),
                     }
+                }
+                UiAction::DisconnectDevice => {
+                    // 右键菜单"断开连接": 真正关闭底层 media 流
+                    if let Some(s) = session.as_mut() {
+                        s.shutdown();
+                    }
+                    session = None;
+                    pending_cam = None;
+                    current_cam = None;
+                    stream_disconnected = true;
+                    player.set_connected(None);
+                    player.set_status("Disconnected");
+                    println!("[Viewer] Disconnected by user");
                 }
                 UiAction::Minimized => {
                     window_minimized = true;
@@ -643,6 +654,134 @@ mod player {
         ConnectDevice(String),
         /// 设备列表已增删, 需要保存配置
         DevicesChanged,
+        /// 右键菜单"断开连接": 真正关闭底层 media 流
+        DisconnectDevice,
+    }
+
+    // ============ 设备配置 (仅 viewer 端本地保存, 不真正下发到摄像头) ============
+    // 字段按 RV1106 摄像头能力设计: 编码 / 图像 / 系统 三类。
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub enum CodecType { H265, H264 }
+    impl CodecType {
+        fn cycle(self) -> Self {
+            match self { CodecType::H265 => CodecType::H264, CodecType::H264 => CodecType::H265 }
+        }
+        fn label(self) -> &'static str {
+            match self { CodecType::H265 => "H.265", CodecType::H264 => "H.264" }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub enum Resolution { R1080p, R720p, R540p }
+    impl Resolution {
+        fn cycle(self) -> Self {
+            match self {
+                Resolution::R1080p => Resolution::R720p,
+                Resolution::R720p => Resolution::R540p,
+                Resolution::R540p => Resolution::R1080p,
+            }
+        }
+        fn label(self) -> &'static str {
+            match self {
+                Resolution::R1080p => "1920x1080",
+                Resolution::R720p => "1280x720",
+                Resolution::R540p => "960x540",
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub enum ExposureMode { Auto, Manual }
+    impl ExposureMode {
+        fn cycle(self) -> Self {
+            match self { ExposureMode::Auto => ExposureMode::Manual, ExposureMode::Manual => ExposureMode::Auto }
+        }
+        fn label(self) -> &'static str {
+            match self { ExposureMode::Auto => "Auto", ExposureMode::Manual => "Manual" }
+        }
+    }
+
+    /// 右键菜单动作
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum CtxMenuAct { Disconnect, Configure }
+
+    /// 可编辑配置字段标识 (用于布局/点击命中)
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum ConfigField {
+        Codec, Resolution, Fps, Bitrate, Gop,
+        Brightness, Contrast, Saturation, Exposure,
+        DeviceName,
+    }
+
+    /// 配置窗体几何布局 (draw 与 click 共用, 保证命中一致)
+    struct CfgGeo {
+        win: (i32, i32, i32, i32),
+        tabs: [(i32, i32, i32, i32); 3],
+        /// (字段, 减号按钮, 值区域, 加号按钮)
+        rows: Vec<(ConfigField, (i32, i32, i32, i32), (i32, i32, i32, i32), (i32, i32, i32, i32))>,
+        /// (保存, 取消, 默认)
+        buttons: [(i32, i32, i32, i32); 3],
+    }
+
+    const CFG_W: i32 = 480;
+    const CFG_H: i32 = 400;
+
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    pub struct DeviceConfig {
+        // ---- 编码参数 ----
+        pub codec: CodecType,
+        pub resolution: Resolution,
+        pub fps: u32,
+        pub bitrate_kbps: u32,
+        pub gop: u32,
+        // ---- 图像参数 ----
+        pub brightness: i32,
+        pub contrast: i32,
+        pub saturation: i32,
+        pub exposure_mode: ExposureMode,
+        // ---- 系统参数 ----
+        pub device_name: String,
+    }
+
+    impl Default for DeviceConfig {
+        fn default() -> Self {
+            DeviceConfig {
+                codec: CodecType::H265,
+                resolution: Resolution::R720p,
+                fps: 25,
+                bitrate_kbps: 2000,
+                gop: 50,
+                brightness: 0,
+                contrast: 0,
+                saturation: 0,
+                exposure_mode: ExposureMode::Auto,
+                device_name: "Camera".to_string(),
+            }
+        }
+    }
+
+    impl DeviceConfig {
+        fn path(peer: &str) -> std::path::PathBuf {
+            let mut dir = std::env::current_dir().unwrap_or_default();
+            dir.push("device_configs");
+            let _ = std::fs::create_dir_all(&dir);
+            dir.push(format!("{}.json", peer));
+            dir
+        }
+        fn load(peer: &str) -> DeviceConfig {
+            let p = DeviceConfig::path(peer);
+            std::fs::read_to_string(&p)
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default()
+        }
+        fn save(&self, peer: &str) {
+            let p = DeviceConfig::path(peer);
+            if let Ok(s) = serde_json::to_string_pretty(self) {
+                let _ = std::fs::write(&p, s);
+            }
+        }
     }
 
     /// 将 sdl2 的各种错误类型统一转为 anyhow::Error
@@ -691,6 +830,36 @@ mod player {
         anyhow::bail!("No usable TTF font found for UI panel (tried: {CANDIDATES:?})")
     }
 
+    /// 加载中文 fallback 字体 (主等宽字体不含 CJK 字形, 中文需回退到此字体)
+    fn load_cjk_font() -> Option<fontdue::Font> {
+        const CANDIDATES: &[&str] = &[
+            "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+            "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/arphic/uming.ttc",
+        ];
+        for p in CANDIDATES {
+            if let Ok(bytes) = std::fs::read(p) {
+                // .ttc 字体集合: 尝试 index 0 (多数中文 TTC 的 index 0 即中文)
+                for idx in 0..=2u32 {
+                    if let Ok(f) = fontdue::Font::from_bytes(
+                        bytes.clone(),
+                        fontdue::FontSettings { collection_index: idx, ..fontdue::FontSettings::default() },
+                    ) {
+                        // 抽样「中」字能光栅化即认为可用
+                        let (m, _) = f.rasterize('中', 14.0);
+                        if m.width > 0 && m.height > 0 {
+                            println!("[Player] CJK font: {p} (index {idx})");
+                            return Some(f);
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("[Player] WARNING: no CJK font found, Chinese text will be blank");
+        None
+    }
+
     /// H.265 解码 + SDL2 渲染的实时播放器 (左侧设备管理面板 + 右侧视频)
     ///
     /// SAFETY: `texture`/`panel_texture` 字段使用 `Texture<'static>`，实际生命周期
@@ -722,8 +891,27 @@ mod player {
         /// 是否已执行过运行时 maximize()：在首次 present 后调用一次，确保窗口启动即最大化
         maximize_applied: bool,
 
+        // ---- 右键上下文菜单 / 配置窗体状态 ----
+        /// 右键弹出的上下文菜单: (x, y, 选中设备索引)
+        context_menu: Option<(i32, i32, usize)>,
+        /// 配置窗体正在编辑的设备 PeerId
+        config_peer: Option<String>,
+        /// 配置窗体当前编辑的配置 (None = 未打开)
+        config: Option<DeviceConfig>,
+        /// 配置窗体当前 tab: 0 编码 / 1 图像 / 2 系统
+        config_tab: usize,
+        /// 系统 tab 中设备名是否处于文本编辑态
+        config_editing_name: bool,
+        /// 设备名文本编辑缓冲
+        config_text: String,
+
+        /// 右键菜单 / 配置窗体共用的 overlay 纹理 (ABGR8888)
+        overlay_texture: Option<sdl2::render::Texture<'static>>,
+
         // ---- 设备管理面板状态 ----
         font: fontdue::Font,
+        /// 中文 fallback 字体 (主字体不含 CJK 字形时使用)
+        font_cjk: Option<fontdue::Font>,
         glyph_cache: HashMap<(char, u32), (fontdue::Metrics, Vec<u8>)>,
         devices: Vec<String>,
         selected: Option<usize>,
@@ -806,7 +994,15 @@ mod player {
                 display_max,
                 window_sized: false,
                 maximize_applied: false,
+                context_menu: None,
+                config_peer: None,
+                config: None,
+                config_tab: 0,
+                config_editing_name: false,
+                config_text: String::new(),
+                overlay_texture: None,
                 font,
+                font_cjk: load_cjk_font(),
                 glyph_cache: HashMap::new(),
                 devices,
                 selected: None,
@@ -857,7 +1053,44 @@ mod player {
                 match event {
                     Event::Quit { .. } => actions.push(UiAction::Quit),
                     Event::KeyDown { keycode: Some(key), keymod, .. } => {
-                        if self.adding {
+                        if self.config_editing_name {
+                            // 配置窗体: 设备名文本编辑
+                            match key {
+                                Keycode::Return | Keycode::KpEnter => {
+                                    if let Some(cfg) = self.config.as_mut() {
+                                        cfg.device_name = self.config_text.trim().to_string();
+                                    }
+                                    self.config_editing_name = false;
+                                    self.video_subsystem.text_input().stop();
+                                    self.panel_dirty = true;
+                                    let _ = self.draw_now();
+                                }
+                                Keycode::Escape => {
+                                    self.config_editing_name = false;
+                                    self.video_subsystem.text_input().stop();
+                                    let _ = self.draw_now();
+                                }
+                                Keycode::Backspace => {
+                                    self.config_text.pop();
+                                    let _ = self.draw_now();
+                                }
+                                Keycode::V if keymod.intersects(Mod::LCTRLMOD | Mod::RCTRLMOD) => {
+                                    if let Ok(t) = self.video_subsystem.clipboard().clipboard_text() {
+                                        self.config_text.push_str(&t);
+                                        let _ = self.draw_now();
+                                    }
+                                }
+                                _ => {}
+                            }
+                        } else if self.config.is_some() {
+                            // 配置窗体打开 (非编辑): Esc 关闭(取消)
+                            if key == Keycode::Escape {
+                                self.config = None;
+                                self.config_peer = None;
+                                self.panel_dirty = true;
+                                let _ = self.draw_now();
+                            }
+                        } else if self.adding {
                             match key {
                                 Keycode::Return | Keycode::KpEnter => {
                                     if let Some(a) = self.finish_add() {
@@ -887,9 +1120,40 @@ mod player {
                         self.input.push_str(&t);
                         self.panel_dirty = true;
                     }
-                    Event::MouseButtonDown { mouse_btn: MouseButton::Left, x, y, clicks, .. } => {
-                        if (x as u32) < PANEL_W {
-                            self.on_panel_click(x, y, clicks, &mut actions);
+                    Event::TextInput { text, .. } if self.config_editing_name => {
+                        self.config_text.push_str(&text);
+                        self.panel_dirty = true;
+                        let _ = self.draw_now();
+                    }
+                    Event::MouseButtonDown { mouse_btn, x, y, clicks, .. } => {
+                        match mouse_btn {
+                            MouseButton::Left => {
+                                if self.config.is_some() {
+                                    // 配置窗体模态: 所有左键交给配置窗体处理
+                                    self.on_config_click(x, y, &mut actions);
+                                } else if self.context_menu.is_some() {
+                                    // 菜单内命中执行对应动作, 否则关闭菜单
+                                    if let Some(act) = self.on_context_menu_click(x, y) {
+                                        match act {
+                                            CtxMenuAct::Disconnect => actions.push(UiAction::DisconnectDevice),
+                                            CtxMenuAct::Configure => self.open_config(),
+                                        }
+                                    }
+                                    self.context_menu = None;
+                                    let _ = self.draw_now();
+                                } else if (x as u32) < PANEL_W {
+                                    self.on_panel_click(x, y, clicks, &mut actions);
+                                }
+                            }
+                            MouseButton::Right => {
+                                if (x as u32) < PANEL_W {
+                                    self.open_context_menu(x, y);
+                                    let _ = self.draw_now();
+                                } else {
+                                    self.context_menu = None;
+                                }
+                            }
+                            _ => {}
                         }
                     }
                     Event::Window { win_event, .. } => match win_event {
@@ -1003,6 +1267,399 @@ mod player {
             self.status = "Device added (double-click to connect)".to_string();
             self.panel_dirty = true;
             Some(UiAction::DevicesChanged)
+        }
+
+        // ============ 右键上下文菜单 ============
+
+        /// 右键面板设备区域: 若已选中设备则弹出菜单 (记录弹出坐标与选中索引)
+        fn open_context_menu(&mut self, x: i32, y: i32) {
+            if let Some(idx) = self.selected {
+                if idx < self.devices.len() {
+                    self.context_menu = Some((x, y, idx));
+                    self.panel_dirty = true;
+                }
+            }
+        }
+
+        /// 右键菜单命中检测: 返回所点动作 (None = 点中菜单外, 直接关闭)
+        fn on_context_menu_click(&self, x: i32, y: i32) -> Option<CtxMenuAct> {
+            let (mx, my, _) = self.context_menu?;
+            let w = 150i32;
+            let items = [CtxMenuAct::Disconnect, CtxMenuAct::Configure];
+            for (i, act) in items.iter().enumerate() {
+                let ry = my + (i as i32) * 26;
+                if x >= mx && x < mx + w && y >= ry && y < ry + 26 {
+                    return Some(*act);
+                }
+            }
+            None
+        }
+
+        // ============ 配置窗体 ============
+
+        /// 打开配置窗体: 载入该设备的本地配置 (不真正下发到摄像头)
+        fn open_config(&mut self) {
+            if let Some(idx) = self.selected {
+                if idx < self.devices.len() {
+                    let peer = self.devices[idx].clone();
+                    let cfg = DeviceConfig::load(&peer);
+                    self.config_peer = Some(peer);
+                    self.config = Some(cfg);
+                    self.config_tab = 0;
+                    self.config_editing_name = false;
+                    self.config_text.clear();
+                    self.panel_dirty = true;
+                }
+            }
+        }
+
+        /// 配置窗体几何布局 (绝对坐标: win 用于 copy, tabs/rows/buttons 相对窗体原点)
+        fn config_geometry(&self) -> CfgGeo {
+            let (win_w, win_h) = self.canvas.window().size();
+            let wx = (win_w as i32 - CFG_W) / 2;
+            let wy = (win_h as i32 - CFG_H) / 2;
+            let win = (wx, wy, CFG_W, CFG_H);
+            let x0 = 0i32;
+            let y0 = 0i32;
+            let tab_w = 140;
+            let tab_h = 26;
+            let tab_y = y0 + 34;
+            let tabs = [
+                (x0 + 12, tab_y, tab_w, tab_h),
+                (x0 + 12 + tab_w + 8, tab_y, tab_w, tab_h),
+                (x0 + 12 + (tab_w + 8) * 2, tab_y, tab_w, tab_h),
+            ];
+            let fields: Vec<ConfigField> = match self.config_tab {
+                0 => vec![ConfigField::Codec, ConfigField::Resolution, ConfigField::Fps, ConfigField::Bitrate, ConfigField::Gop],
+                1 => vec![ConfigField::Brightness, ConfigField::Contrast, ConfigField::Saturation, ConfigField::Exposure],
+                _ => vec![ConfigField::DeviceName],
+            };
+            let row_y0 = y0 + 78;
+            let row_h = 32;
+            let mut rows = Vec::new();
+            for (i, &f) in fields.iter().enumerate() {
+                let ry = row_y0 + (i as i32) * row_h;
+                let minus = (x0 + 200, ry, 24, 24);
+                let value = (x0 + 230, ry, 150, 24);
+                let plus = (x0 + 384, ry, 24, 24);
+                rows.push((f, minus, value, plus));
+            }
+            let by = y0 + CFG_H - 40;
+            let buttons = [
+                (x0 + 20, by, 120, 28),
+                (x0 + 180, by, 120, 28),
+                (x0 + 340, by, 120, 28),
+            ];
+            CfgGeo { win, tabs, rows, buttons }
+        }
+
+        /// 配置参数显示标签
+        fn field_label(f: ConfigField) -> &'static str {
+            match f {
+                ConfigField::Codec => "编码格式",
+                ConfigField::Resolution => "分辨率",
+                ConfigField::Fps => "帧率",
+                ConfigField::Bitrate => "码率",
+                ConfigField::Gop => "GOP",
+                ConfigField::Brightness => "亮度",
+                ConfigField::Contrast => "对比度",
+                ConfigField::Saturation => "饱和度",
+                ConfigField::Exposure => "曝光模式",
+                ConfigField::DeviceName => "设备名称",
+            }
+        }
+
+        /// 配置参数当前值 (字符串)
+        fn field_value(&self, f: ConfigField) -> String {
+            let cfg = self.config.as_ref().unwrap();
+            match f {
+                ConfigField::Codec => cfg.codec.label().to_string(),
+                ConfigField::Resolution => cfg.resolution.label().to_string(),
+                ConfigField::Fps => format!("{} fps", cfg.fps),
+                ConfigField::Bitrate => format!("{} kbps", cfg.bitrate_kbps),
+                ConfigField::Gop => format!("{} 帧", cfg.gop),
+                ConfigField::Brightness => format!("{}", cfg.brightness),
+                ConfigField::Contrast => format!("{}", cfg.contrast),
+                ConfigField::Saturation => format!("{}", cfg.saturation),
+                ConfigField::Exposure => cfg.exposure_mode.label().to_string(),
+                ConfigField::DeviceName => cfg.device_name.clone(),
+            }
+        }
+
+        /// 调整数值/枚举参数 (+1 / -1 步进)
+        fn adjust(&mut self, field: ConfigField, dir: i32) {
+            let cfg = match self.config.as_mut() {
+                Some(c) => c,
+                None => return,
+            };
+            let d = if dir > 0 { 1 } else { -1 };
+            match field {
+                ConfigField::Codec => cfg.codec = cfg.codec.cycle(),
+                ConfigField::Resolution => cfg.resolution = cfg.resolution.cycle(),
+                ConfigField::Exposure => cfg.exposure_mode = cfg.exposure_mode.cycle(),
+                ConfigField::Fps => cfg.fps = (cfg.fps as i32 + d * 5).clamp(5, 60) as u32,
+                ConfigField::Bitrate => cfg.bitrate_kbps = (cfg.bitrate_kbps as i32 + d * 500).clamp(100, 8000) as u32,
+                ConfigField::Gop => cfg.gop = (cfg.gop as i32 + d * 10).clamp(1, 300) as u32,
+                ConfigField::Brightness => cfg.brightness = (cfg.brightness + d * 10).clamp(-100, 100),
+                ConfigField::Contrast => cfg.contrast = (cfg.contrast + d * 10).clamp(-100, 100),
+                ConfigField::Saturation => cfg.saturation = (cfg.saturation + d * 10).clamp(-100, 100),
+                ConfigField::DeviceName => {}
+            }
+            self.panel_dirty = true;
+        }
+
+        /// 配置窗体左键点击处理 (坐标为窗口绝对坐标)
+        fn on_config_click(&mut self, x: i32, y: i32, _actions: &mut Vec<UiAction>) {
+            let geo = self.config_geometry();
+            let (wx, wy, _, _) = geo.win;
+            let lx = x - wx;
+            let ly = y - wy;
+            for (i, t) in geo.tabs.iter().enumerate() {
+                if in_rect(lx, ly, *t) {
+                    self.config_tab = i;
+                    self.config_editing_name = false;
+                    self.panel_dirty = true;
+                    let _ = self.draw_now();
+                    return;
+                }
+            }
+            for (f, minus, value, plus) in &geo.rows {
+                if in_rect(lx, ly, *minus) {
+                    self.adjust(*f, -1);
+                    let _ = self.draw_now();
+                    return;
+                }
+                if in_rect(lx, ly, *plus) {
+                    self.adjust(*f, 1);
+                    let _ = self.draw_now();
+                    return;
+                }
+                if *f == ConfigField::DeviceName && in_rect(lx, ly, *value) {
+                    self.config_editing_name = true;
+                    self.config_text = self.config.as_ref().map(|c| c.device_name.clone()).unwrap_or_default();
+                    self.video_subsystem.text_input().start();
+                    self.panel_dirty = true;
+                    let _ = self.draw_now();
+                    return;
+                }
+            }
+            for (i, b) in geo.buttons.iter().enumerate() {
+                if in_rect(lx, ly, *b) {
+                    match i {
+                        0 => {
+                            if let (Some(peer), Some(cfg)) = (self.config_peer.clone(), self.config.clone()) {
+                                cfg.save(&peer);
+                                println!(
+                                    "[Viewer] Device config saved: {} -> device_configs/{}.json",
+                                    super::short_id(&peer), peer
+                                );
+                            }
+                            self.config = None;
+                            self.config_peer = None;
+                            self.config_editing_name = false;
+                        }
+                        1 => {
+                            self.config = None;
+                            self.config_peer = None;
+                            self.config_editing_name = false;
+                        }
+                        _ => {
+                            self.config = Some(DeviceConfig::default());
+                            self.config_editing_name = false;
+                        }
+                    }
+                    self.panel_dirty = true;
+                    let _ = self.draw_now();
+                    return;
+                }
+            }
+        }
+
+        /// 确保 overlay 纹理尺寸匹配 (不匹配则重建)
+        fn ensure_overlay(&mut self, w: u32, h: u32) -> Result<()> {
+            let need = match &self.overlay_texture {
+                Some(t) => t.query().width != w || t.query().height != h,
+                None => true,
+            };
+            if need {
+                let tc = self.canvas.texture_creator();
+                let tex = map_sdl(
+                    tc.create_texture_streaming(PixelFormatEnum::ABGR8888, w, h),
+                    "create overlay texture",
+                )?;
+                let tex: sdl2::render::Texture<'static> =
+                    unsafe { std::mem::transmute::<sdl2::render::Texture<'_>, sdl2::render::Texture<'static>>(tex) };
+                self.overlay_texture = Some(tex);
+            }
+            Ok(())
+        }
+
+        /// 判断字符是否为 CJK (含中文/日文假名/全角) 范围, 这些字符主等宽字体不含
+        fn is_cjk(c: char) -> bool {
+            let u = c as u32;
+            (0x3000..=0x303F).contains(&u) // CJK 标点
+                || (0x3400..=0x4DBF).contains(&u) // CJK 扩展 A
+                || (0x4E00..=0x9FFF).contains(&u) // CJK 基本汉字
+                || (0xF900..=0xFAFF).contains(&u) // CJK 兼容
+                || (0xFF00..=0xFFEF).contains(&u) // 全角字母/数字
+                || (0x3040..=0x30FF).contains(&u) // 平/片假名
+        }
+
+        /// 光栅化单个字形: CJK 字符直接走中文 fallback 字体 (fontdue 对缺失字符返回 .notdef
+        /// 而非空位图, 故不能用 width/height==0 判断), ASCII 仍用主等宽字体保证观感
+        fn rasterize_glyph(&self, ch: char, px: f32) -> (fontdue::Metrics, Vec<u8>) {
+            if Self::is_cjk(ch) {
+                if let Some(cjk) = &self.font_cjk {
+                    return cjk.rasterize(ch, px);
+                }
+            }
+            self.font.rasterize(ch, px)
+        }
+
+        /// 带缓冲区宽度的文本绘制 (draw_text 硬编码 PANEL_W, 配置窗体更宽需此版本)
+        fn draw_text_w(&mut self, buf: &mut [u8], buf_w: u32, buf_h: u32, x: i32, baseline: i32, px: f32, text: &str, color: [u8; 3]) {
+            let mut pen = x as f32;
+            for ch in text.chars() {
+                let key = (ch, px as u32);
+                if !self.glyph_cache.contains_key(&key) {
+                    let g = self.rasterize_glyph(ch, px);
+                    self.glyph_cache.insert(key, g);
+                }
+                let (m, bitmap) = self.glyph_cache.get(&key).unwrap();
+                let gx = pen.round() as i32 + m.xmin;
+                let gy = baseline - m.height as i32 - m.ymin;
+                for row in 0..m.height {
+                    let py = gy + row as i32;
+                    if py < 0 || py >= buf_h as i32 {
+                        continue;
+                    }
+                    for col in 0..m.width {
+                        let pxx = gx + col as i32;
+                        if pxx < 0 || pxx >= buf_w as i32 {
+                            continue;
+                        }
+                        let cov = bitmap[row * m.width + col] as u32;
+                        if cov == 0 {
+                            continue;
+                        }
+                        let idx = ((py as u32 * buf_w + pxx as u32) * 4) as usize;
+                        for c in 0..3 {
+                            let dst = buf[idx + c] as u32;
+                            buf[idx + c] = ((color[c] as u32 * cov + dst * (255 - cov)) / 255) as u8;
+                        }
+                        buf[idx + 3] = 255;
+                    }
+                }
+                pen += m.advance_width;
+            }
+        }
+
+        /// 绘制右键下拉菜单 (覆盖在 panel 之上)
+        fn draw_context_menu(&mut self) -> Result<()> {
+            let (mx, my, _) = match self.context_menu {
+                Some(v) => v,
+                None => return Ok(()),
+            };
+            let w = 150i32;
+            let items = [("断开连接", CtxMenuAct::Disconnect), ("配置设备", CtxMenuAct::Configure)];
+            let h = (items.len() as i32) * 26;
+            self.ensure_overlay(w as u32, h as u32)?;
+            let mut buf = vec![0u8; (w * h * 4) as usize];
+            fill_rect(&mut buf, w as u32, h as u32, 0, 0, w as u32, h as u32, [38, 38, 44, 255]);
+            for (i, (label, _)) in items.iter().enumerate() {
+                let ry = i as i32 * 26;
+                self.draw_text_w(&mut buf, w as u32, h as u32, 12, ry + 19, 14.0, label, [225, 225, 230]);
+                if i < items.len() - 1 {
+                    fill_rect(&mut buf, w as u32, h as u32, 0, ry + 26, w as u32, 1, [70, 70, 80, 255]);
+                }
+            }
+            if let Some(t) = &mut self.overlay_texture {
+                map_sdl(t.update(None, &buf, (w * 4) as usize), "menu update")?;
+                map_sdl(self.canvas.copy(t, None, Some(Rect::new(mx, my, w as u32, h as u32))), "menu copy")?;
+            }
+            Ok(())
+        }
+
+        /// 绘制配置窗体 (覆盖层)
+        fn draw_config(&mut self) -> Result<()> {
+            let geo = self.config_geometry();
+            let (wx, wy, ww, wh) = geo.win;
+            let w = ww as u32;
+            let h = wh as u32;
+            self.ensure_overlay(w, h)?;
+            let mut buf = vec![0u8; (w * h * 4) as usize];
+
+            // 窗体背景 + 外边框
+            fill_rect(&mut buf, w, h, 0, 0, w, h, [30, 30, 36, 255]);
+            fill_rect(&mut buf, w, h, 0, 0, w, 2, [90, 110, 160, 255]);
+            fill_rect(&mut buf, w, h, 0, 0, 2, h, [90, 110, 160, 255]);
+            fill_rect(&mut buf, w, h, w as i32 - 2, 0, 2, h, [90, 110, 160, 255]);
+            fill_rect(&mut buf, w, h, 0, h as i32 - 2, w, 2, [90, 110, 160, 255]);
+            // 标题栏
+            fill_rect(&mut buf, w, h, 0, 0, w, 30, [46, 46, 56, 255]);
+            self.draw_text_w(&mut buf, w, h, 12, 21, 17.0, "设备配置", [230, 230, 236]);
+            if let Some(peer) = &self.config_peer {
+                self.draw_text_w(&mut buf, w, h, 110, 21, 13.0, &super::short_id(peer), [150, 170, 210]);
+            }
+
+            // tabs
+            let tab_labels = ["编码", "图像", "系统"];
+            for (i, t) in geo.tabs.iter().enumerate() {
+                let active = i == self.config_tab;
+                fill_rect(
+                    &mut buf,
+                    w,
+                    h,
+                    t.0,
+                    t.1,
+                    t.2 as u32,
+                    t.3 as u32,
+                    if active { [70, 95, 145, 255] } else { [44, 44, 54, 255] },
+                );
+                self.draw_text_w(&mut buf, w, h, t.0 + 50, t.1 + 18, 14.0, tab_labels[i], [230, 230, 236]);
+            }
+
+            // 参数行
+            for (f, minus, value, plus) in &geo.rows {
+                let label = Self::field_label(*f);
+                self.draw_text_w(&mut buf, w, h, value.0 - 150, value.1 + 18, 13.0, label, [200, 200, 206]);
+                // 减号
+                fill_rect(&mut buf, w, h, minus.0, minus.1, minus.2 as u32, minus.3 as u32, [55, 55, 65, 255]);
+                self.draw_text_w(&mut buf, w, h, minus.0 + 8, minus.1 + 18, 16.0, "-", [220, 220, 225]);
+                // 加号
+                fill_rect(&mut buf, w, h, plus.0, plus.1, plus.2 as u32, plus.3 as u32, [55, 55, 65, 255]);
+                self.draw_text_w(&mut buf, w, h, plus.0 + 8, plus.1 + 18, 16.0, "+", [220, 220, 225]);
+                // 值框
+                fill_rect(&mut buf, w, h, value.0, value.1, value.2 as u32, value.3 as u32, [20, 20, 26, 255]);
+                fill_rect(&mut buf, w, h, value.0, value.1, value.2 as u32, 1, [70, 70, 80, 255]);
+                fill_rect(&mut buf, w, h, value.0, value.1 + value.3 - 1, value.2 as u32, 1, [70, 70, 80, 255]);
+                fill_rect(&mut buf, w, h, value.0, value.1, 1, value.3 as u32, [70, 70, 80, 255]);
+                fill_rect(&mut buf, w, h, value.0 + value.2 - 1, value.1, 1, value.3 as u32, [70, 70, 80, 255]);
+                let shown = if *f == ConfigField::DeviceName && self.config_editing_name {
+                    format!("{}_", self.config_text)
+                } else {
+                    self.field_value(*f)
+                };
+                let vcol = if *f == ConfigField::DeviceName && self.config_editing_name {
+                    [255, 220, 120]
+                } else {
+                    [210, 210, 216]
+                };
+                self.draw_text_w(&mut buf, w, h, value.0 + 8, value.1 + 18, 13.0, &shown, vcol);
+            }
+
+            // 底部按钮
+            let btn_labels = ["保存", "取消", "默认"];
+            for (i, b) in geo.buttons.iter().enumerate() {
+                fill_rect(&mut buf, w, h, b.0, b.1, b.2 as u32, b.3 as u32, [55, 55, 68, 255]);
+                self.draw_text_w(&mut buf, w, h, b.0 + 42, b.1 + 19, 14.0, btn_labels[i], [225, 225, 230]);
+            }
+
+            if let Some(t) = &mut self.overlay_texture {
+                map_sdl(t.update(None, &buf, (w * 4) as usize), "config update")?;
+                map_sdl(self.canvas.copy(t, None, Some(Rect::new(wx, wy, w, h))), "config copy")?;
+            }
+            Ok(())
         }
 
         // ---- 渲染 ----
@@ -1195,6 +1852,14 @@ mod player {
                 )?;
             }
 
+            // 覆盖层: 右键菜单 / 配置窗体 (须在 present 之前 copy)
+            if self.context_menu.is_some() {
+                let _ = self.draw_context_menu();
+            }
+            if self.config.is_some() {
+                let _ = self.draw_config();
+            }
+
             self.canvas.present();
             self.last_present = Instant::now();
 
@@ -1319,7 +1984,7 @@ mod player {
             for ch in text.chars() {
                 let key = (ch, px as u32);
                 if !self.glyph_cache.contains_key(&key) {
-                    let g = self.font.rasterize(ch, px);
+                    let g = self.rasterize_glyph(ch, px);
                     self.glyph_cache.insert(key, g);
                 }
                 let (m, bitmap) = self.glyph_cache.get(&key).unwrap();
@@ -1480,9 +2145,6 @@ struct ViewerConfig {
     /// 设备列表 (新格式): 多个 DeviceCam PeerId, GUI 设备管理面板可增删
     #[serde(default)]
     cameras: Vec<String>,
-    /// 单设备 PeerId (旧格式, 向后兼容, 解析时合并到 cameras)
-    #[serde(default)]
-    camera: String,
     /// 视频流类型: "main" | "sub" | "third" (默认 main)
     #[serde(default = "default_stream")]
     stream: String,
@@ -1511,7 +2173,6 @@ impl Default for ViewerConfig {
             relay: String::new(),
             enable_mdns: default_enable_mdns(),
             cameras: Vec::new(),
-            camera: String::new(),
             stream: default_stream(),
             output: None,
             no_audio: false,
@@ -1549,8 +2210,7 @@ impl ViewerConfig {
     /// 注意: toml 序列化会丢失原文件中的注释
     #[cfg_attr(not(feature = "player"), allow(dead_code))]
     fn save(&self, path: &PathBuf) -> anyhow::Result<()> {
-        let mut c = self.clone();
-        c.camera = String::new(); // 旧格式字段已迁移到 cameras
+        let c = self.clone();
         let content = toml::to_string_pretty(&c)
             .map_err(|e| anyhow::anyhow!("Failed to serialize config: {e}"))?;
         std::fs::write(path, content)
@@ -1569,19 +2229,8 @@ impl ViewerConfig {
         }
     }
 
-    /// 解析设备列表: 旧格式 camera 字段合并进 cameras (去重, 置于列表首位)
-    fn resolve_cameras(&mut self) {
-        if !self.camera.is_empty() && !self.cameras.contains(&self.camera) {
-            self.cameras.insert(0, self.camera.clone());
-        }
-    }
-
-    /// headless 模式使用的单设备: 优先旧格式 camera 字段, 否则 cameras 列表第一个
+    /// headless 模式使用的单设备: cameras 列表第一个
     fn primary_camera(&self) -> Option<&str> {
-        if !self.camera.is_empty() {
-            Some(&self.camera)
-        } else {
-            self.cameras.first().map(|s| s.as_str())
-        }
+        self.cameras.first().map(|s| s.as_str())
     }
 }
