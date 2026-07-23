@@ -25,6 +25,7 @@
 
 #include "rk_mpi_sys.h"
 #include "rk_mpi_vi.h"
+#include "rk_mpi_vo.h"
 #include "rk_mpi_venc.h"
 #include "rk_mpi_vpss.h"
 #include "rk_mpi_mb.h"
@@ -88,6 +89,14 @@ static int g_fb_bpp = 16;
 static uint8_t *g_fb_work_buf = NULL;
 static pthread_t g_lcd_thread = 0;
 
+// LCD NV12→BGRA 一律走软件路径 (nv12_to_bgra_sw)。
+// 【为何不用 RGA 硬件 CSC】librga 在同一进程内是单例上下文 (RockchipRga)，
+// 而 SDK 的 VPSS/VENC 内部已在用同一个 RGA 单例做编码缩放。若我们在 LCD 线程
+// 另起 c_RkRgaInit/Alloc/Blit，两个使用者并发操作同一 RGA 上下文会破坏其内部
+// dma_buf/fd 记账表，导致 SDK 编码任务拿到失效 dst fd → dma_buf_get 失败 →
+// 失败清理路径过度释放物理页 (mapcount:-128 use-after-free) → 污染页分配器 →
+// 随机 kernel panic (实测崩在网络栈 kfree/arp, dst=960x540 正是 VENC chn2)。
+// 结论: 进程内只能有一个 RGA 使用者 (SDK 自己)，LCD 保持纯软件转换。
 
 // MPP 系统引用计数 (与 audio 共享)
 static volatile int g_sys_init_count = 0;
@@ -776,7 +785,152 @@ static void lcd_v4l2_deinit(int fd) {
     close(fd);
 }
 
-// LCD 显示线程: V4L2(selfpath) DQBUF → 软件 NV12→BGRA → memcpy(fb0)
+// ---- LCD 显示后端 B: VO 模块 (VOP 硬件 CSC, 零 CPU 转换) ----
+// 官方示例参考:
+//   RV1106_Linux_SDK/media/samples/simple_test/simple_vi_get_frame_send_vo_rv1106.c
+// 管线: VI selfpath(chn1) --RK_MPI_VI_GetChnFrame--> RK_MPI_VO_SendFrame --> VOP(显示控制器)
+// VOP 硬件完成 NV12→RGB CSC + 缩放, 完全不占 CPU, 也不碰 RGA 单例
+// (RGA 仅由 MPP/SDK 内部在 VPSS/VENC/VO 复用同一个上下文, 无第二使用者, 见文件顶部说明)。
+// 与旧 "fb" 后端(软件 NV12→BGRA ~60% CPU)互斥: 二者都吃 ISP selfpath 资源,
+// 故由 env LCD_BACKEND 二选一, 启动时定一次 (默认 "vo")。
+static int g_lcd_use_vo = 0;
+static int g_lcd_vo_layer = 0;
+static int g_lcd_vo_dev   = 0;
+static int g_lcd_vo_chn   = 0;
+static int g_lcd_vi_selfpath_chn = 1;  // 1 = rkisp_selfpath (0=mainpath 已绑 VPSS)
+
+static int lcd_vo_init(void) {
+    int ret;
+    // 1) 创建 selfpath VI 通道 (与 mainpath chn0 并存, 独立 GetChnFrame)
+    VI_CHN_ATTR_S vi_attr;
+    memset(&vi_attr, 0, sizeof(vi_attr));
+    vi_attr.stIspOpt.u32BufCount = 3;
+    vi_attr.stIspOpt.enMemoryType = VI_V4L2_MEMORY_TYPE_DMABUF;
+    vi_attr.stSize.u32Width  = (uint32_t)g_lcd_width;
+    vi_attr.stSize.u32Height = (uint32_t)g_lcd_height;
+    vi_attr.enPixelFormat = RK_FMT_YUV420SP;
+    vi_attr.enCompressMode = COMPRESS_MODE_NONE;
+    vi_attr.u32Depth = 2;  // 必须 < u32BufCount, 否则 GetChnFrame 失败
+    ret = RK_MPI_VI_SetChnAttr(VI_DEV_ID, g_lcd_vi_selfpath_chn, &vi_attr);
+    if (ret != RK_SUCCESS) {
+        printf("[rk_camera] LCD VO: VI SetChnAttr(selfpath) failed %x\n", ret);
+        return -1;
+    }
+    ret = RK_MPI_VI_EnableChn(VI_DEV_ID, g_lcd_vi_selfpath_chn);
+    if (ret != RK_SUCCESS) {
+        printf("[rk_camera] LCD VO: VI EnableChn(selfpath) failed %x\n", ret);
+        return -1;
+    }
+
+    // 2) VO 初始化 (顺序严格参照官方示例)
+    VO_PUB_ATTR_S         pub;
+    VO_VIDEO_LAYER_ATTR_S layer;
+    VO_CHN_ATTR_S         chn;
+    memset(&pub, 0, sizeof(pub));
+    memset(&layer, 0, sizeof(layer));
+    memset(&chn, 0, sizeof(chn));
+
+    ret = RK_MPI_VO_BindLayer(g_lcd_vo_layer, g_lcd_vo_dev, VO_LAYER_MODE_GRAPHIC);
+    if (ret != RK_SUCCESS) {
+        printf("[rk_camera] LCD VO: BindLayer failed %x\n", ret);
+        goto fail_vi;
+    }
+    pub.enIntfType = VO_INTF_DEFAULT;
+    pub.enIntfSync = VO_OUTPUT_DEFAULT;
+    ret = RK_MPI_VO_SetPubAttr(g_lcd_vo_dev, &pub);
+    if (ret != RK_SUCCESS) { printf("[rk_camera] LCD VO: SetPubAttr failed %x\n", ret); goto fail_vo; }
+    ret = RK_MPI_VO_Enable(g_lcd_vo_dev);
+    if (ret != RK_SUCCESS) { printf("[rk_camera] LCD VO: Enable failed %x\n", ret); goto fail_vo; }
+
+    layer.enPixFormat      = RK_FMT_RGB888;
+    layer.enCompressMode   = COMPRESS_AFBC_16x16;
+    layer.stDispRect.s32X  = 0;
+    layer.stDispRect.s32Y  = 0;
+    layer.stDispRect.u32Width  = (uint32_t)g_lcd_width;
+    layer.stDispRect.u32Height = (uint32_t)g_lcd_height;
+    layer.stImageSize.u32Width  = (uint32_t)g_lcd_width;
+    layer.stImageSize.u32Height = (uint32_t)g_lcd_height;
+    layer.u32DispFrmRt = 25;
+    ret = RK_MPI_VO_SetLayerAttr(g_lcd_vo_layer, &layer);
+    if (ret != RK_SUCCESS) { printf("[rk_camera] LCD VO: SetLayerAttr failed %x\n", ret); goto fail_vo; }
+    RK_MPI_VO_SetLayerSpliceMode(g_lcd_vo_layer, VO_SPLICE_MODE_RGA);
+    ret = RK_MPI_VO_EnableLayer(g_lcd_vo_layer);
+    if (ret != RK_SUCCESS) { printf("[rk_camera] LCD VO: EnableLayer failed %x\n", ret); goto fail_vo; }
+
+    chn.stRect.s32X = 0;
+    chn.stRect.s32Y = 0;
+    chn.stRect.u32Width  = (uint32_t)g_lcd_width;
+    chn.stRect.u32Height = (uint32_t)g_lcd_height;
+    chn.u32FgAlpha = 255;
+    chn.u32BgAlpha = 0;
+    chn.enMirror = MIRROR_NONE;
+    chn.enRotation = ROTATION_0;
+    chn.u32Priority = 1;
+    ret = RK_MPI_VO_SetChnAttr(g_lcd_vo_layer, g_lcd_vo_chn, &chn);
+    if (ret != RK_SUCCESS) { printf("[rk_camera] LCD VO: SetChnAttr failed %x\n", ret); goto fail_vo; }
+    ret = RK_MPI_VO_EnableChn(g_lcd_vo_layer, g_lcd_vo_chn);
+    if (ret != RK_SUCCESS) { printf("[rk_camera] LCD VO: EnableChn failed %x\n", ret); goto fail_vo; }
+
+    printf("[rk_camera] LCD VO initialized (VOP hardware CSC, %dx%d)\n",
+           g_lcd_width, g_lcd_height);
+    return 0;
+
+fail_vo:
+    RK_MPI_VO_DisableChn(g_lcd_vo_layer, g_lcd_vo_chn);
+    RK_MPI_VO_DisableLayer(g_lcd_vo_layer);
+    RK_MPI_VO_Disable(g_lcd_vo_dev);
+    RK_MPI_VO_UnBindLayer(g_lcd_vo_layer, g_lcd_vo_dev);
+fail_vi:
+    RK_MPI_VI_DisableChn(VI_DEV_ID, g_lcd_vi_selfpath_chn);
+    return -1;
+}
+
+static void lcd_vo_deinit(void) {
+    RK_MPI_VO_DisableChn(g_lcd_vo_layer, g_lcd_vo_chn);
+    RK_MPI_VO_DisableLayer(g_lcd_vo_layer);
+    RK_MPI_VO_Disable(g_lcd_vo_dev);
+    RK_MPI_VO_UnBindLayer(g_lcd_vo_layer, g_lcd_vo_dev);
+    RK_MPI_VO_CloseFd();
+    RK_MPI_VI_DisableChn(VI_DEV_ID, g_lcd_vi_selfpath_chn);
+    printf("[rk_camera] LCD VO deinitialized\n");
+}
+
+static void *lcd_vo_thread(void *arg) {
+    (void)arg;
+    printf("[rk_camera] LCD VO thread started (VI selfpath -> VO)\n");
+    VIDEO_FRAME_INFO_S frame;
+    long long frames = 0;
+    long long start_us = 0;
+    while (!g_quit) {
+        int ret = RK_MPI_VI_GetChnFrame(VI_DEV_ID, g_lcd_vi_selfpath_chn, &frame, 1000);
+        if (ret != RK_SUCCESS) {
+            // 超时或暂无可取帧: 继续, 不阻塞编码管线
+            continue;
+        }
+        // VOP 硬件完成 CSC+缩放, 应用侧零 CPU 转换
+        RK_MPI_VO_SendFrame(g_lcd_vo_layer, g_lcd_vo_chn, &frame, -1);
+        RK_MPI_VI_ReleaseChnFrame(VI_DEV_ID, g_lcd_vi_selfpath_chn, &frame);
+
+        frames++;
+        if (start_us == 0) {
+            struct timeval tv; gettimeofday(&tv, NULL);
+            start_us = (long long)tv.tv_sec * 1000000 + tv.tv_usec;
+        } else {
+            struct timeval tv; gettimeofday(&tv, NULL);
+            long long now = (long long)tv.tv_sec * 1000000 + tv.tv_usec;
+            if (now - start_us >= 5000000) {
+                double fps = frames / ((now - start_us) / 1000000.0);
+                printf("[rk_camera][LCD_STAT] VO: fps=%.1f (VOP hardware CSC, ~0 CPU)\n", fps);
+                fflush(stdout);
+                start_us = now; frames = 0;
+            }
+        }
+    }
+    printf("[rk_camera] LCD VO thread stopped\n");
+    return NULL;
+}
+
+// LCD 显示线程(fb 后端): V4L2(selfpath) DQBUF → 软件 NV12→BGRA → memcpy(fb0)
 // 架构性代价: selfpath 内部缓冲比 mainpath(编码源) 多 1~2 帧, 故 LCD 预览延时
 // 通常略大于网络流。已用 BUF_CNT=2 + 实时线程优先级压到最低。
 static void *lcd_display_thread(void *arg) {
@@ -809,6 +963,15 @@ static void *lcd_display_thread(void *arg) {
     int output_w = g_lcd_width;
     int output_h = g_lcd_height;
     int pixel_size = g_fb_bpp / 8;
+
+    // [TEST] 屏蔽软件 NV12→BGRA: 仅维持 V4L2 取流循环, 跳过转换+写 fb,
+    // 用于测量其余管线(编码/推流)的 CPU 基线。env LCD_SKIP_CONVERT=1 开启。
+    int skip_convert = (getenv("LCD_SKIP_CONVERT") != NULL);
+    if (skip_convert)
+        printf("[rk_camera][TEST] LCD NV12→BGRA SKIPPED (env LCD_SKIP_CONVERT=1)\n");
+
+    // NV12→BGRA 一律走软件路径 (见文件顶部说明: 进程内不能有第二个 RGA 使用者,
+    // 否则与 SDK 内部 VPSS/VENC 的 RGA 单例冲突, 破坏 dma_buf 记账 → kernel panic)。
 
     // --- 5 秒统计: 量化 LCD 预览延时 ---
     // 关键拆分: 每帧循环 = (1) DQBUF 阻塞等待 selfpath 投递一帧 (wait)
@@ -864,13 +1027,15 @@ static void *lcd_display_thread(void *arg) {
             continue;
         }
 
-        // 软件 NV12→BGRA (安全, 无硬件 DMA; 含 1:1/缩放, 静态列映射无每帧分配)
-        nv12_to_bgra_sw((const uint8_t *)data, v4l2_w, v4l2_h, v4l2_stride,
-                        g_fb_work_buf, output_w, output_h);
-
         size_t copy_size = (size_t)output_w * output_h * pixel_size;
-        if (copy_size <= g_fb_size) {
-            memcpy(g_framebuffer, g_fb_work_buf, copy_size);
+
+        // NV12→BGRA: 纯软件转换 (进程内不能起第二个 RGA 使用者, 见文件顶部说明)
+        // [TEST] skip_convert=1 时跳过转换+写 fb, 仅维持取流循环测 CPU 基线
+        if (!skip_convert) {
+            nv12_to_bgra_sw((const uint8_t *)data, v4l2_w, v4l2_h, v4l2_stride,
+                            g_fb_work_buf, output_w, output_h);
+            if (copy_size <= g_fb_size)
+                memcpy(g_framebuffer, g_fb_work_buf, copy_size);
         }
 
         ioctl(v4l2_fd, VIDIOC_QBUF, &buf);
@@ -1026,14 +1191,36 @@ int rk_camera_init(int main_w, int main_h, int fps, int bitrate, int sensor_fps)
         if (ret != 0) return -1;
     }
 
-    // 5. LCD 显示线程 — ISP selfpath V4L2 (RV1106 单 VPSS Group 约束, 不能走 VPSS 通道)
+    // 5. LCD 显示后端 — env LCD_BACKEND 二选一 (默认 "vo" = VOP 硬件 CSC, 零 CPU):
+    //   "vo": VI selfpath -> RK_MPI_VO_SendFrame (VOP 硬件做 CSC+缩放, 不碰 RGA)
+    //   "fb": 旧路径, ISP selfpath V4L2 -> 软件 NV12→BGRA -> /dev/fb0 (~60% CPU)
     if (g_fb_enabled) {
-        ret = pthread_create(&g_lcd_thread, NULL, lcd_display_thread, NULL);
-        if (ret != 0) {
-            printf("[rk_camera] WARN: LCD thread create failed\n");
-            g_fb_enabled = 0;
+        const char *backend = getenv("LCD_BACKEND");
+        int use_vo = (backend == NULL) || (strcmp(backend, "vo") == 0);
+        if (use_vo) {
+            if (lcd_vo_init() == 0) {
+                g_lcd_use_vo = 1;
+                ret = pthread_create(&g_lcd_thread, NULL, lcd_vo_thread, NULL);
+                if (ret != 0) {
+                    printf("[rk_camera] WARN: LCD VO thread create failed\n");
+                    lcd_vo_deinit();
+                    g_lcd_use_vo = 0;
+                    g_fb_enabled = 0;
+                } else {
+                    printf("[rk_camera] LCD display thread created (VO hardware CSC)\n");
+                }
+            } else {
+                printf("[rk_camera] LCD VO init failed; set LCD_BACKEND=fb for software path, LCD disabled\n");
+                g_fb_enabled = 0;
+            }
         } else {
-            printf("[rk_camera] LCD display thread created (selfpath V4L2)\n");
+            ret = pthread_create(&g_lcd_thread, NULL, lcd_display_thread, NULL);
+            if (ret != 0) {
+                printf("[rk_camera] WARN: LCD thread create failed\n");
+                g_fb_enabled = 0;
+            } else {
+                printf("[rk_camera] LCD display thread created (selfpath V4L2)\n");
+            }
         }
     }
 
@@ -1147,6 +1334,11 @@ void rk_camera_deinit() {
     if (g_fb_enabled && g_lcd_thread) {
         pthread_join(g_lcd_thread, NULL);
         g_lcd_thread = 0;
+    }
+    // VO 后端清理 (selfpath VI 通道 + VO 模块)
+    if (g_lcd_use_vo) {
+        lcd_vo_deinit();
+        g_lcd_use_vo = 0;
     }
 
     // 解绑: VENC ← VPSS ← VI
