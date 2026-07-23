@@ -1074,6 +1074,21 @@ impl MediaPlayer {
     ) -> Result<proto::control::ControlResponse> {
         use proto::control::{encode_request, read_frame, write_frame};
 
+        // 若控制流断开, 下次请求时尝试重新打开 (满足 spec §5.1.3)
+        if self.control_stream.is_none() {
+            let device_cam = match self.device_cam_peer_id {
+                Some(id) => id,
+                None => return Err(anyhow::anyhow!("not connected to device-cam")),
+            };
+            match self.stream_control.open_stream(device_cam, stream_protocols::CONTROL_PROTOCOL).await {
+                Ok(s) => {
+                    println!("[Viewer] Control stream reopened on demand");
+                    self.control_stream = Some(s);
+                }
+                Err(e) => return Err(anyhow::anyhow!("control stream not ready: {e}")),
+            }
+        }
+
         let stream = self.control_stream.as_mut()
             .ok_or_else(|| anyhow::anyhow!("control stream not ready"))?;
 

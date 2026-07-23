@@ -157,8 +157,11 @@ fn validate_encoder_config(config: &EncoderConfig) -> Result<(), String> {
     if config.dst_frame_rate_num == 0 || config.dst_frame_rate_num > 30 {
         return Err(format!("dst_frame_rate_num {} out of range 1-30", config.dst_frame_rate_num));
     }
-    if config.gop == 0 || config.gop > 300 {
-        return Err(format!("gop {} out of range 1-300", config.gop));
+    if config.dst_frame_rate_den == 0 {
+        return Err("dst_frame_rate_den must be positive".to_string());
+    }
+    if config.gop == 0 || config.gop > 400 {
+        return Err(format!("gop {} out of range 1-400", config.gop));
     }
     match config.output_data_type.as_str() {
         "H.264" | "H.265" => {}
@@ -167,6 +170,26 @@ fn validate_encoder_config(config: &EncoderConfig) -> Result<(), String> {
     match config.rc_mode.as_str() {
         "CBR" | "VBR" => {}
         _ => return Err(format!("invalid rc_mode: {}", config.rc_mode)),
+    }
+    match config.rc_quality.as_str() {
+        "lowest" | "lower" | "low" | "medium" | "high" | "higher" | "highest" => {}
+        _ => return Err(format!("invalid rc_quality: {}", config.rc_quality)),
+    }
+    match config.gop_mode.as_str() {
+        "normalP" | "smartP" => {}
+        _ => return Err(format!("invalid gop_mode: {}", config.gop_mode)),
+    }
+    match config.h264_profile.as_str() {
+        "high" | "main" | "baseline" => {}
+        _ => return Err(format!("invalid h264_profile: {}", config.h264_profile)),
+    }
+    match config.smart.as_str() {
+        "open" | "close" => {}
+        _ => return Err(format!("invalid smart: {}", config.smart)),
+    }
+    match config.rotation {
+        0 | 90 | 180 | 270 => {}
+        _ => return Err(format!("invalid rotation: {}", config.rotation)),
     }
     Ok(())
 }

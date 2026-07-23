@@ -51,6 +51,10 @@ static int get_profile(const char *p_str);
 static int get_gop_mode(const char *g_str);
 static int get_mirror(const char *m_str);
 
+// ---- 前向声明: 控制通道持久化恢复接口 ----
+int rk_isp_set_from_ini(int cam_id);
+static void rk_video_set_from_ini(void);
+
 // ---- 常量定义 ----
 
 #define VI_DEV_ID           0
@@ -731,6 +735,9 @@ int rk_camera_init(int main_w, int main_h, int fps, int bitrate, int sensor_fps)
         return -1;
     }
 
+    // 从 INI 恢复上次持久化的 encoder 参数 (控制通道 set 时写入)
+    rk_video_set_from_ini();
+
     // 4. 初始化已启用的 VENC 通道并绑定 (从 g_chn_attr 读取全部参数)
     int venc_chns[] = {VENC_CHN_MAIN, VENC_CHN_SUB, VENC_CHN_THIRD};
     int vpss_chns[] = {VPSS_CHN_MAIN, VPSS_CHN_SUB, VPSS_CHN_THIRD};
@@ -803,6 +810,9 @@ int rk_camera_init(int main_w, int main_h, int fps, int bitrate, int sensor_fps)
             g_fb_enabled = 0;
         }
     }
+
+    // 从 INI 恢复上次持久化的 ISP 图像参数 (控制通道 set 时写入)
+    rk_isp_set_from_ini(0);
 
     g_initialized = 1;
     printf("[rk_camera] initialized, %d stream threads started%s\n",
@@ -898,6 +908,197 @@ int rk_camera_request_idr_all() {
         }
     }
     return ret;
+}
+
+// 热更新单个编码通道参数 (对标 rkipc video.c 运行时改参)
+// 内部: StopRecvFrame; 若分辨率/codec 变更则 DestroyChn+venc_init_single 重建,
+//       否则 GetChnAttr+SetChnAttr 改码率/GOP/帧率; 最后 StartRecvFrame 恢复取流。
+// SDK 约束 (mpi.txt): RK_MPI_VENC_StartRecvFrame 之后成员不可改, 必须先 StopRecvFrame 才能 SetChnAttr。
+// 短暂停顿(丢若干帧)。参数中 NULL/<0 表示沿用当前 g_chn_attr 中的值。
+int rk_camera_update_chn_config(int chn_id,
+                                const char *codec,
+                                int width, int height,
+                                int dst_fps_num, int dst_fps_den,
+                                int bitrate_kbps,
+                                const char *rc_mode,
+                                const char *rc_quality,
+                                int gop,
+                                const char *gop_mode,
+                                const char *h264_profile) {
+    if (chn_id < 0 || chn_id >= VENC_MAX_CHN) return -1;
+    if (!g_chn_enabled[chn_id]) return -1;
+
+    ChnEncAttr *old = &g_chn_attr[chn_id];
+    int sensor_fps = g_sensor_fps > 0 ? g_sensor_fps : 30;
+
+    int new_codec = (codec && codec[0]) ? get_codec_type(codec) : old->codec;
+    int new_w = width > 0 ? width : old->width;
+    int new_h = height > 0 ? height : old->height;
+    int new_dst_num = dst_fps_num > 0 ? dst_fps_num : old->dst_fps_num;
+    int new_dst_den = dst_fps_den > 0 ? dst_fps_den : old->dst_fps_den;
+    int new_br = bitrate_kbps > 0 ? bitrate_kbps : old->bitrate_kbps;
+    int new_rc_mode = (rc_mode && rc_mode[0]) ? get_rc_mode(rc_mode, new_codec) : old->rc_mode;
+    int new_rc_quality = (rc_quality && rc_quality[0]) ? get_rc_quality(rc_quality) : old->rc_quality;
+    int new_gop = gop > 0 ? gop : old->gop;
+    int new_gop_mode = (gop_mode && gop_mode[0]) ? get_gop_mode(gop_mode) : old->gop_mode;
+    int new_profile = (h264_profile && h264_profile[0]) ? get_profile(h264_profile) : old->profile;
+    if (new_codec != RK_VIDEO_ID_AVC) new_profile = 0;
+
+    // 沿用当前未暴露字段 (mirror/smartp_viridrlen/stream_buf_cnt)
+    int new_smartp = old->smartp_viridrlen;
+    int new_stream_buf = old->stream_buf_cnt > 0 ? old->stream_buf_cnt : 2;
+    int new_mirror = old->mirror;
+
+    int need_rebuild = (new_codec != old->codec) || (new_w != old->width) || (new_h != old->height);
+
+    // 写回全局记录
+    old->codec = new_codec;
+    old->width = new_w;
+    old->height = new_h;
+    old->dst_fps_num = new_dst_num;
+    old->dst_fps_den = new_dst_den;
+    old->bitrate_kbps = new_br;
+    old->rc_mode = new_rc_mode;
+    old->rc_quality = new_rc_quality;
+    old->gop = new_gop;
+    old->gop_mode = new_gop_mode;
+    old->profile = new_profile;
+    old->smartp_viridrlen = new_smartp;
+    old->stream_buf_cnt = new_stream_buf;
+    old->mirror = new_mirror;
+
+    RK_MPI_VENC_StopRecvFrame(chn_id);
+
+    int ret = 0;
+    if (need_rebuild) {
+        RK_MPI_VENC_DestroyChn(chn_id);
+        ret = venc_init_single(chn_id, new_w, new_h, new_dst_num, new_dst_den, sensor_fps,
+                               new_br, new_gop, new_codec, new_rc_mode, new_rc_quality,
+                               new_profile, new_gop_mode, new_mirror, new_smartp, new_stream_buf);
+        printf("[rk_camera] chn[%d] hot-updated (rebuilt): %dx%d @%d/%dfps %dkbps gop=%d rc=%s q=%d\n",
+               chn_id, new_w, new_h, new_dst_num, new_dst_den, new_br, new_gop,
+               rc_mode ? rc_mode : "-", new_rc_quality);
+        return ret;
+    }
+
+    // 非重建: GetChnAttr + SetChnAttr 热改码率/GOP/帧率 (StartRecvFrame 之后成员已锁定)
+    VENC_CHN_ATTR_S stAttr;
+    memset(&stAttr, 0, sizeof(stAttr));
+    if (RK_MPI_VENC_GetChnAttr(chn_id, &stAttr) == RK_SUCCESS) {
+        VENC_RC_ATTR_S *pRcAttr = &stAttr.stRcAttr;
+        int is_vbr = (new_rc_mode == VENC_RC_MODE_H264VBR || new_rc_mode == VENC_RC_MODE_H265VBR);
+        int venc_src_num = (sensor_fps > 0) ? sensor_fps : new_dst_num;
+        int venc_src_den = 1;
+        int venc_dst_num = new_dst_num;
+        int venc_dst_den = (new_dst_den > 0) ? new_dst_den : 1;
+        pRcAttr->enRcMode = new_rc_mode;
+        if (new_codec == RK_VIDEO_ID_AVC) {
+            pRcAttr->stH264Cbr.u32Gop = new_gop;
+            pRcAttr->stH264Cbr.u32SrcFrameRateNum = venc_src_num;
+            pRcAttr->stH264Cbr.u32SrcFrameRateDen = venc_src_den;
+            pRcAttr->stH264Cbr.fr32DstFrameRateNum = venc_dst_num;
+            pRcAttr->stH264Cbr.fr32DstFrameRateDen = venc_dst_den;
+            if (is_vbr) {
+                pRcAttr->stH264Vbr.u32BitRate = new_br;
+                pRcAttr->stH264Vbr.u32MaxBitRate = new_br * 3 / 2;
+                pRcAttr->stH264Vbr.u32MinBitRate = new_br / 2;
+            } else {
+                pRcAttr->stH264Cbr.u32BitRate = new_br;
+            }
+        } else {
+            pRcAttr->stH265Cbr.u32Gop = new_gop;
+            pRcAttr->stH265Cbr.u32SrcFrameRateNum = venc_src_num;
+            pRcAttr->stH265Cbr.u32SrcFrameRateDen = venc_src_den;
+            pRcAttr->stH265Cbr.fr32DstFrameRateNum = venc_dst_num;
+            pRcAttr->stH265Cbr.fr32DstFrameRateDen = venc_dst_den;
+            if (is_vbr) {
+                pRcAttr->stH265Vbr.u32BitRate = new_br;
+                pRcAttr->stH265Vbr.u32MaxBitRate = new_br * 3 / 2;
+                pRcAttr->stH265Vbr.u32MinBitRate = new_br / 2;
+            } else {
+                pRcAttr->stH265Cbr.u32BitRate = new_br;
+            }
+        }
+        stAttr.stGopAttr.enGopMode = new_gop_mode;
+        stAttr.stGopAttr.s32VirIdrLen = new_smartp;
+
+        if (RK_MPI_VENC_SetChnAttr(chn_id, &stAttr) == RK_SUCCESS) {
+            // rc_quality 为动态属性, 可独立 SetRcParam
+            if (new_rc_quality >= 0) {
+                VENC_RC_PARAM_S rc_param;
+                memset(&rc_param, 0, sizeof(rc_param));
+                RK_MPI_VENC_GetRcParam(chn_id, &rc_param);
+                int min_qp = 40 - new_rc_quality * 5;
+                if (new_codec == RK_VIDEO_ID_AVC) rc_param.stParamH264.u32MinQp = min_qp;
+                else rc_param.stParamH265.u32MinQp = min_qp;
+                RK_MPI_VENC_SetRcParam(chn_id, &rc_param);
+            }
+            VENC_RECV_PIC_PARAM_S stRecvParam;
+            memset(&stRecvParam, 0, sizeof(stRecvParam));
+            stRecvParam.s32RecvPicNum = -1;
+            RK_MPI_VENC_StartRecvFrame(chn_id, &stRecvParam);
+            printf("[rk_camera] chn[%d] hot-updated (no rebuild): %dx%d @%d/%dfps %dkbps gop=%d rc=%s q=%d\n",
+                   chn_id, new_w, new_h, new_dst_num, new_dst_den, new_br, new_gop,
+                   rc_mode ? rc_mode : "-", new_rc_quality);
+            return 0;
+        }
+    }
+
+    // 回退: SetChnAttr 失败, 重建通道
+    RK_MPI_VENC_DestroyChn(chn_id);
+    ret = venc_init_single(chn_id, new_w, new_h, new_dst_num, new_dst_den, sensor_fps,
+                           new_br, new_gop, new_codec, new_rc_mode, new_rc_quality,
+                           new_profile, new_gop_mode, new_mirror, new_smartp, new_stream_buf);
+    printf("[rk_camera] chn[%d] hot-updated (rebuilt fallback): %dx%d @%d/%dfps %dkbps gop=%d rc=%s q=%d\n",
+           chn_id, new_w, new_h, new_dst_num, new_dst_den, new_br, new_gop,
+           rc_mode ? rc_mode : "-", new_rc_quality);
+    return ret;
+}
+
+// rk_param_* 定义在文件末尾, 此处前向声明供本函数调用 (避免隐式声明)
+int rk_param_get_int(const char *key, int default_value);
+char *rk_param_get_string(const char *key, const char *default_value);
+
+// 从 INI 恢复 encoder 参数 (对标 rkipc video.c rk_video_set_from_ini)
+// 在 VENC 初始化前调用, 用上次持久化的值覆盖 g_chn_attr。
+// 读取的 key 与 rk_video_source.rs::set_encoder_config 写入的 INI key 完全一致。
+static void rk_video_set_from_ini(void) {
+    const char *prefix[VENC_MAX_CHN] = {"video.0", "video.1", "video.2"};
+    char key[64];
+    int v;
+    const char *s;
+
+    for (int i = 0; i < VENC_MAX_CHN; i++) {
+        if (!g_chn_enabled[i]) continue;
+        ChnEncAttr *a = &g_chn_attr[i];
+
+        snprintf(key, sizeof(key), "%s.width", prefix[i]);
+        v = rk_param_get_int(key, -1); if (v > 0) a->width = v;
+        snprintf(key, sizeof(key), "%s.height", prefix[i]);
+        v = rk_param_get_int(key, -1); if (v > 0) a->height = v;
+        snprintf(key, sizeof(key), "%s.dst_frame_rate_num", prefix[i]);
+        v = rk_param_get_int(key, -1); if (v > 0) a->dst_fps_num = v;
+        snprintf(key, sizeof(key), "%s.dst_frame_rate_den", prefix[i]);
+        v = rk_param_get_int(key, -1); if (v > 0) a->dst_fps_den = v;
+        snprintf(key, sizeof(key), "%s.max_rate", prefix[i]);
+        v = rk_param_get_int(key, -1); if (v > 0) a->bitrate_kbps = v;
+        snprintf(key, sizeof(key), "%s.gop", prefix[i]);
+        v = rk_param_get_int(key, -1); if (v > 0) a->gop = v;
+
+        snprintf(key, sizeof(key), "%s.output_data_type", prefix[i]);
+        s = rk_param_get_string(key, ""); if (s && s[0]) a->codec = get_codec_type(s);
+        snprintf(key, sizeof(key), "%s.rc_mode", prefix[i]);
+        s = rk_param_get_string(key, ""); if (s && s[0]) a->rc_mode = get_rc_mode(s, a->codec);
+        snprintf(key, sizeof(key), "%s.rc_quality", prefix[i]);
+        s = rk_param_get_string(key, ""); if (s && s[0]) a->rc_quality = get_rc_quality(s);
+        snprintf(key, sizeof(key), "%s.gop_mode", prefix[i]);
+        s = rk_param_get_string(key, ""); if (s && s[0]) a->gop_mode = get_gop_mode(s);
+        snprintf(key, sizeof(key), "%s.h264_profile", prefix[i]);
+        s = rk_param_get_string(key, ""); if (s && s[0]) a->profile = (a->codec == RK_VIDEO_ID_AVC) ? get_profile(s) : 0;
+
+        printf("[rk_camera] chn[%d] restored from INI: %dx%d @%d/%dfps %dkbps gop=%d\n",
+               i, a->width, a->height, a->dst_fps_num, a->dst_fps_den, a->bitrate_kbps, a->gop);
+    }
 }
 
 // 反初始化

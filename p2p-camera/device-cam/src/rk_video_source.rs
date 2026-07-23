@@ -640,6 +640,20 @@ extern "C" {
     // 系统操作
     fn rk_system_reboot() -> std::ffi::c_int;
     fn rk_system_factory_reset() -> std::ffi::c_int;
+
+    // 编码参数热更新 (运行时改参, 对标 rkipc video.c)
+    fn rk_camera_update_chn_config(
+        chn_id: std::ffi::c_int,
+        codec: *const std::ffi::c_char,
+        width: std::ffi::c_int, height: std::ffi::c_int,
+        dst_fps_num: std::ffi::c_int, dst_fps_den: std::ffi::c_int,
+        bitrate_kbps: std::ffi::c_int,
+        rc_mode: *const std::ffi::c_char,
+        rc_quality: *const std::ffi::c_char,
+        gop: std::ffi::c_int,
+        gop_mode: *const std::ffi::c_char,
+        h264_profile: *const std::ffi::c_char,
+    ) -> std::ffi::c_int;
 }
 
 use proto::control::{EncoderConfig, ImageConfig, ImageAdjustment, SystemConfig, SystemConfigSet};
@@ -684,7 +698,7 @@ pub fn get_encoder_config(chn_id: u32) -> Option<EncoderConfig> {
         })
 }
 
-/// 设置编码参数 (写入 INI + 热改/重建)
+/// 设置编码参数 (写入 INI 持久化 + 热改实时生效)
 pub fn set_encoder_config(chn_id: u32, config: &EncoderConfig) -> anyhow::Result<()> {
     let stream_prefix = match chn_id {
         0 => "video.0",
@@ -693,27 +707,42 @@ pub fn set_encoder_config(chn_id: u32, config: &EncoderConfig) -> anyhow::Result
         _ => return Err(anyhow::anyhow!("invalid chn_id: {chn_id}")),
     };
 
-        // 写入 INI 持久化
-        param_set_string(&format!("{stream_prefix}.output_data_type"), &config.output_data_type);
-        param_set_int(&format!("{stream_prefix}.width"), config.width as i32);
-        param_set_int(&format!("{stream_prefix}.height"), config.height as i32);
-        param_set_string(&format!("{stream_prefix}.rc_mode"), &config.rc_mode);
-        param_set_string(&format!("{stream_prefix}.rc_quality"), &config.rc_quality);
-        param_set_int(&format!("{stream_prefix}.gop"), config.gop as i32);
-        param_set_string(&format!("{stream_prefix}.gop_mode"), &config.gop_mode);
-        param_set_int(&format!("{stream_prefix}.max_rate"), config.max_rate as i32);
-        param_set_int(&format!("{stream_prefix}.dst_frame_rate_num"), config.dst_frame_rate_num as i32);
-        param_set_int(&format!("{stream_prefix}.dst_frame_rate_den"), config.dst_frame_rate_den as i32);
-        param_set_string(&format!("{stream_prefix}.h264_profile"), &config.h264_profile);
-        param_set_string(&format!("{stream_prefix}.smart"), &config.smart);
-        param_set_int(&format!("{stream_prefix}.rotation"), config.rotation as i32);
+    // 1) 持久化到 INI (重启后由 rk_video_set_from_ini 恢复)
+    param_set_string(&format!("{stream_prefix}.output_data_type"), &config.output_data_type);
+    param_set_int(&format!("{stream_prefix}.width"), config.width as i32);
+    param_set_int(&format!("{stream_prefix}.height"), config.height as i32);
+    param_set_string(&format!("{stream_prefix}.rc_mode"), &config.rc_mode);
+    param_set_string(&format!("{stream_prefix}.rc_quality"), &config.rc_quality);
+    param_set_int(&format!("{stream_prefix}.gop"), config.gop as i32);
+    param_set_string(&format!("{stream_prefix}.gop_mode"), &config.gop_mode);
+    param_set_int(&format!("{stream_prefix}.max_rate"), config.max_rate as i32);
+    param_set_int(&format!("{stream_prefix}.dst_frame_rate_num"), config.dst_frame_rate_num as i32);
+    param_set_int(&format!("{stream_prefix}.dst_frame_rate_den"), config.dst_frame_rate_den as i32);
+    param_set_string(&format!("{stream_prefix}.h264_profile"), &config.h264_profile);
+    param_set_string(&format!("{stream_prefix}.smart"), &config.smart);
+    param_set_int(&format!("{stream_prefix}.rotation"), config.rotation as i32);
 
-        // TODO: 热改编码参数 — 需确认 RK MPI SDK 是否支持运行时修改
-        // 可选方案:
-        //   1. RK_MPI_VENC_SetChnAttr (热改码率/GOP/帧率, 不中断视频流)
-        //   2. rk_camera_deinit + rk_camera_init (重建编码器, 短暂中断视频流)
-        // 当前先仅持久化 INI, 编码参数在下次重启后生效
-        tracing::warn!("[RkVideoSource] Encoder config saved to INI, hot-update not yet implemented");
+    // 2) 热改: 实时生效 (仅 rv1106 且摄像头已初始化时)
+    #[cfg(feature = "rv1106")]
+    {
+        unsafe {
+            let codec_c = std::ffi::CString::new(config.output_data_type.as_str()).unwrap_or_default();
+            let rc_c = std::ffi::CString::new(config.rc_mode.as_str()).unwrap_or_default();
+            let q_c = std::ffi::CString::new(config.rc_quality.as_str()).unwrap_or_default();
+            let gm_c = std::ffi::CString::new(config.gop_mode.as_str()).unwrap_or_default();
+            let prof_c = std::ffi::CString::new(config.h264_profile.as_str()).unwrap_or_default();
+            rk_camera_update_chn_config(
+                chn_id as i32,
+                codec_c.as_ptr(),
+                config.width as i32, config.height as i32,
+                config.dst_frame_rate_num as i32, config.dst_frame_rate_den as i32,
+                config.max_rate as i32,
+                rc_c.as_ptr(), q_c.as_ptr(),
+                config.gop as i32,
+                gm_c.as_ptr(), prof_c.as_ptr(),
+            );
+        }
+    }
 
     Ok(())
 }
@@ -724,11 +753,11 @@ pub fn get_image_config(cam_id: u32) -> Option<ImageConfig> {
 
     unsafe {
         let adjustment = Some(ImageAdjustment {
-            contrast: rk_isp_get_contrast(cam),
-            brightness: rk_isp_get_brightness(cam),
-            saturation: rk_isp_get_saturation(cam),
-            sharpness: rk_isp_get_sharpness(cam),
-            hue: rk_isp_get_hue(cam),
+            contrast: Some(rk_isp_get_contrast(cam)),
+            brightness: Some(rk_isp_get_brightness(cam)),
+            saturation: Some(rk_isp_get_saturation(cam)),
+            sharpness: Some(rk_isp_get_sharpness(cam)),
+            hue: Some(rk_isp_get_hue(cam)),
         });
 
         Some(ImageConfig {
@@ -749,19 +778,26 @@ pub fn set_image_config(cam_id: u32, config: &ImageConfig) -> anyhow::Result<()>
 
     unsafe {
         if let Some(ref adj) = config.adjustment {
-            rk_isp_set_contrast(cam, adj.contrast);
-            rk_isp_set_brightness(cam, adj.brightness);
-            rk_isp_set_saturation(cam, adj.saturation);
-            rk_isp_set_sharpness(cam, adj.sharpness);
-            rk_isp_set_hue(cam, adj.hue);
-
-            // INI 持久化
-            let prefix = format!("isp.{}.adjustment", cam_id);
-            param_set_int(&format!("{prefix}.contrast"), adj.contrast);
-            param_set_int(&format!("{prefix}.brightness"), adj.brightness);
-            param_set_int(&format!("{prefix}.saturation"), adj.saturation);
-            param_set_int(&format!("{prefix}.sharpness"), adj.sharpness);
-            param_set_int(&format!("{prefix}.hue"), adj.hue);
+            if let Some(v) = adj.contrast {
+                if v < 0 || v > 100 { return Err(anyhow::anyhow!("contrast out of range 0-100: {v}")); }
+                rk_isp_set_contrast(cam, v);
+            }
+            if let Some(v) = adj.brightness {
+                if v < 0 || v > 100 { return Err(anyhow::anyhow!("brightness out of range 0-100: {v}")); }
+                rk_isp_set_brightness(cam, v);
+            }
+            if let Some(v) = adj.saturation {
+                if v < 0 || v > 100 { return Err(anyhow::anyhow!("saturation out of range 0-100: {v}")); }
+                rk_isp_set_saturation(cam, v);
+            }
+            if let Some(v) = adj.sharpness {
+                if v < 0 || v > 100 { return Err(anyhow::anyhow!("sharpness out of range 0-100: {v}")); }
+                rk_isp_set_sharpness(cam, v);
+            }
+            if let Some(v) = adj.hue {
+                if v < 0 || v > 100 { return Err(anyhow::anyhow!("hue out of range 0-100: {v}")); }
+                rk_isp_set_hue(cam, v);
+            }
         }
 
         // 其他子类别暂不实现

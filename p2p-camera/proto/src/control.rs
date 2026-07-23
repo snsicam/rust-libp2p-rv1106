@@ -119,13 +119,19 @@ pub struct ImageConfig {
 }
 
 /// 图像调整参数 (isp.{cam_id}.adjustment)
+/// 字段全部为 Option, 支持部分更新 (只传需要修改的字段)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageAdjustment {
-    pub contrast: i32,     // 0-100
-    pub brightness: i32,   // 0-100
-    pub saturation: i32,   // 0-100
-    pub sharpness: i32,    // 0-100
-    pub hue: i32,          // 0-100
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contrast: Option<i32>,     // 0-100
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub brightness: Option<i32>,   // 0-100
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub saturation: Option<i32>,   // 0-100
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sharpness: Option<i32>,    // 0-100
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hue: Option<i32>,          // 0-100
 }
 
 /// 曝光参数 (isp.{cam_id}.exposure)
