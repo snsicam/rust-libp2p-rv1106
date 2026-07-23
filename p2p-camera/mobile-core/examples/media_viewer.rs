@@ -514,6 +514,10 @@ mod player {
         /// 进入 waiting_for_keyframe 的时间，用于超时兜底（避免 cam 关键帧标记
         /// 异常时播放器门控永久不开 → 黑屏）
         waiting_since: Option<std::time::Instant>,
+        /// 显示屏可用区域最大尺寸，用于限制窗口初始尺寸不超过屏幕
+        display_max: (u32, u32),
+        /// 是否已根据视频分辨率设置过初始窗口尺寸（只在首帧设置一次，之后尊重用户拖动/最大化）
+        window_sized: bool,
     }
 
     impl VideoPlayer {
@@ -568,9 +572,20 @@ mod player {
             let sdl_context = map_sdl(sdl2::init(), "init")?;
             let video_subsystem = map_sdl(sdl_context.video(), "video")?;
 
+            // 显示屏可用区域(排除任务栏), 用于限制窗口初始及最大尺寸不超过屏幕
+            let display_max = video_subsystem
+                .display_usable_bounds(0)
+                .map(|r| (r.width(), r.height()))
+                .unwrap_or((1920, 1080));
+
+            // 初始窗口尺寸不超过屏幕可用区域
+            let init_w = 1280u32.min(display_max.0);
+            let init_h = 720u32.min(display_max.1);
+
             let window = video_subsystem
-                .window("P2P Camera Viewer", 1280, 720)
+                .window("P2P Camera Viewer", init_w, init_h)
                 .position_centered()
+                .resizable()
                 .build()
                 .map_err(|e| anyhow::anyhow!("SDL window: {e}"))?;
             let canvas = window
@@ -600,6 +615,8 @@ mod player {
                 // 置 true 与重连后 reset_decoder() 行为一致：丢弃一切直到真 IDR。
                 waiting_for_keyframe: true,
                 waiting_since: Some(std::time::Instant::now()),
+                display_max,
+                window_sized: false,
             })
         }
 
@@ -693,7 +710,24 @@ mod player {
                 let tex: sdl2::render::Texture<'static> =
                     unsafe { std::mem::transmute::<sdl2::render::Texture<'_>, sdl2::render::Texture<'static>>(tex) };
                 self.texture = Some(tex);
-                map_sdl(self.canvas.window_mut().set_size(w, h), "set_size")?;
+
+                // 仅在首次确定视频分辨率时设置一次窗口初始尺寸: 使用视频原始尺寸,
+                // 但等比缩小到不超过屏幕可用区域; 之后尊重用户的拖动/最大化, 不再强制改窗口大小
+                if !self.window_sized {
+                    let (max_w, max_h) = self.display_max;
+                    let scale = (max_w as f32 / w as f32)
+                        .min(max_h as f32 / h as f32)
+                        .min(1.0);
+                    let win_w = ((w as f32) * scale).round().max(1.0) as u32;
+                    let win_h = ((h as f32) * scale).round().max(1.0) as u32;
+                    let win = self.canvas.window_mut();
+                    let _ = win.set_size(win_w, win_h);
+                    win.set_position(
+                        sdl2::video::WindowPos::Centered,
+                        sdl2::video::WindowPos::Centered,
+                    );
+                    self.window_sized = true;
+                }
                 println!("[Player] Video: {w}x{h} ({:?})", frame.format());
             }
 
@@ -737,12 +771,26 @@ mod player {
                 }
             }
 
+            // 以黑色填充背景, 再把视频等比缩放居中绘制(letterbox), 随窗口大小/最大化自适应
+            self.canvas.set_draw_color(sdl2::pixels::Color::RGB(0, 0, 0));
             self.canvas.clear();
+
+            let (win_w, win_h) = self
+                .canvas
+                .output_size()
+                .map_err(|e| anyhow::anyhow!("SDL output_size: {e}"))?;
+            let scale = (win_w as f32 / self.width as f32)
+                .min(win_h as f32 / self.height as f32);
+            let dst_w = ((self.width as f32) * scale).round().max(1.0) as u32;
+            let dst_h = ((self.height as f32) * scale).round().max(1.0) as u32;
+            let dst_x = (win_w.saturating_sub(dst_w) / 2) as i32;
+            let dst_y = (win_h.saturating_sub(dst_h) / 2) as i32;
+
             map_sdl(
                 self.canvas.copy(
                     self.texture.as_ref().unwrap(),
                     None,
-                    Some(Rect::new(0, 0, self.width, self.height)),
+                    Some(Rect::new(dst_x, dst_y, dst_w, dst_h)),
                 ),
                 "copy",
             )?;
