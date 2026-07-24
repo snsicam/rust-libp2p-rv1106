@@ -39,6 +39,8 @@
 #include "rk_comm_aio.h"
 #include "RgaApi.h"
 
+#include "lcd_preview.h"   // LCD 预览模块 (抽取自原 lcd_vo_*)
+
 // ISP (rkaiq) 头文件
 #include "rk_aiq_user_api2_sysctl.h"
 #include "rk_aiq_user_api2_imgproc.h"
@@ -88,11 +90,8 @@ static rk_aiq_sys_ctx_t *g_aiq_ctx = NULL;
 // 会破坏其内部 dma_buf/fd 记账, 触发 kernel panic。VO 路径全程走 MPP 自己的 RGA
 // 上下文, 不存在第二使用者, 故安全且不占额外 CPU。
 static volatile int g_fb_enabled = 0;  // LCD 显示使能 (1=已启用 VO 预览)
-static int g_lcd_width = 720;
-static int g_lcd_height = 720;
-static int g_lcd_fps = 20;             // LCD(VO) 显示帧率, 用于限速喂帧 + u32DispFrmRt
-static int g_sensor_fps = 30;          // sensor 原生帧率, 供 selfpath VI 通道设源帧率
-static pthread_t g_lcd_thread = 0;
+// 以下 LCD 显示私有状态(g_lcd_width/height/fps, g_sensor_fps, g_lcd_thread)
+// 已迁移至 lcd_preview.c 模块 (见 lcd_preview.h), 由 lcd_preview_start/stop 控制。
 
 // MPP 系统引用计数 (与 audio 共享)
 static volatile int g_sys_init_count = 0;
@@ -261,7 +260,7 @@ static int vi_chn_init(int width, int height, int fps, int sensor_fps) {
     // VI 全速运行在 sensor 原生帧率 (src=dst=sensor_fps), 不做丢帧;
     // 各码流的帧率控制由各 VENC 的 fr32DstFrameRate 完成 (见 venc_init_single)。
     if (sensor_fps <= 0) sensor_fps = fps;  // 回退: sensor_fps 未知时使用 target fps
-    g_sensor_fps = sensor_fps;
+    lcd_preview_set_sensor_fps(sensor_fps);
     vi_chn_attr.stFrameRate.s32SrcFrameRate = sensor_fps;
     vi_chn_attr.stFrameRate.s32DstFrameRate = sensor_fps;
 
@@ -517,168 +516,15 @@ static int bind_vpss_to_venc(int vpss_chn, int venc_chn) {
 // 官方示例参考:
 //   RV1106_Linux_SDK/media/samples/simple_test/simple_vi_get_frame_send_vo_rv1106.c
 // 管线: VI selfpath(chn1) --RK_MPI_VI_GetChnFrame--> RK_MPI_VO_SendFrame --> VOP(显示控制器)
-// VOP 硬件完成 NV12→RGB CSC + 缩放, 完全不占 CPU, 也不碰 RGA 单例
-// (RGA 仅由 MPP/SDK 内部在 VPSS/VENC/VO 复用同一个上下文, 无第二使用者, 见文件顶部说明)。
-// 与旧 "fb" 后端(软件 NV12→BGRA ~60% CPU)互斥: 二者都吃 ISP selfpath 资源,
-// VO 为 LCD 唯一显示路径 (VOP 硬件 CSC, 零 CPU, 不碰 RGA 单例)。
-static int g_lcd_use_vo = 0;
-static int g_lcd_vo_layer = 0;
-static int g_lcd_vo_dev   = 0;
-static int g_lcd_vo_chn   = 0;
-static int g_lcd_vi_selfpath_chn = 1;  // 1 = rkisp_selfpath (0=mainpath 已绑 VPSS)
+// ---- LCD 显示代码已迁移至 lcd_preview.c 模块 (见 lcd_preview.h) ----
+// 模块自管理: g_lcd_use_vo / g_lcd_vo_layer / g_lcd_vo_dev / g_lcd_vo_chn /
+// g_lcd_vi_selfpath_chn / g_lcd_width / g_lcd_height / g_lcd_fps / g_sensor_fps /
+// g_lcd_thread / g_lcd_quit 均已移入模块, 由 lcd_preview_start/stop 控制。
 
-static int lcd_vo_init(void) {
-    int ret;
-    // 1) 创建 selfpath VI 通道 (与 mainpath chn0 并存, 独立 GetChnFrame)
-    VI_CHN_ATTR_S vi_attr;
-    memset(&vi_attr, 0, sizeof(vi_attr));
-    vi_attr.stIspOpt.u32BufCount = 3;
-    vi_attr.stIspOpt.enMemoryType = VI_V4L2_MEMORY_TYPE_DMABUF;
-    vi_attr.stSize.u32Width  = (uint32_t)g_lcd_width;
-    vi_attr.stSize.u32Height = (uint32_t)g_lcd_height;
-    vi_attr.enPixelFormat = RK_FMT_YUV420SP;
-    vi_attr.enCompressMode = COMPRESS_MODE_NONE;
-    vi_attr.u32Depth = 2;  // 必须 < u32BufCount, 否则 GetChnFrame 失败
-    // 显式设 selfpath 帧率: 源=sensor 原生帧率, 目的=LCD 显示帧率。
-    // 不设会触发 "illegal param s32SrcFrameRate(0) s32DstFrameRate(0)", selfpath 跑在
-    // 不受控默认速率(~30fps), 与 VO 合成速率(u32DispFrmRt=g_lcd_fps)不匹配。
-    vi_attr.stFrameRate.s32SrcFrameRate = g_sensor_fps > 0 ? g_sensor_fps : 30;
-    vi_attr.stFrameRate.s32DstFrameRate = g_lcd_fps > 0 ? g_lcd_fps : 20;
-    ret = RK_MPI_VI_SetChnAttr(VI_DEV_ID, g_lcd_vi_selfpath_chn, &vi_attr);
-    if (ret != RK_SUCCESS) {
-        printf("[rk_camera] LCD VO: VI SetChnAttr(selfpath) failed %x\n", ret);
-        return -1;
-    }
-    ret = RK_MPI_VI_EnableChn(VI_DEV_ID, g_lcd_vi_selfpath_chn);
-    if (ret != RK_SUCCESS) {
-        printf("[rk_camera] LCD VO: VI EnableChn(selfpath) failed %x\n", ret);
-        return -1;
-    }
+// lcd_vo_init / lcd_vo_deinit / lcd_vo_thread 已迁移至 lcd_preview.c
+// (见 lcd_preview.h 的 lcd_preview_start / lcd_preview_stop)。
 
-    // 2) VO 初始化 (顺序严格参照官方示例)
-    VO_PUB_ATTR_S         pub;
-    VO_VIDEO_LAYER_ATTR_S layer;
-    VO_CHN_ATTR_S         chn;
-    memset(&pub, 0, sizeof(pub));
-    memset(&layer, 0, sizeof(layer));
-    memset(&chn, 0, sizeof(chn));
 
-    ret = RK_MPI_VO_BindLayer(g_lcd_vo_layer, g_lcd_vo_dev, VO_LAYER_MODE_GRAPHIC);
-    if (ret != RK_SUCCESS) {
-        printf("[rk_camera] LCD VO: BindLayer failed %x\n", ret);
-        goto fail_vi;
-    }
-    pub.enIntfType = VO_INTF_DEFAULT;
-    pub.enIntfSync = VO_OUTPUT_DEFAULT;
-    ret = RK_MPI_VO_SetPubAttr(g_lcd_vo_dev, &pub);
-    if (ret != RK_SUCCESS) { printf("[rk_camera] LCD VO: SetPubAttr failed %x\n", ret); goto fail_vo; }
-    ret = RK_MPI_VO_Enable(g_lcd_vo_dev);
-    if (ret != RK_SUCCESS) { printf("[rk_camera] LCD VO: Enable failed %x\n", ret); goto fail_vo; }
-
-    layer.enPixFormat      = RK_FMT_RGB888;
-    layer.enCompressMode   = COMPRESS_AFBC_16x16;
-    layer.stDispRect.s32X  = 0;
-    layer.stDispRect.s32Y  = 0;
-    layer.stDispRect.u32Width  = (uint32_t)g_lcd_width;
-    layer.stDispRect.u32Height = (uint32_t)g_lcd_height;
-    layer.stImageSize.u32Width  = (uint32_t)g_lcd_width;
-    layer.stImageSize.u32Height = (uint32_t)g_lcd_height;
-    layer.u32DispFrmRt = g_lcd_fps > 0 ? g_lcd_fps : 25;
-    ret = RK_MPI_VO_SetLayerAttr(g_lcd_vo_layer, &layer);
-    if (ret != RK_SUCCESS) { printf("[rk_camera] LCD VO: SetLayerAttr failed %x\n", ret); goto fail_vo; }
-    // 注意: 不调用 RK_MPI_VO_SetLayerDispBufLen 调大显示缓冲池。
-    // 该平台显示缓冲内存有限, 设 8 帧会在 EnableLayer 时报
-    // "not enough displaybuf buf len" 导致 VO 整体初始化失败 -> LCD 黑屏。
-    // 改为在 lcd_vo_thread 用 SendFrame(0) 非阻塞: VO 缓冲满时立即丢帧,
-    // 投喂速率自动跟随 composer 实际消费率, 从源头避免缓冲池堆积/ no free buffer。
-    RK_MPI_VO_SetLayerSpliceMode(g_lcd_vo_layer, VO_SPLICE_MODE_RGA);
-    ret = RK_MPI_VO_EnableLayer(g_lcd_vo_layer);
-    if (ret != RK_SUCCESS) { printf("[rk_camera] LCD VO: EnableLayer failed %x\n", ret); goto fail_vo; }
-
-    chn.stRect.s32X = 0;
-    chn.stRect.s32Y = 0;
-    chn.stRect.u32Width  = (uint32_t)g_lcd_width;
-    chn.stRect.u32Height = (uint32_t)g_lcd_height;
-    chn.u32FgAlpha = 255;
-    chn.u32BgAlpha = 0;
-    chn.enMirror = MIRROR_NONE;
-    chn.enRotation = ROTATION_0;
-    chn.u32Priority = 1;
-    ret = RK_MPI_VO_SetChnAttr(g_lcd_vo_layer, g_lcd_vo_chn, &chn);
-    if (ret != RK_SUCCESS) { printf("[rk_camera] LCD VO: SetChnAttr failed %x\n", ret); goto fail_vo; }
-    ret = RK_MPI_VO_EnableChn(g_lcd_vo_layer, g_lcd_vo_chn);
-    if (ret != RK_SUCCESS) { printf("[rk_camera] LCD VO: EnableChn failed %x\n", ret); goto fail_vo; }
-
-    printf("[rk_camera] LCD VO initialized (VOP hardware CSC, %dx%d)\n",
-           g_lcd_width, g_lcd_height);
-    return 0;
-
-fail_vo:
-    RK_MPI_VO_DisableChn(g_lcd_vo_layer, g_lcd_vo_chn);
-    RK_MPI_VO_DisableLayer(g_lcd_vo_layer);
-    RK_MPI_VO_Disable(g_lcd_vo_dev);
-    RK_MPI_VO_UnBindLayer(g_lcd_vo_layer, g_lcd_vo_dev);
-fail_vi:
-    RK_MPI_VI_DisableChn(VI_DEV_ID, g_lcd_vi_selfpath_chn);
-    return -1;
-}
-
-static void lcd_vo_deinit(void) {
-    RK_MPI_VO_DisableChn(g_lcd_vo_layer, g_lcd_vo_chn);
-    RK_MPI_VO_DisableLayer(g_lcd_vo_layer);
-    RK_MPI_VO_Disable(g_lcd_vo_dev);
-    RK_MPI_VO_UnBindLayer(g_lcd_vo_layer, g_lcd_vo_dev);
-    RK_MPI_VO_CloseFd();
-    RK_MPI_VI_DisableChn(VI_DEV_ID, g_lcd_vi_selfpath_chn);
-    printf("[rk_camera] LCD VO deinitialized\n");
-}
-
-static void *lcd_vo_thread(void *arg) {
-    (void)arg;
-    printf("[rk_camera] LCD VO thread started (VI selfpath -> VO)\n");
-    VIDEO_FRAME_INFO_S frame;
-    long long frames = 0;
-    long long start_us = 0;
-    // 紧循环直送 (参照官方 sample simple_vi_get_frame_send_vo_rv1106.c):
-    // SendFrame(-1) 在 VO 内部缓冲满时自动阻塞背压, 不会溢出缓冲池, 无需应用层限速。
-    // selfpath 已在源头设目的帧率=g_lcd_fps(均匀 20fps), 此处每帧直送即可。
-    // 显示缓冲池已在 lcd_vo_init 调大到 8, 吸收重负载下 composer 偶发卡顿,
-    // 消除 "Layer 0 no free buffer to compose"。
-
-    while (!g_quit) {
-        int ret = RK_MPI_VI_GetChnFrame(VI_DEV_ID, g_lcd_vi_selfpath_chn, &frame, 1000);
-        if (ret != RK_SUCCESS) {
-            // 超时或暂无可取帧: 继续, 不阻塞编码管线
-            continue;
-        }
-
-        // VOP 硬件完成 CSC+缩放, 应用侧零 CPU 转换
-        // SendFrame 用 0 (非阻塞): VO 显示缓冲满时立即返回失败, 此处直接丢帧。
-        // 实测该平台 LCD/composer 实际消费率约 9~10fps(受限于 LCD 刷新/合成能力),
-        // 若投喂快于消费, 缓冲池会堆积并刷 "Layer 0 no free buffer to compose"。
-        // 非阻塞丢帧使投喂速率自动跟随 composer 消费率, 缓冲池永不堆积, 从根上消除该错误。
-        ret = RK_MPI_VO_SendFrame(g_lcd_vo_layer, g_lcd_vo_chn, &frame, 0);
-        RK_MPI_VI_ReleaseChnFrame(VI_DEV_ID, g_lcd_vi_selfpath_chn, &frame);
-        if (ret != RK_SUCCESS) {
-            // 缓冲满(或暂时不可送): 丢弃此帧继续, 不阻塞、不堆积
-            continue;
-        }
-
-        struct timeval tv; gettimeofday(&tv, NULL);
-        long long now = (long long)tv.tv_sec * 1000000 + tv.tv_usec;
-        frames++;
-        if (start_us == 0) {
-            start_us = now;
-        } else if (now - start_us >= 5000000) {
-            double fps = frames / ((now - start_us) / 1000000.0);
-            printf("[rk_camera][LCD_STAT] VO: fps=%.1f (VOP hardware CSC, ~0 CPU)\n", fps);
-            fflush(stdout);
-            start_us = now; frames = 0;
-        }
-    }
-    printf("[rk_camera] LCD VO thread stopped\n");
-    return NULL;
-}
 
 
 // ---- 公开 API ----
@@ -803,21 +649,13 @@ int rk_camera_init(int main_w, int main_h, int fps, int bitrate, int sensor_fps)
         if (ret != 0) return -1;
     }
 
-    // 5. LCD 显示 — MPP VO 模块 (VOP 硬件 CSC, 零 CPU 转换, 不碰 RGA 单例)
+    // 5. LCD 显示 — 交由 lcd_preview 模块 (VOP 硬件 CSC, 零 CPU, 不碰 RGA 单例)
+    //    模块自管理 selfpath VI 通道 + VO video plane + 送帧线程 (见 lcd_preview.h)
     if (g_fb_enabled) {
-        if (lcd_vo_init() == 0) {
-            g_lcd_use_vo = 1;
-            ret = pthread_create(&g_lcd_thread, NULL, lcd_vo_thread, NULL);
-            if (ret != 0) {
-                printf("[rk_camera] WARN: LCD VO thread create failed\n");
-                lcd_vo_deinit();
-                g_lcd_use_vo = 0;
-                g_fb_enabled = 0;
-            } else {
-                printf("[rk_camera] LCD display thread created (VO hardware CSC)\n");
-            }
+        if (lcd_preview_start() == 0) {
+            printf("[rk_camera] LCD display started (VO hardware CSC)\n");
         } else {
-            printf("[rk_camera] LCD VO init failed, LCD disabled\n");
+            printf("[rk_camera] LCD preview start failed, LCD disabled\n");
             g_fb_enabled = 0;
         }
     }
@@ -887,11 +725,51 @@ void rk_camera_set_chn_config(int chn_id,
 // width/height: LCD 分辨率 (0 表示使用默认分辨率)
 // fps: 显示帧率
 void rk_camera_set_vo_config(int width, int height, int fps) {
-    if (width > 0) g_lcd_width = width;
-    if (height > 0) g_lcd_height = height;
-    if (fps > 0) g_lcd_fps = fps;
+    lcd_preview_set_config(width, height, fps);
     g_fb_enabled = 1;
-    printf("[rk_camera] LCD(VO) enabled: %dx%d @%dfps\n", g_lcd_width, g_lcd_height, fps);
+    printf("[rk_camera] LCD(VO) enabled: %dx%d @%dfps\n", width, height, fps);
+}
+
+// 设置 LCD 预览 video plane 子矩形位置 (局部显示)
+void rk_camera_set_vo_rect(int x, int y) {
+    lcd_preview_set_rect(x, y);
+}
+
+// ---- rknn 推理 (独立模块 rknn_infer.c, 复用 LCD selfpath 通道) ----
+extern int rknn_infer_init(const char *model_path);
+extern int rknn_infer_start(void);
+extern void rknn_infer_stop(void);
+
+// 启用 rknn 目标检测: 加载模型 + 启动推理 (消费 lcd_preview 的 selfpath 帧)。
+//   须在 rk_camera_init() 之前调用 (与 set_vo_config 同级)。
+int rk_camera_enable_rknn(const char *model_path) {
+    if (rknn_infer_init(model_path) != 0) {
+        printf("[rk_camera] rknn init failed\n");
+        return -1;
+    }
+    if (rknn_infer_start() != 0) {
+        printf("[rk_camera] rknn start failed\n");
+        return -1;
+    }
+    printf("[rk_camera] rknn enabled: %s\n", model_path);
+    return 0;
+}
+
+// ---- preview-only 封装 (供 standalone lcd-preview 使用, 不触发编码/VPSS) ----
+// 仅做 SYS_Init + ISP + VI dev 最小初始化后启动 LCD 预览。
+int rk_camera_preview_only_init(int w, int h, int fps) {
+    if (ensure_sys_init() != 0) return -1;
+    isp_init();
+    if (vi_dev_init() != 0) { isp_deinit(); maybe_sys_exit(); return -1; }
+    lcd_preview_set_config(w, h, fps);
+    return lcd_preview_start();
+}
+
+void rk_camera_preview_only_deinit(void) {
+    lcd_preview_stop();
+    RK_MPI_VI_DisableDev(VI_DEV_ID);
+    isp_deinit();
+    maybe_sys_exit();
 }
 
 // 设置帧回调
@@ -940,7 +818,7 @@ int rk_camera_update_chn_config(int chn_id,
     if (!g_chn_enabled[chn_id]) return -1;
 
     ChnEncAttr *old = &g_chn_attr[chn_id];
-    int sensor_fps = g_sensor_fps > 0 ? g_sensor_fps : 30;
+    int sensor_fps = lcd_preview_get_sensor_fps();
 
     int new_codec = (codec && codec[0]) ? get_codec_type(codec) : old->codec;
     int new_w = width > 0 ? width : old->width;
@@ -1182,16 +1060,11 @@ void rk_camera_deinit() {
         }
     }
 
-    // 停止 LCD 显示线程 (独立于 MPP, 先 join)
-    if (g_fb_enabled && g_lcd_thread) {
-        pthread_join(g_lcd_thread, NULL);
-        g_lcd_thread = 0;
-    }
-    // VO 后端清理 (selfpath VI 通道 + VO 模块)
-    if (g_lcd_use_vo) {
-        lcd_vo_deinit();
-        g_lcd_use_vo = 0;
-    }
+    // 停止 rknn 推理 (注销消费者 + 释放帧源引用)
+    rknn_infer_stop();
+
+    // 停止 LCD 预览 (模块自管理线程与 VO 清理)
+    lcd_preview_stop();
 
     // 解绑: VENC ← VPSS ← VI
     for (int i = 0; i < VENC_MAX_CHN; i++) {

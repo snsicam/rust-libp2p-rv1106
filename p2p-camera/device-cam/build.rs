@@ -64,7 +64,31 @@ fn main() {
     let mut cc_build = cc::Build::new();
     cc_build
         .file("src/rk_camera.c")
+        .file("src/lcd_preview.c")   // LCD 预览模块 (从 rk_camera.c 抽取)
+        .file("src/bbox_shm.c")     // cam→LVGL bbox 共享内存环形队列
+        .file("src/rknn_infer.c")    // rknn YOLOv5 推理 (复用 LCD selfpath 通道)
         .include(&sdk_include);
+
+    // RKNN 头文件 (rknn_api.h) — 不在 SDK 默认 include/rknn 下,
+    // 而在 rknn 例子目录里。自动探测候选路径, 找不到再用 env 覆盖提示。
+    let sdk_root_rknn_inc = std::env::var("RV1106_SDK_ROOT")
+        .map(|r| format!("{}/media/rockit/rockit/mpi/sdk/include/rknn", r))
+        .unwrap_or_default();
+    let rknn_inc_candidates = vec![
+        std::env::var("RV1106_RKNN_INCLUDE").unwrap_or_default(), // 手动覆盖优先
+        format!("{}/rknn", sdk_include),
+        sdk_root_rknn_inc,
+        // rknn 例子 (用户确认可参考其代码):
+        "/home/song/samba/work/rv1106/rknn/luckfox_pico_rknn_example/include/rknn".to_string(),
+        "/home/song/samba/work/rv1106".to_string(),   // 递归兜底
+    ];
+    let rknn_include = find_dir_containing(&rknn_inc_candidates, "rknn_api.h", 6)
+        .unwrap_or_else(|| {
+            println!("cargo:warning=RKNN include NOT found. Set RV1106_RKNN_INCLUDE to dir containing rknn_api.h");
+            format!("{}/rknn", sdk_include)
+        });
+    println!("cargo:warning=RKNN include path: {}", rknn_include);
+    cc_build.include(&rknn_include);
 
     // 添加 rkaiq 头文件路径 (可能是冒号分隔的多路径)
     for inc_dir in rkaiq_include.split(':') {
@@ -125,6 +149,57 @@ fn main() {
     println!("cargo:rustc-link-search=native={}", rga_lib);
     println!("cargo:rustc-link-lib=static=rga");
     println!("cargo:rustc-link-lib=static=stdc++");  // RGA 是 C++ 库, 需要 libstdc++
+
+    // RKNN 推理库 (librknnmrt.so) — 不在 SDK 默认 lib 下, 而在 rknn 例子 lib/glibc。
+    // 自动探测候选路径 (优先 glibc 版本, 匹配 gnueabihf target)。
+    let rknn_lib_candidates = vec![
+        std::env::var("RV1106_RKNN_LIB").unwrap_or_default(), // 手动覆盖优先
+        format!("{}/../lib/glibc", sdk_lib_paths),
+        "/home/song/samba/work/rv1106/rknn/luckfox_pico_rknn_example/lib/glibc".to_string(),
+        "/home/song/samba/work/rv1106".to_string(),   // 递归兜底
+    ];
+    let rknn_lib = find_dir_containing(&rknn_lib_candidates, "librknnmrt.so", 6)
+        .unwrap_or_else(|| {
+            println!("cargo:warning=RKNN lib NOT found. Set RV1106_RKNN_LIB to dir containing librknnmrt.so");
+            format!("{}/../lib/glibc", sdk_lib_paths)
+        });
+    println!("cargo:rustc-link-search=native={}", rknn_lib);
+    println!("cargo:rustc-link-lib=dylib=rknnmrt");
+}
+
+// 在候选根目录下查找某个文件, 返回其所在目录 (含直接命中与递归子目录)。
+// 用于自动探测 rknn_api.h / librknnmrt.so 的位置 (它们不在 SDK 默认 include/lib 下,
+// 而在 rknn 例子目录里)。
+fn find_dir_containing(roots: &[String], filename: &str, max_depth: u32) -> Option<String> {
+    for root in roots {
+        if root.is_empty() { continue; }
+        let root = root.trim_end_matches('/');
+        // 直接命中: root 本身就是包含该文件的目录
+        if std::path::Path::new(root).join(filename).exists() {
+            return Some(root.to_string());
+        }
+        // 递归子目录查找
+        if let Some(found) = walk_find(std::path::Path::new(root), filename, max_depth) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn walk_find(dir: &std::path::Path, filename: &str, depth: u32) -> Option<String> {
+    if depth == 0 { return None; }
+    let entries = std::fs::read_dir(dir).ok()?;
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            if let Some(f) = walk_find(&p, filename, depth - 1) {
+                return Some(f);
+            }
+        } else if p.file_name().map(|n| n == filename).unwrap_or(false) {
+            return p.parent().map(|pp| pp.display().to_string());
+        }
+    }
+    None
 }
 
 fn chrono_now() -> String {

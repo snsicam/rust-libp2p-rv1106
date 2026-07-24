@@ -53,7 +53,11 @@ extern "C" {
 
     // VO (LCD) 配置
     fn rk_camera_set_vo_config(width: std::ffi::c_int, height: std::ffi::c_int,
-                                fps: std::ffi::c_int);
+                               fps: std::ffi::c_int);
+    fn rk_camera_set_vo_rect(x: std::ffi::c_int, y: std::ffi::c_int);
+
+    // 启用 rknn 目标检测 (独立模块 rknn_infer.c, 复用 LCD selfpath 通道)
+    fn rk_camera_enable_rknn(model_path: *const std::ffi::c_char) -> std::ffi::c_int;
 
     fn rk_audio_init(
         sample_rate: std::ffi::c_int,
@@ -247,6 +251,13 @@ pub struct RkVideoSource {
     /// LCD 分辨率 (0 表示自动检测)
     lcd_width: u32,
     lcd_height: u32,
+    /// video plane 在屏幕上的左上角坐标 (局部显示, 默认 0,0 = 全屏)
+    lcd_disp_x: u32,
+    lcd_disp_y: u32,
+    /// 是否启用 rknn 目标检测 (复用 LCD selfpath 帧源, 框经 bbox_shm 给 LVGL)
+    enable_rknn: bool,
+    /// rknn 模型路径 (.rknn)
+    rknn_model_path: String,
 }
 
 impl RkVideoSource {
@@ -264,6 +275,10 @@ impl RkVideoSource {
             enable_lcd: false,
             lcd_width: 800,
             lcd_height: 480,
+            lcd_disp_x: 0,
+            lcd_disp_y: 0,
+            enable_rknn: false,
+            rknn_model_path: String::new(),
         }
     }
 
@@ -272,6 +287,24 @@ impl RkVideoSource {
         self.enable_lcd = true;
         if width > 0 { self.lcd_width = width; }
         if height > 0 { self.lcd_height = height; }
+        self
+    }
+
+    /// 启用 LCD 局部显示, 指定 video plane 子矩形位置 (x, y 为左上角)
+    pub fn with_lcd_rect(mut self, x: u32, y: u32, width: u32, height: u32) -> Self {
+        self.enable_lcd = true;
+        if width > 0 { self.lcd_width = width; }
+        if height > 0 { self.lcd_height = height; }
+        self.lcd_disp_x = x;
+        self.lcd_disp_y = y;
+        self
+    }
+
+    /// 启用 rknn 目标检测: 复用 LCD selfpath 帧源, 检测框经 bbox_shm 给 LVGL。
+    ///   model_path: .rknn 模型文件路径 (板端绝对路径)。
+    pub fn with_rknn(mut self, model_path: String) -> Self {
+        self.enable_rknn = true;
+        self.rknn_model_path = model_path;
         self
     }
 
@@ -294,6 +327,10 @@ impl RkVideoSource {
         let enable_lcd = self.enable_lcd;
         let lcd_width = self.lcd_width;
         let lcd_height = self.lcd_height;
+        let lcd_disp_x = self.lcd_disp_x;
+        let lcd_disp_y = self.lcd_disp_y;
+        let enable_rknn = self.enable_rknn;
+        let rknn_model_path = self.rknn_model_path.clone();
         let sensor_frame_rate = self.sensor_frame_rate;
 
         let handle = thread::spawn(move || {
@@ -408,10 +445,14 @@ impl RkVideoSource {
                 }
             }
 
-            // 启用 LCD 显示 (需要在 rk_camera_init 前调用)
+            // 启用 LCD 局部显示 (需要在 rk_camera_init 前调用)
             if enable_lcd {
                 let lcd_fps = main.dst_fps_num / main.dst_fps_den.max(1);
                 unsafe {
+                    rk_camera_set_vo_rect(
+                        lcd_disp_x as i32,
+                        lcd_disp_y as i32,
+                    );
                     rk_camera_set_vo_config(
                         lcd_width as i32,
                         lcd_height as i32,
@@ -420,6 +461,18 @@ impl RkVideoSource {
                 }
                 println!("[RkVideoSource] LCD enabled: {}x{} @{}fps",
                          lcd_width, lcd_height, lcd_fps);
+            }
+
+            // 启用 rknn 目标检测 (复用 LCD selfpath 帧源, 须在 rk_camera_init 前)
+            if enable_rknn {
+                let path_c = std::ffi::CString::new(rknn_model_path.as_str())
+                    .unwrap_or_else(|_| std::ffi::CString::new("").unwrap());
+                let r = unsafe { rk_camera_enable_rknn(path_c.as_ptr()) };
+                if r != 0 {
+                    eprintln!("[RkVideoSource] rknn enable failed: {}", r);
+                } else {
+                    println!("[RkVideoSource] rknn enabled: {}", rknn_model_path);
+                }
             }
 
             // 初始化摄像头硬件
