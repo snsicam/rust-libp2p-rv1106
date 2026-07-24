@@ -18,10 +18,12 @@
 #include <math.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <sys/time.h>
 
 #include "rknn_api.h"          // RKNN SDK
 #include "lcd_preview.h"        // 帧源 (selfpath) + 消费者注册 + 屏幕子矩形
 #include "bbox_shm.h"           // cam<->LVGL 检测框通道
+#include "rk_mpi_mb.h"          // RK_MPI_MB_Handle2VirAddr: DMABUF 帧取 CPU 虚拟地址
 
 // ---- 后处理结果结构 (对齐例子 postprocess.h) ----
 #define OBJ_NUMB_MAX_SIZE  128
@@ -327,15 +329,77 @@ static void bilinear_bgr_resize(const uint8_t *src, int sw, int sh,
 // ===================================================================
 //  显示泵消费者回调 (µs 级: 仅拷贝 NV12 像素到队列, 不推理)
 // ===================================================================
+static volatile long g_cb_calls = 0;    // 回调被泵调用次数 (诊断)
+static volatile long g_cb_queued = 0;   // 成功入队帧数 (诊断)
+static volatile long g_overlay_frames = 0; // 已画框的显示帧数 (诊断)
+
+// ---- 在 NV12 帧上画检测框 (参考 rknn 例子 cv::rectangle, 但直接画在硬件 VO 帧) ----
+// 把框画进送 VO 的 NV12 像素, 不依赖 fb0 图层叠加, 避开 VOP 层序/alpha 风险。
+#define BOX_THICK 3
+// 调色板 (Y,U,V), 按 COCO 类别取模上色
+static const uint8_t g_box_pal[][3] = {
+    {255,128,128}, // 0 白
+    { 76, 85,255}, // 1 红
+    {150, 46, 21}, // 2 绿
+    { 29,255,128}, // 3 蓝
+    {226,  3,149}, // 4 黄
+    {179,174, 21}, // 5 青
+    {105,213,255}, // 6 品红
+    {173, 30,187}, // 7 橙
+    { 76, 85,255}, // 8
+    {150, 46, 21}, // 9
+};
+static inline void nv12_set_px(uint8_t *base, int stride, int h,
+                               int px, int py, uint8_t Y, uint8_t U, uint8_t V) {
+    if (px < 0 || py < 0 || px >= stride || py >= h) return;
+    base[py * stride + px] = Y;
+    int uidx = (py / 2) * stride + (px / 2) * 2;   // UV 平面 (stride*h/2, 4:2:0)
+    base[(size_t)stride * h + uidx]     = U;
+    base[(size_t)stride * h + uidx + 1] = V;
+}
+// box 已是屏幕子矩形坐标; 减 disp 偏移得 selfpath 帧内坐标再画。
+static void draw_boxes_on_nv12(uint8_t *base, int w, int h, int stride,
+                               const bbox_snapshot_t *snap, int disp_x, int disp_y) {
+    for (int i = 0; i < snap->count; i++) {
+        const bbox_t *b = &snap->boxes[i];
+        int x0 = b->x - disp_x, y0 = b->y - disp_y;
+        int x1 = x0 + b->w,      y1 = y0 + b->h;
+        int cx0 = x0 < 0 ? 0 : x0;
+        int cy0 = y0 < 0 ? 0 : y0;
+        int cx1 = x1 > w ? w : x1;
+        int cy1 = y1 > h ? h : y1;
+        if (cx1 <= cx0 || cy1 <= cy0) continue;
+        const uint8_t *c = g_box_pal[b->cls % 10];
+        uint8_t Y = c[0], U = c[1], V = c[2];
+        int t = BOX_THICK;
+        for (int yy = cy0; yy < cy1; yy++) {
+            for (int xx = cx0; xx < cx1; xx++) {
+                int edge = (yy < cy0 + t) || (yy >= cy1 - t) ||
+                           (xx < cx0 + t) || (xx >= cx1 - t);
+                if (edge) nv12_set_px(base, stride, h, xx, yy, Y, U, V);
+            }
+        }
+    }
+}
+
 static void rknn_frame_cb(const VIDEO_FRAME_INFO_S *frame, void *ctx) {
     (void)ctx;
+    g_cb_calls++;
     size_t next = g_prod_idx + 1;
     if (next - g_cons_idx >= FRAME_SLOTS) return;  // 满, 丢帧 (不阻塞泵)
     frame_slot_t *s = &g_slots[g_prod_idx % FRAME_SLOTS];
     int w = (int)frame->stVFrame.u32Width;
     int h = (int)frame->stVFrame.u32Height;
     int stride = (int)frame->stVFrame.u32VirWidth;
-    // NV12: Y 平面 = stride*h, UV 平面(stride*h/2), pVirAddr[0]=Y, [1]=UV
+    // selfpath 通道是 DMABUF, pVirAddr 为 NULL; 须用 Handle2VirAddr 经 pMbBlk 取 CPU 虚拟地址
+    // (NV12: Y 平面在 base, UV 平面在 base + stride*h)。参考 SDK test_mpi_vi.cpp:2286。
+    uint8_t *base = (uint8_t *)RK_MPI_MB_Handle2VirAddr(frame->stVFrame.pMbBlk);
+    if (base == NULL) {
+        static int warn = 0;
+        if (!warn) { printf("[rknn] WARN: Handle2VirAddr NULL (DMABUF pMbBlk)\n"); warn = 1; }
+        return;
+    }
+    // NV12: Y 平面 = stride*h, UV 平面(stride*h/2), 二者连续: Y 在 base, UV 在 base+stride*h
     uint32_t y_sz  = (uint32_t)stride * (uint32_t)h;
     uint32_t uv_sz = (uint32_t)stride * (uint32_t)h / 2;
     uint32_t sz = y_sz + uv_sz;
@@ -344,10 +408,32 @@ static void rknn_frame_cb(const VIDEO_FRAME_INFO_S *frame, void *ctx) {
         s->nv12 = (uint8_t *)malloc(sz + 16);
         s->cap = (int)sz + 16;
     }
-    memcpy(s->nv12,                  (uint8_t *)frame->stVFrame.pVirAddr[0], y_sz);
-    memcpy(s->nv12 + y_sz, (uint8_t *)frame->stVFrame.pVirAddr[1], uv_sz);
+    memcpy(s->nv12,                  base, y_sz);
+    memcpy(s->nv12 + y_sz, base + y_sz, uv_sz);
     s->w = w; s->h = h; s->stride = stride;
+
+    // 直接在本帧 NV12 上画最新检测框 (送 VO 即带框显示, 参考 rknn 例子 cv::rectangle)。
+    // 此帧随后由泵 SendFrame 送显; rknn 推理用的是上面已拷贝的干净 s->nv12, 不受影响。
+    if (g_shm) {
+        bbox_snapshot_t snap;
+        if (bbox_shm_acquire(g_shm, &snap) && snap.count > 0) {
+            int dx, dy, dw, dh;
+            lcd_preview_get_disp_rect(&dx, &dy, &dw, &dh);  // 屏幕子矩形偏移
+            draw_boxes_on_nv12(base, w, h, stride, &snap, dx, dy);
+            g_overlay_frames++;
+            if (g_overlay_frames == 1) {
+                printf("[rknn] overlay active: drawing %d boxes on VO frame\n", snap.count);
+                fflush(stdout);
+            }
+        }
+    }
+
     g_prod_idx = next;
+    if (g_cb_queued == 0) {
+        printf("[rknn] first frame queued: %dx%d stride=%d base=%p\n", w, h, stride, (void *)base);
+        fflush(stdout);
+    }
+    g_cb_queued++;
 }
 
 // ===================================================================
@@ -356,7 +442,19 @@ static void rknn_frame_cb(const VIDEO_FRAME_INFO_S *frame, void *ctx) {
 static void *rknn_worker(void *arg) {
     (void)arg;
     printf("[rknn] worker started\n");
+    long infers = 0, dets = 0;          // 5s 窗口: 推理次数 / 检出框数 (诊断)
+    struct timeval tv0; gettimeofday(&tv0, NULL);
+    long long stat_us = (long long)tv0.tv_sec * 1000000 + tv0.tv_usec;
     while (!g_quit) {
+        // 每 5s 打印一次统计: 无论有没有帧都打 (定位链路断点)
+        struct timeval tvn; gettimeofday(&tvn, NULL);
+        long long now = (long long)tvn.tv_sec * 1000000 + tvn.tv_usec;
+        if (now - stat_us >= 5000000) {
+            printf("[rknn][STAT] cb_calls=%ld queued=%ld infers=%ld dets=%ld over=%ld\n",
+                   g_cb_calls, g_cb_queued, infers, dets, g_overlay_frames);
+            fflush(stdout);
+            stat_us = now; infers = 0; dets = 0;
+        }
         if (g_cons_idx == g_prod_idx) { usleep(1000); continue; }
 
         frame_slot_t *s = &g_slots[g_cons_idx % FRAME_SLOTS];
@@ -372,9 +470,11 @@ static void *rknn_worker(void *arg) {
 
         int ret = rknn_run(g_app.rknn_ctx, NULL);
         if (ret < 0) { printf("[rknn] rknn_run fail %d\n", ret); continue; }
+        infers++;
 
         object_detect_result_list od;
         post_process(&g_app, g_app.output_mems, BOX_THRESH, NMS_THRESH, &od);
+        dets += od.count;
 
         // 坐标映射: 模型(640) -> 帧 -> 屏幕子矩形
         int dx, dy, dw, dh;

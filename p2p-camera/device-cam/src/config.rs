@@ -120,6 +120,32 @@ fn default_lcd_enabled() -> bool { false }
 fn default_lcd_width() -> u32 { 800 }
 fn default_lcd_height() -> u32 { 480 }
 
+/// rknn 目标检测配置 (复用 lcd 的 selfpath 帧源, 结果经 bbox_shm 给 LVGL)
+///
+/// 注意: rknn 不独占 VI 通道, 它复用 lcd_preview 的中性 selfpath 帧源
+/// (LCD 或 rknn 任一需要即开启), 见 rknn_infer.c / lcd_preview.c。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RknnConfig {
+    /// 是否启用 rknn 目标检测
+    #[serde(default = "default_rknn_enabled")]
+    pub enabled: bool,
+    /// .rknn 模型文件路径 (板端绝对路径)
+    #[serde(default = "default_rknn_model_path")]
+    pub model_path: String,
+}
+
+fn default_rknn_enabled() -> bool { false }
+fn default_rknn_model_path() -> String { "/oem/yolov5.rknn".to_string() }
+
+impl Default for RknnConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_rknn_enabled(),
+            model_path: default_rknn_model_path(),
+        }
+    }
+}
+
 impl Default for LcdConfig {
     fn default() -> Self {
         Self {
@@ -289,6 +315,10 @@ pub struct Config {
     #[serde(default)]
     pub lcd: LcdConfig,
 
+    /// rknn 目标检测配置 (复用 lcd selfpath 帧源)
+    #[serde(default)]
+    pub rknn: RknnConfig,
+
     /// sensor 原生输出帧率 (摄像头模组实际产出率, 如 30)。
     /// 注意: 这是 VI/编码器的输入源帧率, 与各码流的目标帧率(dst_frame_rate)不同。
     /// 帧率控制逻辑(对标 rkipc isp.0.adjustment:fps): VENC 的 u32SrcFrameRate 必须等于此值,
@@ -320,6 +350,7 @@ impl Default for Config {
             udp_port: None,
             video: VideoConfig::default(),
             lcd: LcdConfig::default(),
+            rknn: RknnConfig::default(),
             sensor_frame_rate: default_sensor_frame_rate(),
             video_file: None,
         }
@@ -380,6 +411,11 @@ impl Config {
         if cli.enable_audio { self.audio.enabled = true; }
         if let Some(udp_port) = cli.udp_port { self.udp_port = Some(udp_port); }
         if let Some(ref video_file) = cli.video_file { self.video_file = Some(video_file.clone()); }
+        #[cfg(feature = "rv1106")]
+        if let Some(ref rknn_model) = cli.rknn_model {
+            self.rknn.enabled = true;
+            self.rknn.model_path = rknn_model.to_string_lossy().to_string();
+        }
     }
 
     /// 返回所有启用码流的配置列表
@@ -438,4 +474,8 @@ pub struct CliOverrides {
     pub enable_audio: bool,
     pub udp_port: Option<u16>,
     pub video_file: Option<PathBuf>,
+    /// rknn 模型路径 (指定即启用 rknn 目标检测, 复用 lcd selfpath 帧源)
+    /// 仅 rv1106 特性下存在 (对应 Opt 的 --rknn-model 参数)
+    #[cfg(feature = "rv1106")]
+    pub rknn_model: Option<PathBuf>,
 }

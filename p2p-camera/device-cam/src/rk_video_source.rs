@@ -57,7 +57,10 @@ extern "C" {
     fn rk_camera_set_vo_rect(x: std::ffi::c_int, y: std::ffi::c_int);
 
     // 启用 rknn 目标检测 (独立模块 rknn_infer.c, 复用 LCD selfpath 通道)
-    fn rk_camera_enable_rknn(model_path: *const std::ffi::c_char) -> std::ffi::c_int;
+    //   拆成两步以对齐 LCD 的时序: init(加载模型) 在 rk_camera_init 前,
+    //   start(启 selfpath 帧源 + worker) 必须在 rk_camera_init 之后 (VI 设备已启用)。
+    fn rk_camera_init_rknn(model_path: *const std::ffi::c_char) -> std::ffi::c_int;
+    fn rk_camera_start_rknn() -> std::ffi::c_int;
 
     fn rk_audio_init(
         sample_rate: std::ffi::c_int,
@@ -463,15 +466,15 @@ impl RkVideoSource {
                          lcd_width, lcd_height, lcd_fps);
             }
 
-            // 启用 rknn 目标检测 (复用 LCD selfpath 帧源, 须在 rk_camera_init 前)
+            // 启用 rknn 目标检测: 加载模型 (复用 LCD selfpath 帧源, 须在 rk_camera_init 前)
             if enable_rknn {
                 let path_c = std::ffi::CString::new(rknn_model_path.as_str())
                     .unwrap_or_else(|_| std::ffi::CString::new("").unwrap());
-                let r = unsafe { rk_camera_enable_rknn(path_c.as_ptr()) };
+                let r = unsafe { rk_camera_init_rknn(path_c.as_ptr()) };
                 if r != 0 {
-                    eprintln!("[RkVideoSource] rknn enable failed: {}", r);
+                    eprintln!("[RkVideoSource] rknn init failed: {}", r);
                 } else {
-                    println!("[RkVideoSource] rknn enabled: {}", rknn_model_path);
+                    println!("[RkVideoSource] rknn model loaded: {}", rknn_model_path);
                 }
             }
 
@@ -490,6 +493,18 @@ impl RkVideoSource {
             if ret != 0 {
                 eprintln!("[RkVideoSource] rk_camera_init failed: {}", ret);
                 return;
+            }
+
+            // 启动 rknn 推理: 须在 rk_camera_init 之后 (VI 设备已启用,
+            // 否则 lcd_preview_ensure_source 在 un-enabled VI dev 上
+            // 调 RK_MPI_VI_SetChnAttr 会 SIGSEGV)。
+            if enable_rknn {
+                let r = unsafe { rk_camera_start_rknn() };
+                if r != 0 {
+                    eprintln!("[RkVideoSource] rknn start failed: {}", r);
+                } else {
+                    println!("[RkVideoSource] rknn started (reuse LCD selfpath channel)");
+                }
             }
 
             // 设置帧回调

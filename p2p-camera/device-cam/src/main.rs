@@ -107,6 +107,8 @@ async fn main() -> Result<()> {
         enable_audio: opt.enable_audio,
         udp_port: opt.udp_port,
         video_file: None,
+        #[cfg(feature = "rv1106")]
+        rknn_model: opt.rknn_model,
     };
     config.apply_cli_overrides(&cli_overrides);
 
@@ -185,6 +187,9 @@ async fn main() -> Result<()> {
             );
             if config.lcd.enabled {
                 source = source.with_lcd(config.lcd.width, config.lcd.height);
+            }
+            if config.rknn.enabled {
+                source = source.with_rknn(config.rknn.model_path.clone());
             }
             let (_, start_tx) = source.spawn(
                 broadcast_sender_to_crossbeam(main_tx.clone()),
@@ -1043,6 +1048,10 @@ struct Opt {
 
     #[arg(long)]
     udp_port: Option<u16>,
+
+    #[cfg(feature = "rv1106")]
+    #[arg(long)]
+    rknn_model: Option<std::path::PathBuf>,
 }
 
 fn validate_device_cam_config(config: &config::Config) {
@@ -1100,6 +1109,13 @@ fn validate_device_cam_config(config: &config::Config) {
         config.audio.encode_type,
         config.audio.bit_rate,
         config.audio.enable_vqe);
+
+    // 打印 rknn 目标检测状态
+    if config.rknn.enabled {
+        println!("[DeviceCam] rknn:  ON  model={}", config.rknn.model_path);
+    } else {
+        println!("[DeviceCam] rknn:  OFF");
+    }
 }
 
 fn is_same_subnet(a: Ipv4Addr, b: Ipv4Addr) -> bool {

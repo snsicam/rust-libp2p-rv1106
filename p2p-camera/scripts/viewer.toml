@@ -1,0 +1,7 @@
+relays = []
+relay = ""
+enable_mdns = true
+camera = ""
+stream = "main"
+no_audio = false
+play = false

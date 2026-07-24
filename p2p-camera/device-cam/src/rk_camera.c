@@ -740,18 +740,27 @@ extern int rknn_infer_init(const char *model_path);
 extern int rknn_infer_start(void);
 extern void rknn_infer_stop(void);
 
-// 启用 rknn 目标检测: 加载模型 + 启动推理 (消费 lcd_preview 的 selfpath 帧)。
-//   须在 rk_camera_init() 之前调用 (与 set_vo_config 同级)。
-int rk_camera_enable_rknn(const char *model_path) {
+// rknn 初始化: 仅加载模型 + 申请 rknn 内存 (不碰 VI 硬件)。
+//   须在 rk_camera_init() 之前调用 (与 set_vo_config 同级),
+//   此时 VI 设备尚未启用, 不可启 selfpath 帧源。
+int rk_camera_init_rknn(const char *model_path) {
     if (rknn_infer_init(model_path) != 0) {
         printf("[rk_camera] rknn init failed\n");
         return -1;
     }
+    printf("[rk_camera] rknn model loaded: %s\n", model_path);
+    return 0;
+}
+
+// rknn 启动: 启 selfpath 帧源 (需 VI 设备已启用) + worker 线程。
+//   须在 rk_camera_init() 之后调用 (与 lcd_preview_start 同级),
+//   因为 lcd_preview_ensure_source 会操作 VI 通道, 必须先有 VI 设备。
+int rk_camera_start_rknn(void) {
     if (rknn_infer_start() != 0) {
         printf("[rk_camera] rknn start failed\n");
         return -1;
     }
-    printf("[rk_camera] rknn enabled: %s\n", model_path);
+    printf("[rk_camera] rknn started (reuse LCD selfpath channel)\n");
     return 0;
 }
 
