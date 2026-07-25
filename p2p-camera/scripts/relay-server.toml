@@ -1,0 +1,5 @@
+
+use_ipv6 = false
+key_file = "relay-server.key"
+port = 4001
+public_ip = "101.35.90.171"

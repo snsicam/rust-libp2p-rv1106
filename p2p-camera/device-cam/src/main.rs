@@ -35,7 +35,7 @@ use anyhow::{Context, Result};
 use behaviour::Behaviour;
 use clap::Parser;
 use crossbeam_channel::Sender;
-use futures::{AsyncWriteExt, StreamExt};
+use futures::{AsyncReadExt, AsyncWriteExt, StreamExt};
 use libp2p::{
     core::multiaddr::{Multiaddr, Protocol},
     dcutr, identify, identity, noise, relay,
@@ -43,9 +43,11 @@ use libp2p::{
     tcp,
     PeerId,
 };
+use libp2p_stream::Control;
 use net_diag::{ConnectionStrategy, NatDiagnostic, NatType};
 use proto::{
     media_packet::MediaPacket,
+    registry::{RegistryMessage, REGISTRY_PROTOCOL},
     stream_protocols,
 };
 use tokio::sync::broadcast;
@@ -252,6 +254,16 @@ async fn main() -> Result<()> {
     let peer_id = keypair.public().to_peer_id();
     println!("[DeviceCam] PeerId: {peer_id}");
 
+    // 保留一份私钥副本用于向 relay 注册签名 (swarm 会拿走原 keypair)
+    let signing_keypair = keypair.clone();
+
+    // 读取板载序列号 (Linux /proc/cpuinfo 的 Serial；非 Linux 无硬件则返回 None)
+    let serial = read_board_serial();
+    match &serial {
+        Some(s) => println!("[DeviceCam] Board serial: {s} (will register with relay)"),
+        None => println!("[DeviceCam] No board serial configured — relay registry skipped (viewer must use full PeerId)"),
+    }
+
     // ---- 解析 Relay 地址列表 ----
     let relay_states: Vec<RelayState> = config.relays.iter().map(|addr_str| {
         let addr: Multiaddr = addr_str.parse()
@@ -324,6 +336,8 @@ async fn main() -> Result<()> {
 
     // ---- Stream 控制 (三路视频 + 音频 + 向后兼容旧协议) ----
     let mut stream_control = swarm.behaviour().new_stream_control();
+    // 用于向 relay 发送注册表流的独立控制句柄 (可并发)
+    let registry_control = stream_control.clone();
 
     // 主码流
     let mut incoming_main = stream_control
@@ -589,6 +603,19 @@ async fn main() -> Result<()> {
                                         }
                                     }
                                 }
+
+                                // 向 relay 注册 (serial → peer_id) 签名绑定，
+                                // 使 viewer 仅凭短 serial 即可经 relay 解析出真实 PeerId 并连接。
+                                if let Some(ref s) = serial {
+                                    let ctrl = registry_control.clone();
+                                    let kp = signing_keypair.clone();
+                                    let ser = s.clone();
+                                    let self_pid = kp.public().to_peer_id();
+                                    let relay_pid = peer_id; // 此分支内 peer_id 即 relay
+                                    tokio::spawn(async move {
+                                        register_camera_with_relay(ctrl, relay_pid, kp, ser, self_pid).await;
+                                    });
+                                }
                             }
                         } else {
                             println!("[DeviceCam] *** Viewer connected: {peer_id} via {conn_type} ***");
@@ -810,6 +837,85 @@ fn stream_config_to_params(s: &config::StreamConfig) -> rk_video_source::StreamP
         smartp_viridrlen: s.smartp_viridrlen,
         stream_buf_cnt: s.stream_buf_cnt,
         mirror: s.mirror.clone(),
+    }
+}
+
+/// 读取板载序列号
+///
+/// 在 Linux 上从 `/proc/cpuinfo` 的 `Serial` 字段读取板载序列号
+/// (树莓派等单板机每块板唯一，如 `e33700a6620dfddc`)；非 Linux (如 Windows 测试环境)
+/// 无该硬件信息，返回 None，此时不向 relay 注册，viewer 须用完整 PeerId 直连。
+/// 该序列号仅作**公开查找键**，不进入密钥；viewer 经 relay 注册表解析成真实 PeerId。
+fn read_board_serial() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(content) = std::fs::read_to_string("/proc/cpuinfo") {
+            for line in content.lines() {
+                let line = line.trim();
+                if let Some(rest) = line.strip_prefix("Serial") {
+                    if let Some(val) = rest.split(':').nth(1) {
+                        let val = val.trim();
+                        if !val.is_empty() {
+                            return Some(val.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// 打开到 relay 的注册表流，发送 `(serial, peer_id, pubkey, signature)` 注册消息。
+/// 签名 = ed25519(privkey, serial || peer_id)，使绑定不可伪造。
+async fn register_camera_with_relay(
+    mut control: Control,
+    relay_peer: PeerId,
+    keypair: identity::Keypair,
+    serial: String,
+    self_peer: PeerId,
+) {
+    let result: anyhow::Result<()> = async {
+        let mut stream = control
+            .open_stream(relay_peer, REGISTRY_PROTOCOL)
+            .await
+            .map_err(|e| anyhow::anyhow!("open registry stream: {e}"))?;
+        let pubkey = keypair.public().encode_protobuf();
+        let peer_bytes = self_peer.to_bytes();
+        let payload = RegistryMessage::sign_payload(&serial, &peer_bytes);
+        let signature = keypair
+            .sign(&payload)
+            .map_err(|e| anyhow::anyhow!("sign: {e}"))?;
+        let msg = RegistryMessage::Register {
+            serial,
+            peer_id: peer_bytes,
+            pubkey,
+            signature,
+        };
+        stream.write_all(&msg.encode()).await?;
+        stream.flush().await?;
+        // 读取 relay 回执 (用于日志，失败不影响注册)
+        use tokio::time::timeout;
+        let _ = timeout(std::time::Duration::from_secs(3), async {
+            let mut ack = vec![0u8; 1024];
+            let n = stream.read(&mut ack).await?;
+            if n > 0 {
+                if let Ok(RegistryMessage::Error { message }) = RegistryMessage::decode(&ack[..n]) {
+                    tracing::warn!("[DeviceCam] relay rejected registration: {message}");
+                }
+            }
+            Ok::<(), std::io::Error>(())
+        })
+        .await;
+        Ok(())
+    }
+    .await;
+
+    match result {
+        Ok(()) => tracing::info!("[DeviceCam] Registered serial with relay {relay_peer}"),
+        Err(e) => {
+            tracing::warn!("[DeviceCam] Failed to register serial with relay {relay_peer}: {e}")
+        }
     }
 }
 

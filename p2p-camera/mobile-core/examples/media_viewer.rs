@@ -11,7 +11,7 @@
 //!   media_viewer --relay ... --camera ... --play
 //!
 //! GUI 模式 (play=true):
-//!   窗口左侧为设备管理面板，显示 viewer.toml 中 cameras 列表；
+//!   窗口左侧为设备管理面板，显示 viewer.toml 中 camera_serials 设备列表；
 //!   - 单击选中设备，双击设备开始连接并在右侧播放视频
 //!   - [+ Add] 添加设备 (键入或 Ctrl+V 粘贴 PeerId，Enter 确认，Esc 取消)
 //!   - [- Del] 删除选中设备
@@ -63,7 +63,7 @@ async fn main() -> Result<()> {
 
     // 命令行参数覆盖配置文件
     if !opt.relays.is_empty() { config.relays = opt.relays.clone(); }
-    if let Some(ref camera) = opt.camera { config.cameras.insert(0, camera.clone()); }
+    if let Some(ref camera) = opt.camera { config.camera_serials.insert(0, camera.clone()); }
     if let Some(ref output) = opt.output { config.output = Some(output.clone()); }
     if opt.no_audio { config.no_audio = true; }
     #[cfg(feature = "player")]
@@ -273,7 +273,7 @@ async fn run_gui(opt: Opt, mut config: ViewerConfig) -> Result<()> {
     use std::time::Instant;
 
     println!("[Viewer] Initializing SDL player...");
-    let mut player = player::VideoPlayer::new(config.cameras.clone())?;
+    let mut player = player::VideoPlayer::new(config.device_list())?;
 
     let mut audio_player = if !config.no_audio {
         match player::AudioPlayer::new(16000) {
@@ -347,7 +347,8 @@ async fn run_gui(opt: Opt, mut config: ViewerConfig) -> Result<()> {
                     player.set_status(format!("Connecting {} ...", short_id(&cam)));
                 }
                 UiAction::DevicesChanged => {
-                    config.cameras = player.devices().to_vec();
+                    // 设备列表统一存回 camera_serials (serial 与 PeerId 混用均可，连接时自动判定)
+                    config.camera_serials = player.devices().to_vec();
                     match config.save(&opt.config) {
                         Ok(()) => println!("[Viewer] Config saved: {}", opt.config.display()),
                         Err(e) => eprintln!("[Viewer] Failed to save config: {e}"),
@@ -2288,7 +2289,7 @@ struct Opt {
     #[arg(long = "relay")]
     relays: Vec<String>,
 
-    /// 摄像头 (DeviceCam) PeerId (覆盖配置文件)
+    /// 摄像头 (DeviceCam) PeerId 或短序列号 serial (覆盖配置文件)
     #[arg(long)]
     camera: Option<String>,
 
@@ -2329,9 +2330,12 @@ struct ViewerConfig {
     /// 是否启用 mDNS 局域网发现 (默认 true)
     #[serde(default = "default_enable_mdns")]
     enable_mdns: bool,
-    /// 设备列表 (新格式): 多个 DeviceCam PeerId, GUI 设备管理面板可增删
-    #[serde(default)]
-    cameras: Vec<String>,
+    /// 设备列表: 每个元素可以是长 PeerId 或短序列号 serial (如树莓派 /proc/cpuinfo 的
+    /// Serial, 形如 e33700a6620dfddc)。viewer 会自动判定——能 parse 成 PeerId 就直连，
+    /// 否则当 serial 经 relay 注册表解析出真实 PeerId 再连接。GUI 设备管理面板可增删。
+    /// 兼容旧配置的 `cameras` 字段 (serde alias 合并进来)。
+    #[serde(default, alias = "cameras")]
+    camera_serials: Vec<String>,
     /// 视频流类型: "main" | "sub" | "third" (默认 main)
     #[serde(default = "default_stream")]
     stream: String,
@@ -2359,7 +2363,7 @@ impl Default for ViewerConfig {
             relays: Vec::new(),
             relay: String::new(),
             enable_mdns: default_enable_mdns(),
-            cameras: Vec::new(),
+            camera_serials: Vec::new(),
             stream: default_stream(),
             output: None,
             no_audio: false,
@@ -2416,8 +2420,13 @@ impl ViewerConfig {
         }
     }
 
-    /// headless 模式使用的单设备: cameras 列表第一个
-    fn primary_camera(&self) -> Option<&str> {
-        self.cameras.first().map(|s| s.as_str())
+    /// 设备列表 (统一为 camera_serials，连接时自动判定 PeerId / serial)
+    fn device_list(&self) -> Vec<String> {
+        self.camera_serials.clone()
+    }
+
+    /// headless 模式使用的单设备: 设备列表第一个
+    fn primary_camera(&self) -> Option<String> {
+        self.device_list().into_iter().next()
     }
 }

@@ -2,13 +2,18 @@ relays = [
     "/ip4/101.35.90.171/udp/4001/quic-v1/p2p/12D3KooWDGUejVsts1G4tGyf8ukkr73eWxCr1EUfCQxgcbSDUie1",
     "/ip4/101.35.90.171/tcp/4001/p2p/12D3KooWDGUejVsts1G4tGyf8ukkr73eWxCr1EUfCQxgcbSDUie1",
 ]
-relay = ""
+
 enable_mdns = true
-cameras = [
+# 设备列表: 每个元素可以是长 PeerId 或短序列号 serial (如树莓派 /proc/cpuinfo 的
+# Serial: e33700a6620dfddc)。viewer 自动判定——能 parse 成 PeerId 就直连，否则当
+# serial 经 relay 注册表解析出真实 PeerId 再连接。
+# (旧配置中的 `cameras` 字段仍可兼容，会被自动合并进来)
+camera_serials = [
     "12D3KooWG2ihY7Ne75KqkYyYrQWL1ACLUgUN8rp1nTskQB3RNNNt",
     "12D3KooWG2ihY7Ne75KqkYyYrQWL1ACLUgUN8rp1nTskQB3RNaaa",
+    "e33700a6620dfddc",
 ]
-camera = ""
+
 stream = "auto"
 no_audio = false
 play = true

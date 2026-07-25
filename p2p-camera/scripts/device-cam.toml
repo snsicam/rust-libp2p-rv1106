@@ -16,8 +16,6 @@ enable_mdns = true
 # 是否启用 DCUtR 直连打洞。
 # 4G/CGNAT 等入站 UDP 被屏蔽的网络下打洞必然失败，且其握手会挤占中继视频流
 # 写入带宽，导致 SLOW write / 帧丢弃 / 卡顿。viewer 在 4G 时务必设为 false，仅走中继。
-# 方案 B 实测失败（cam 在 4G/CGNAT 对称 NAT，DCUtR 打不通），回退方案 A 强制 main 流，
-# 故此处保持 false，避免打洞握手挤占中继带宽。
 enable_dcutr = false
 
 # 运行模式 (listen: 等待 viewer 连接)
@@ -60,7 +58,7 @@ volume = 50
 # 编码类型: "PCM" (不编码) | "G711A" | "G711U" | "MP2"
 encode_type = "PCM"
 # 编码码率 (bps): G711A = 64000@8kHz, 128000@16kHz; MP2 = 64000+
-bit_rate = 128000
+bit_rate = 16000
 # VQE 语音质量增强 (依赖 vqe_cfg 配置文件)
 enable_vqe = false
 vqe_cfg = "/oem/usr/share/vqefiles/config_aivqe.json"
@@ -77,7 +75,7 @@ vqe_cfg = "/oem/usr/share/vqefiles/config_aivqe.json"
 enabled = true
 # 编码格式: "H265" 或 "H264"
 codec = "H265"
-# 分辨率 (宽 x 高)
+# 分辨率 (宽 x 高) ["2304*1296","1920*1080","1280*720","960*540","640*360","320*240"]
 width = 2304
 height = 1296
 # 帧率: fps = src_frame_rate_num / src_frame_rate_den
@@ -90,9 +88,9 @@ rc_mode = "CBR"
 # RC 质量等级: "highest" | "higher" | "high" | "medium" | "low" | "lower" | "lowest"
 rc_quality = "high"
 # 最大码率 (kbps)
-bitrate_kbps = 2048
-# GOP (I帧间隔，秒数×帧率)；4G 下改为 15 以加快丢帧后恢复
-gop = 15
+bitrate_kbps = 8192
+# GOP (I帧间隔，秒数×帧率)
+gop = 50
 # GOP 模式: "normalP" 或 "smartP"
 gop_mode = "normalP"
 # SmartP 虚拟 I 帧间隔
@@ -116,6 +114,8 @@ dst_frame_rate_den = 1
 rc_mode = "CBR"
 rc_quality = "high"
 bitrate_kbps = 512
+# relay/4G 下链路有丢帧: GOP 越小, 丢 P 帧后解码器冻结到下一个 IDR 的时间越短。
+# 15@30fps≈0.5s 恢复最快; 同时让 request_idr 不可靠时自然 IDR 也很快到来(起播/重连快)。
 gop = 15
 gop_mode = "normalP"
 smartp_viridrlen = 25
@@ -134,11 +134,26 @@ dst_frame_rate_num = 25
 dst_frame_rate_den = 1
 rc_mode = "CBR"
 rc_quality = "high"
-# 第三码流(中清)原 1024kbps 在 4G(<1.5Mbps)下会饱和丢包，降到 500 留余量
-bitrate_kbps = 500
+bitrate_kbps = 1024
 gop = 15
 gop_mode = "normalP"
 smartp_viridrlen = 25
 h264_profile = "high"
 stream_buf_cnt = 2
 mirror = "none"
+
+[lcd]
+enabled = true
+width = 720   # 0 = 自动检测
+height = 720  # 0 = 自动检测
+
+# =========== rknn 目标检测 (rv1106 模式) ==========
+# 复用 lcd_preview 的 selfpath 帧源 (不另开 VI 通道), 推理结果经
+# bbox_shm(/bbox_cam_lvgl) 给 LVGL 画框。LCD 关闭时 rknn 仍可独立运行。
+# enabled=true 需在板端放好 .rknn 模型 (如 luckfox_pico_yolov5 导出的 yolov5.rknn)。
+
+[rknn]
+# 是否启用 rknn 目标检测 (命令行 --rknn-model <path> 可覆盖并自动启用)
+enabled = false
+# .rknn 模型文件路径 (板端绝对路径)
+model_path = "/oem/yolov5.rknn"

@@ -12,17 +12,18 @@ use std::net::Ipv4Addr;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use futures::{AsyncReadExt, StreamExt};
+use futures::{AsyncReadExt, AsyncWriteExt, StreamExt};
 use libp2p::{
     core::multiaddr::{Multiaddr, Protocol},
     dcutr, identify, mdns, noise, ping, relay,
     swarm::{NetworkBehaviour, SwarmEvent},
-    tcp, StreamProtocol, Swarm, PeerId,
+    tcp, StreamProtocol, Swarm, PeerId, identity,
 };
 use libp2p::swarm::behaviour::toggle::Toggle;
 use libp2p_stream::{self, Control};
 use proto::{
     media_packet::{MediaPacket, MediaTrack, FLAG_VIDEO_KEYFRAME},
+    registry::{RegistryMessage, REGISTRY_PROTOCOL},
     stream_protocols,
 };
 use tokio::sync::mpsc;
@@ -219,6 +220,8 @@ pub struct MediaPlayer {
     mdns_cache: std::collections::HashMap<libp2p::PeerId, Multiaddr>,
     /// 控制通道流 (用于发送控制请求)
     control_stream: Option<libp2p::Stream>,
+    /// 当前已连接的 relay peer (用于 serial→peer_id 解析查询)
+    connected_relay: Option<PeerId>,
 }
 
 /// 保存连接参数，用于断连后自动重连
@@ -283,6 +286,7 @@ impl MediaPlayer {
             udp_port: options.udp_port,
             mdns_cache: std::collections::HashMap::new(),
             control_stream: None,
+            connected_relay: None,
         };
 
         // 监听本地 QUIC (指定端口或随机)
@@ -364,8 +368,16 @@ impl MediaPlayer {
         stream_type: &str,
         options: ConnectOptions,
     ) -> Result<()> {
-        let device_cam: PeerId = device_cam_peer_id.parse()?;
-        self.device_cam_peer_id = Some(device_cam);
+        // 判定输入是完整 PeerId 还是短序列号 (serial)
+        // serial 形如树莓派 /proc/cpuinfo 的 Serial (如 e33700a6620dfddc)，
+        // viewer 可仅凭它经 relay 注册表解析出真实 PeerId 再连接，无需手抄长串。
+        let known_device_cam: Option<PeerId> = device_cam_peer_id.parse().ok();
+        if known_device_cam.is_none() {
+            println!(
+                "[Viewer] Input '{}' is not a PeerId — treating as serial, will resolve via relay registry",
+                device_cam_peer_id
+            );
+        }
 
         // 保存连接参数用于重连
         self.connect_params = Some(ConnectParams {
@@ -407,9 +419,11 @@ impl MediaPlayer {
 
         // 优先使用 mDNS 缓存中已有的 device-cam 地址（重连时缓存可能已有）
         if enable_mdns {
-            if let Some(cached_addr) = self.mdns_cache.get(&device_cam) {
-                tracing::info!("[Viewer] Using cached mDNS address for {device_cam}: {cached_addr}");
-                mdns_discovered_addr = Some(cached_addr.clone());
+            if let Some(dc) = known_device_cam {
+                if let Some(cached_addr) = self.mdns_cache.get(&dc) {
+                    tracing::info!("[Viewer] Using cached mDNS address for {dc}: {cached_addr}");
+                    mdns_discovered_addr = Some(cached_addr.clone());
+                }
             }
         }
 
@@ -450,6 +464,7 @@ impl MediaPlayer {
                             if is_relay && connected_relay.is_none() {
                                 tracing::info!("[Viewer] Connected to relay {peer_id}");
                                 connected_relay = Some((peer_id, addr));
+                                self.connected_relay = Some(peer_id);
                             }
                         }
                         SwarmEvent::Behaviour(ViewerBehaviourEvent::Mdns(
@@ -471,9 +486,11 @@ impl MediaPlayer {
                                         entry.or_insert(addr.clone());
                                     }
                                 }
-                                if peer_id == device_cam && mdns_discovered_addr.is_none() {
-                                    tracing::info!("[Viewer] mDNS found target DeviceCam {peer_id} at {addr}");
-                                    mdns_discovered_addr = Some(addr);
+                                if let Some(dc) = known_device_cam {
+                                    if peer_id == dc && mdns_discovered_addr.is_none() {
+                                        tracing::info!("[Viewer] mDNS found target DeviceCam {peer_id} at {addr}");
+                                        mdns_discovered_addr = Some(addr);
+                                    }
                                 }
                             }
                         }
@@ -504,6 +521,25 @@ impl MediaPlayer {
                 }
             }
         }
+
+        // 归一化: 若输入是 serial，经 relay registry 解析成真实 peer id (并验签)
+        let connected_relay_peer = connected_relay.as_ref().map(|(p, _)| *p);
+        let device_cam = if let Some(pid) = known_device_cam {
+            pid
+        } else {
+            let relay_pid = connected_relay_peer.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "无法解析序列号 '{}'：未连接到任何 Relay（请检查 relays 配置）",
+                    device_cam_peer_id
+                )
+            })?;
+            println!("[Viewer] Resolving serial {} via relay {} ...", device_cam_peer_id, relay_pid);
+            let (pid, _pk) = self.query_registry(relay_pid, device_cam_peer_id).await?;
+            println!("[Viewer] Resolved serial {} -> peer {}", device_cam_peer_id, pid);
+            pid
+        };
+        self.device_cam_peer_id = Some(device_cam);
+        self.connected_relay = connected_relay_peer;
 
         // 优先使用 mDNS 发现的 LAN 直连
         if let Some(lan_addr) = mdns_discovered_addr {
@@ -582,6 +618,73 @@ impl MediaPlayer {
 
         self.connected = true;
         Ok(())
+    }
+
+    /// 经 relay 注册表把短序列号解析成真实 PeerId。
+    ///
+    /// 同时用返回的公钥验签，确认 `(serial → peer_id)` 绑定真实无误
+    /// (防止中间人返回伪造的 peer_id)。仅当输入是 serial 时才需调用。
+    pub async fn query_registry(
+        &mut self,
+        relay_peer: PeerId,
+        serial: &str,
+    ) -> Result<(PeerId, identity::PublicKey)> {
+        let mut stream = self
+            .stream_control
+            .open_stream(relay_peer, REGISTRY_PROTOCOL)
+            .await
+            .map_err(|e| anyhow::anyhow!("open registry stream to relay: {e}"))?;
+        let msg = RegistryMessage::Query {
+            serial: serial.to_string(),
+        };
+        stream.write_all(&msg.encode()).await?;
+        stream.flush().await?;
+
+        // 读取 relay 响应 (注册表消息很小，单次或少量读取即可)
+        let mut buf: Vec<u8> = Vec::with_capacity(256);
+        let mut tmp = [0u8; 1024];
+        loop {
+            let n = stream.read(&mut tmp).await?;
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&tmp[..n]);
+            if RegistryMessage::decode(&buf).is_ok() {
+                break;
+            }
+            if buf.len() >= 4096 {
+                break;
+            }
+        }
+        if buf.is_empty() {
+            anyhow::bail!("registry stream closed without response");
+        }
+        let resp = RegistryMessage::decode(&buf)?;
+        match resp {
+            RegistryMessage::Response {
+                peer_id,
+                pubkey,
+                signature,
+            } => {
+                let claimed = PeerId::from_bytes(&peer_id)
+                    .map_err(|e| anyhow::anyhow!("invalid peer_id from registry: {e}"))?;
+                let pk = identity::PublicKey::try_decode_protobuf(&pubkey)
+                    .map_err(|e| anyhow::anyhow!("invalid pubkey from registry: {e}"))?;
+                if pk.to_peer_id() != claimed {
+                    anyhow::bail!("registry: pubkey/peer_id 不匹配");
+                }
+                let payload = RegistryMessage::sign_payload(serial, &peer_id);
+                if !pk.verify(&payload, &signature) {
+                    anyhow::bail!("registry: 签名无效，绑定可能被篡改");
+                }
+                Ok((claimed, pk))
+            }
+            RegistryMessage::NotFound => {
+                anyhow::bail!("serial '{serial}' 未在 relay 注册表中找到 (相机是否已上线？)")
+            }
+            RegistryMessage::Error { message } => anyhow::bail!("relay registry 错误: {message}"),
+            _ => anyhow::bail!("registry: 意外的响应类型"),
+        }
     }
 
     /// 获取下一个视频帧 (供 Native UI 层轮询)
