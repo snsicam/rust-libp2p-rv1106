@@ -905,6 +905,12 @@ mod player {
     /// 加载系统 TTF 字体 (fontdue 纯 Rust 光栅化, 无需 SDL2_ttf)
     fn load_font() -> Result<fontdue::Font> {
         const CANDIDATES: &[&str] = &[
+            // Windows
+            "C:\\Windows\\Fonts\\consola.ttf",
+            "C:\\Windows\\Fonts\\cour.ttf",
+            "C:\\Windows\\Fonts\\arial.ttf",
+            "C:\\Windows\\Fonts\\segoeui.ttf",
+            // Linux
             "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
             "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
@@ -925,6 +931,12 @@ mod player {
     /// 加载中文 fallback 字体 (主等宽字体不含 CJK 字形, 中文需回退到此字体)
     fn load_cjk_font() -> Option<fontdue::Font> {
         const CANDIDATES: &[&str] = &[
+            // Windows (微软雅黑 / 宋体)
+            "C:\\Windows\\Fonts\\msyh.ttc",
+            "C:\\Windows\\Fonts\\msyh.ttf",
+            "C:\\Windows\\Fonts\\simsun.ttc",
+            "C:\\Windows\\Fonts\\simhei.ttf",
+            // Linux
             "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
             "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
             "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",

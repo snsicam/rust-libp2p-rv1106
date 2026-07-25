@@ -5,6 +5,37 @@ fn main() {
     std::fs::write(&stamp_path, &build_time).unwrap();
     println!("cargo:rerun-if-changed={}", stamp_path.display());
     println!("cargo:rustc-env=BUILD_TIME={build_time}");
+
+    #[cfg(target_os = "windows")]
+    windows_setup();
+}
+
+#[cfg(target_os = "windows")]
+fn windows_setup() {
+    if std::env::var("LIBCLANG_PATH").is_err() {
+        let vcpkg_root = std::env::var("VCPKG_ROOT").ok();
+        let candidates: Vec<std::path::PathBuf> = {
+            let mut paths = Vec::new();
+            if let Some(ref root) = vcpkg_root {
+                paths.push(std::path::PathBuf::from(root)
+                    .join("installed").join("x64-windows")
+                    .join("tools").join("llvm").join("bin"));
+            }
+            paths.push(std::path::PathBuf::from(r"C:\Program Files\LLVM\bin"));
+            paths
+        };
+        let found = candidates.iter().find(|p| p.join("libclang.dll").exists());
+        if let Some(path) = found {
+            println!("cargo:rustc-env=LIBCLANG_PATH={}", path.display());
+            println!("cargo:warning=[INFO] Auto-detected LIBCLANG_PATH={}", path.display());
+        } else {
+            println!("cargo:warning=[WARN] LIBCLANG_PATH not set, bindgen may fail. Install LLVM or set LIBCLANG_PATH manually.");
+        }
+    }
+
+    if std::env::var("VCPKGRS_DYNAMIC").is_err() {
+        println!("cargo:warning=[INFO] Set VCPKGRS_DYNAMIC=1 for dynamic linking with vcpkg ffmpeg/SDL2");
+    }
 }
 
 fn chrono_now() -> String {

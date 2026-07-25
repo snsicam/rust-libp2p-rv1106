@@ -33,13 +33,22 @@ proto = { path = "../proto" }
 # 可选: 实时播放 (player feature)
 # ffmpeg-next 版本需匹配系统 ffmpeg:
 #   "6" → ffmpeg 6.x (Ubuntu 24.04 默认 6.1.1)
-#   "7" → ffmpeg 7.x (需手动安装)
+#   "7" → ffmpeg 7.x (vcpkg Windows 默认安装 7.1, libavcodec 62)
 # 注意: ffmpeg-next 6.1.1 的 codec/software-scaling 内部引用 format 模块,
 #       无法用 default-features=false 禁用 format, 必须保留默认 features.
 # 系统依赖 (Ubuntu): sudo apt install libavcodec-dev libavformat-dev libavutil-dev \
 #                                      libswscale-dev libswresample-dev libavfilter-dev \
 #                                      libavdevice-dev libsdl2-dev clang
-ffmpeg-next = { version = "6", optional = true }
+#
+# Windows 编译:
+#   1. 安装 vcpkg: git clone https://github.com/microsoft/vcpkg && .\vcpkg\bootstrap-vcpkg.bat
+#   2. 安装依赖: vcpkg install ffmpeg:x64-windows sdl2:x64-windows
+#   3. 设置环境变量: $env:VCPKGRS_DYNAMIC="1"; $env:LIBCLANG_PATH="<LLVM_path>"
+#   4. 编译: cargo build --example media_viewer --features player
+#   5. 或使用脚本: .\scripts\build_viewer.ps1
+ffmpeg-next = { version = "8", optional = true }
+# Windows 上 sdl2 可通过 vcpkg 链接；若 vcpkg 不可用，可启用 bundled feature
+# 从源码编译 SDL2: sdl2 = { version = "0.37", optional = true, features = ["bundled"] }
 sdl2 = { version = "0.37", optional = true }
 # 纯 Rust 字体光栅化, 用于 media_viewer 设备管理面板文字绘制 (系统未装 SDL2_ttf)
 fontdue = { version = "0.9", optional = true }
