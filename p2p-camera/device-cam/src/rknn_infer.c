@@ -24,6 +24,7 @@
 #include "lcd_preview.h"        // 帧源 (selfpath) + 消费者注册 + 屏幕子矩形
 #include "bbox_shm.h"           // cam<->LVGL 检测框通道
 #include "rk_mpi_mb.h"          // RK_MPI_MB_Handle2VirAddr: DMABUF 帧取 CPU 虚拟地址
+#include "rk_mpi_sys.h"         // RK_MPI_SYS_MmzAlloc: 分配"自有"显示缓冲 (消除与 VI 环形缓冲竞争)
 
 // ---- 后处理结果结构 (对齐例子 postprocess.h) ----
 #define OBJ_NUMB_MAX_SIZE  128
@@ -90,6 +91,19 @@ static bbox_shm_t *g_shm = NULL;
 static pthread_t g_worker = 0;
 static volatile int g_quit = 0;
 static int g_running = 0;
+
+// 推理预处理复用缓冲 (避免每帧 malloc 1.5MB)
+static uint8_t *g_bgr_buf = NULL;
+static size_t   g_bgr_cap = 0;
+
+// 自有显示缓冲池: 回调把"带框副本"画在这批 MB 上送 VO。
+// 关键: 不画在 VI 环形缓冲上 —— 否则下一帧 VI 捕获会覆盖框像素(VO 还没扫完),
+// 造成框闪烁; 自有缓冲 VO 显示完才释放引用, 我们用 round-robin 复用(安全)。
+#define DISP_POOL 3
+static MB_BLK    g_disp_mb[DISP_POOL];
+static uint8_t  *g_disp_vaddr[DISP_POOL];
+static long long g_disp_sent[DISP_POOL];
+static int       g_disp_w = 0, g_disp_h = 0, g_disp_stride = 0;
 
 // ===================================================================
 //  数学小工具 (对齐例子 postprocess.cc)
@@ -333,9 +347,111 @@ static volatile long g_cb_calls = 0;    // 回调被泵调用次数 (诊断)
 static volatile long g_cb_queued = 0;   // 成功入队帧数 (诊断)
 static volatile long g_overlay_frames = 0; // 已画框的显示帧数 (诊断)
 
-// ---- 在 NV12 帧上画检测框 (参考 rknn 例子 cv::rectangle, 但直接画在硬件 VO 帧) ----
-// 把框画进送 VO 的 NV12 像素, 不依赖 fb0 图层叠加, 避开 VOP 层序/alpha 风险。
+// ---- 逐物体跟踪缓存 + 时间平滑 (消除静止物体框闪烁 / 幽灵框累积) ----
+// g_track: 每个"物体"一条记录, 位置随时间平滑收敛, 各自有 last(最近一次匹配时间)。
+// 仅在 (now - last) > BOX_PERSIST_MS 时才清除单条记录(物体真正离开), 故静止物体框稳。
+// 匹配按 类别+IoU 贪心指派, 避免同一物体产生多个幽灵框(旧版 cache 会无限累积→全屏乱闪)。
+#ifndef MAX
+#define MAX(a,b) ((a)>(b)?(a):(b))
+#endif
+#ifndef MIN
+#define MIN(a,b) ((a)<(b)?(a):(b))
+#endif
+typedef struct { bbox_t b; long long last; int used; } track_t;
+static pthread_mutex_t g_track_lock = PTHREAD_MUTEX_INITIALIZER;
+static track_t g_track[BBOX_SHM_MAX_BOXES];
+static int     g_track_n = 0;
+#define BOX_PERSIST_MS 1500                // 超过该时长未匹配任何检出 -> 清除该物体
+#define BOX_SMOOTH_W   0.3f                // 新检测融合权重(越小越稳)
+#define BOX_MATCH_IOU  0.4f                // 同类别匹配 IoU 阈值
+static long long now_ms(void) {
+    struct timeval tv; gettimeofday(&tv, NULL);
+    return (long long)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+}
+static float box_iou(const bbox_t *a, const bbox_t *b) {
+    int x1 = MAX(a->x, b->x), y1 = MAX(a->y, b->y);
+    int x2 = MIN(a->x + a->w, b->x + b->w), y2 = MIN(a->y + a->h, b->y + b->h);
+    int iw = x2 - x1, ih = y2 - y1;
+    if (iw <= 0 || ih <= 0) return 0.f;
+    int inter = iw * ih;
+    int ua = a->w * a->h + b->w * b->h - inter;
+    return ua > 0 ? (float)inter / ua : 0.f;
+}
+// worker 每检出一次调用: 对检出框(按置信度降序)贪心匹配缓存里同类别 IoU 最佳者做平滑;
+// 未匹配且未满则新增; 过期(>BOX_PERSIST_MS 无匹配)的记录在此删除。
+static void update_box_cache(const bbox_t *boxes, int n) {
+    long long t = now_ms();
+    pthread_mutex_lock(&g_track_lock);
+    // 1) 删除过期记录
+    for (int i = 0; i < g_track_n; ) {
+        if (t - g_track[i].last > BOX_PERSIST_MS) {
+            g_track[i] = g_track[g_track_n - 1];
+            g_track_n--;
+        } else i++;
+    }
+    if (n <= 0) { pthread_mutex_unlock(&g_track_lock); return; }
+    if (n > BBOX_SHM_MAX_BOXES) n = BBOX_SHM_MAX_BOXES;
+    // 2) 按 score 降序排列检出索引
+    int ord[BBOX_SHM_MAX_BOXES];
+    for (int i = 0; i < n; i++) ord[i] = i;
+    for (int i = 1; i < n; i++) {
+        int k = ord[i], j = i - 1;
+        while (j >= 0 && boxes[ord[j]].score < boxes[k].score) {
+            ord[j + 1] = ord[j]; j--;
+        }
+        ord[j + 1] = k;
+    }
+    for (int i = 0; i < g_track_n; i++) g_track[i].used = 0;
+    // 3) 贪心指派
+    for (int oi = 0; oi < n; oi++) {
+        const bbox_t *nb = &boxes[ord[oi]];
+        int mi = -1; float best = BOX_MATCH_IOU;
+        for (int j = 0; j < g_track_n; j++) {
+            if (g_track[j].used || g_track[j].b.cls != nb->cls) continue;
+            float v = box_iou(&g_track[j].b, nb);
+            if (v > best) { best = v; mi = j; }
+        }
+        if (mi >= 0) {
+            bbox_t *c = &g_track[mi].b;
+            c->x     = (int32_t)(c->x     * (1 - BOX_SMOOTH_W) + nb->x     * BOX_SMOOTH_W);
+            c->y     = (int32_t)(c->y     * (1 - BOX_SMOOTH_W) + nb->y     * BOX_SMOOTH_W);
+            c->w     = (int32_t)(c->w     * (1 - BOX_SMOOTH_W) + nb->w     * BOX_SMOOTH_W);
+            c->h     = (int32_t)(c->h     * (1 - BOX_SMOOTH_W) + nb->h     * BOX_SMOOTH_W);
+            c->score = nb->score;
+            g_track[mi].last = t;
+            g_track[mi].used = 1;
+        } else if (g_track_n < BBOX_SHM_MAX_BOXES) {
+            g_track[g_track_n].b = *nb;
+            g_track[g_track_n].last = t;
+            g_track[g_track_n].used = 1;
+            g_track_n++;
+        }
+    }
+    pthread_mutex_unlock(&g_track_lock);
+}
+
+// ---- 在 NV12 帧上画检测框 + 类别标签 (对齐例子 cv::rectangle + cv::putText) ----
+// 把框画进我们"自有"的显示缓冲 NV12 像素(由泵送 VO), 不依赖 fb0 图层, 避开 VOP 层序/alpha。
 #define BOX_THICK 3
+
+// COCO 80 类名 (与例子 coco_cls_to_name 一致)
+static const char *g_coco_names[OBJ_CLASS_NUM] = {
+    "person","bicycle","car","motorcycle","airplane","bus","train","truck","boat",
+    "traffic light","fire hydrant","stop sign","parking meter","bench","bird","cat",
+    "dog","horse","sheep","cow","elephant","bear","zebra","giraffe","backpack",
+    "umbrella","handbag","tie","suitcase","frisbee","skis","snowboard","sports ball",
+    "kite","baseball bat","baseball glove","skateboard","surfboard","tennis racket",
+    "bottle","wine glass","cup","fork","knife","spoon","bowl","banana","apple",
+    "sandwich","orange","broccoli","carrot","hot dog","pizza","donut","cake","chair",
+    "couch","potted plant","bed","dining table","toilet","tv","laptop","mouse","remote",
+    "keyboard","cell phone","microwave","oven","toaster","sink","refrigerator","book",
+    "clock","vase","scissors","teddy bear","hair drier","toothbrush",
+};
+static const char *cls_name(int cls) {
+    if (cls < 0 || cls >= OBJ_CLASS_NUM) return "obj";
+    return g_coco_names[cls];
+}
+
 // 调色板 (Y,U,V), 按 COCO 类别取模上色
 static const uint8_t g_box_pal[][3] = {
     {255,128,128}, // 0 白
@@ -349,6 +465,58 @@ static const uint8_t g_box_pal[][3] = {
     { 76, 85,255}, // 8
     {150, 46, 21}, // 9
 };
+
+// ---- 5x7 点阵字体 (a-z, 0-9, 空格, '.', '%'), 每字形 7 行 x 5 列, 行字节 bit4..0 = 列0..4 ----
+static const uint8_t g_font[39][7] = {
+    {0x00,0x00,0x00,0x00,0x00,0x00,0x00}, // 0 space
+    {0x0E,0x11,0x11,0x1F,0x11,0x11,0x11}, // 1 a
+    {0x1E,0x11,0x11,0x1E,0x11,0x11,0x1E}, // 2 b
+    {0x0E,0x11,0x10,0x10,0x10,0x11,0x0E}, // 3 c
+    {0x0F,0x11,0x11,0x11,0x11,0x11,0x0F}, // 4 d
+    {0x0E,0x11,0x11,0x1E,0x10,0x11,0x0E}, // 5 e
+    {0x0E,0x08,0x08,0x0E,0x08,0x08,0x08}, // 6 f
+    {0x0E,0x11,0x11,0x1F,0x11,0x11,0x17}, // 7 g
+    {0x10,0x10,0x10,0x1E,0x11,0x11,0x11}, // 8 h
+    {0x04,0x00,0x04,0x04,0x04,0x04,0x04}, // 9 i
+    {0x02,0x00,0x02,0x02,0x02,0x12,0x0C}, // 10 j
+    {0x10,0x10,0x14,0x18,0x14,0x12,0x11}, // 11 k
+    {0x06,0x04,0x04,0x04,0x04,0x04,0x0E}, // 12 l
+    {0x11,0x1B,0x1F,0x1B,0x1B,0x1B,0x1B}, // 13 m
+    {0x11,0x19,0x15,0x15,0x15,0x15,0x15}, // 14 n
+    {0x0E,0x11,0x11,0x11,0x11,0x11,0x0E}, // 15 o
+    {0x1E,0x11,0x11,0x1E,0x10,0x10,0x10}, // 16 p
+    {0x0F,0x11,0x11,0x11,0x15,0x13,0x0D}, // 17 q
+    {0x11,0x11,0x14,0x18,0x14,0x11,0x11}, // 18 r
+    {0x0E,0x11,0x10,0x0E,0x01,0x11,0x0E}, // 19 s
+    {0x04,0x04,0x04,0x0E,0x04,0x04,0x04}, // 20 t
+    {0x11,0x11,0x11,0x11,0x11,0x11,0x0E}, // 21 u
+    {0x11,0x11,0x11,0x11,0x0A,0x0A,0x04}, // 22 v
+    {0x1B,0x1B,0x1B,0x1B,0x1B,0x15,0x15}, // 23 w
+    {0x11,0x11,0x0A,0x04,0x0A,0x11,0x11}, // 24 x
+    {0x11,0x11,0x0A,0x04,0x04,0x04,0x04}, // 25 y
+    {0x1F,0x01,0x02,0x04,0x08,0x10,0x1F}, // 26 z
+    {0x0E,0x11,0x13,0x15,0x19,0x11,0x0E}, // 27 0
+    {0x04,0x0C,0x04,0x04,0x04,0x04,0x0E}, // 28 1
+    {0x0E,0x11,0x01,0x02,0x04,0x08,0x1F}, // 29 2
+    {0x1F,0x10,0x1E,0x10,0x01,0x11,0x0E}, // 30 3
+    {0x10,0x18,0x14,0x12,0x1F,0x10,0x10}, // 31 4
+    {0x1F,0x11,0x1E,0x01,0x01,0x11,0x0E}, // 32 5
+    {0x06,0x08,0x10,0x1E,0x11,0x11,0x0E}, // 33 6
+    {0x1F,0x01,0x02,0x04,0x08,0x08,0x08}, // 34 7
+    {0x0E,0x11,0x11,0x0E,0x11,0x11,0x0E}, // 35 8
+    {0x0E,0x11,0x11,0x0F,0x01,0x02,0x0C}, // 36 9
+    {0x00,0x00,0x00,0x00,0x00,0x06,0x06}, // 37 .
+    {0x15,0x15,0x04,0x08,0x13,0x15,0x15}, // 38 %
+};
+static int font_idx(char c) {
+    if (c == ' ') return 0;
+    if (c >= 'a' && c <= 'z') return 1 + (c - 'a');
+    if (c >= '0' && c <= '9') return 27 + (c - '0');
+    if (c == '.') return 37;
+    if (c == '%') return 38;
+    return -1; // 不支持字符 -> 跳过
+}
+
 static inline void nv12_set_px(uint8_t *base, int stride, int h,
                                int px, int py, uint8_t Y, uint8_t U, uint8_t V) {
     if (px < 0 || py < 0 || px >= stride || py >= h) return;
@@ -357,11 +525,47 @@ static inline void nv12_set_px(uint8_t *base, int stride, int h,
     base[(size_t)stride * h + uidx]     = U;
     base[(size_t)stride * h + uidx + 1] = V;
 }
-// box 已是屏幕子矩形坐标; 减 disp 偏移得 selfpath 帧内坐标再画。
+static void fill_rect_nv12(uint8_t *base, int w, int h, int stride,
+                           int x0, int y0, int x1, int y1,
+                           uint8_t Y, uint8_t U, uint8_t V) {
+    int cx0 = x0 < 0 ? 0 : x0, cy0 = y0 < 0 ? 0 : y0;
+    int cx1 = x1 > w ? w : x1, cy1 = y1 > h ? h : y1;
+    for (int yy = cy0; yy < cy1; yy++)
+        for (int xx = cx0; xx < cx1; xx++)
+            nv12_set_px(base, stride, h, xx, yy, Y, U, V);
+}
+// 在 (px,py) 处画字符串(5x7 字体, 字符间距 1px), 颜色 (Y,U,V)
+static void draw_text_nv12(uint8_t *base, int w, int h, int stride,
+                           int px, int py, const char *s,
+                           uint8_t Y, uint8_t U, uint8_t V) {
+    int cur = px;
+    for (const char *p = s; *p; p++) {
+        int gi = font_idx(*p);
+        if (gi < 0) { cur += 6; continue; }
+        const uint8_t *g = g_font[gi];
+        for (int r = 0; r < 7; r++) {
+            uint8_t row = g[r];
+            for (int c = 0; c < 5; c++) {
+                if (row & (1u << (4 - c)))
+                    nv12_set_px(base, stride, h, cur + c, py + r, Y, U, V);
+            }
+        }
+        cur += 6;
+        if (cur > w) break;
+    }
+}
+
+// boxes 已是屏幕子矩形坐标; 减 disp 偏移得 selfpath 帧内坐标再画。
+// 每框: 彩色边框 + 顶部类别标签(填充底色 + 暗色文字, 便于在复杂背景上读)。
+// 过期的单条记录 (now - last > BOX_PERSIST_MS) 跳过不画(物体已离开)。
 static void draw_boxes_on_nv12(uint8_t *base, int w, int h, int stride,
-                               const bbox_snapshot_t *snap, int disp_x, int disp_y) {
-    for (int i = 0; i < snap->count; i++) {
-        const bbox_t *b = &snap->boxes[i];
+                               const track_t *boxes, int count, int disp_x, int disp_y) {
+    char label[48];
+    long long now = now_ms();
+    for (int i = 0; i < count; i++) {
+        const track_t *t = &boxes[i];
+        if (now - t->last > BOX_PERSIST_MS) continue;  // 已过期, 不画
+        const bbox_t *b = &t->b;
         int x0 = b->x - disp_x, y0 = b->y - disp_y;
         int x1 = x0 + b->w,      y1 = y0 + b->h;
         int cx0 = x0 < 0 ? 0 : x0;
@@ -371,33 +575,43 @@ static void draw_boxes_on_nv12(uint8_t *base, int w, int h, int stride,
         if (cx1 <= cx0 || cy1 <= cy0) continue;
         const uint8_t *c = g_box_pal[b->cls % 10];
         uint8_t Y = c[0], U = c[1], V = c[2];
-        int t = BOX_THICK;
+        // 边框
+        int th = BOX_THICK;
         for (int yy = cy0; yy < cy1; yy++) {
             for (int xx = cx0; xx < cx1; xx++) {
-                int edge = (yy < cy0 + t) || (yy >= cy1 - t) ||
-                           (xx < cx0 + t) || (xx >= cx1 - t);
+                int edge = (yy < cy0 + th) || (yy >= cy1 - th) ||
+                           (xx < cx0 + th) || (xx >= cx1 - th);
                 if (edge) nv12_set_px(base, stride, h, xx, yy, Y, U, V);
             }
         }
+        // 标签: "name 92"
+        snprintf(label, sizeof(label), "%s %d", cls_name(b->cls),
+                 (int)(b->score * 100));
+        int tw = (int)strlen(label) * 6;          // 文字像素宽 (5+1 间距)
+        int lx0 = cx0, ly0 = cy0 - 9;             // 标签条置于框顶上方
+        if (ly0 < 0) { ly0 = cy0 + 1; }           // 顶部越界则放框内
+        int lx1 = lx0 + tw, ly1 = ly0 + 8;
+        if (lx1 > w) lx1 = w;
+        fill_rect_nv12(base, w, h, stride, lx0, ly0, lx1, ly1, Y, U, V); // 底色=框色
+        draw_text_nv12(base, w, h, stride, lx0 + 1, ly0 + 1, label, 16, 128, 128); // 暗色字
     }
 }
 
-static void rknn_frame_cb(const VIDEO_FRAME_INFO_S *frame, void *ctx) {
+static int rknn_frame_cb(const VIDEO_FRAME_INFO_S *frame, VIDEO_FRAME_INFO_S *out_frame, void *ctx) {
     (void)ctx;
     g_cb_calls++;
     size_t next = g_prod_idx + 1;
-    if (next - g_cons_idx >= FRAME_SLOTS) return;  // 满, 丢帧 (不阻塞泵)
+    if (next - g_cons_idx >= FRAME_SLOTS) return 0;  // 满, 丢帧 (不阻塞泵)
     frame_slot_t *s = &g_slots[g_prod_idx % FRAME_SLOTS];
     int w = (int)frame->stVFrame.u32Width;
     int h = (int)frame->stVFrame.u32Height;
     int stride = (int)frame->stVFrame.u32VirWidth;
     // selfpath 通道是 DMABUF, pVirAddr 为 NULL; 须用 Handle2VirAddr 经 pMbBlk 取 CPU 虚拟地址
-    // (NV12: Y 平面在 base, UV 平面在 base + stride*h)。参考 SDK test_mpi_vi.cpp:2286。
     uint8_t *base = (uint8_t *)RK_MPI_MB_Handle2VirAddr(frame->stVFrame.pMbBlk);
     if (base == NULL) {
         static int warn = 0;
         if (!warn) { printf("[rknn] WARN: Handle2VirAddr NULL (DMABUF pMbBlk)\n"); warn = 1; }
-        return;
+        return 0;
     }
     // NV12: Y 平面 = stride*h, UV 平面(stride*h/2), 二者连续: Y 在 base, UV 在 base+stride*h
     uint32_t y_sz  = (uint32_t)stride * (uint32_t)h;
@@ -411,29 +625,63 @@ static void rknn_frame_cb(const VIDEO_FRAME_INFO_S *frame, void *ctx) {
     memcpy(s->nv12,                  base, y_sz);
     memcpy(s->nv12 + y_sz, base + y_sz, uv_sz);
     s->w = w; s->h = h; s->stride = stride;
-
-    // 直接在本帧 NV12 上画最新检测框 (送 VO 即带框显示, 参考 rknn 例子 cv::rectangle)。
-    // 此帧随后由泵 SendFrame 送显; rknn 推理用的是上面已拷贝的干净 s->nv12, 不受影响。
-    if (g_shm) {
-        bbox_snapshot_t snap;
-        if (bbox_shm_acquire(g_shm, &snap) && snap.count > 0) {
-            int dx, dy, dw, dh;
-            lcd_preview_get_disp_rect(&dx, &dy, &dw, &dh);  // 屏幕子矩形偏移
-            draw_boxes_on_nv12(base, w, h, stride, &snap, dx, dy);
-            g_overlay_frames++;
-            if (g_overlay_frames == 1) {
-                printf("[rknn] overlay active: drawing %d boxes on VO frame\n", snap.count);
-                fflush(stdout);
-            }
-        }
-    }
-
     g_prod_idx = next;
     if (g_cb_queued == 0) {
         printf("[rknn] first frame queued: %dx%d stride=%d base=%p\n", w, h, stride, (void *)base);
         fflush(stdout);
     }
     g_cb_queued++;
+
+    // 把"带框副本"画到自有显示缓冲并交回泵送 VO:
+    // 选最久未送的缓冲(round-robin, 保证 VO 已显示完上一轮 -> 无竞争)。
+    int slot = 0; long long oldest = g_disp_sent[0];
+    for (int i = 1; i < DISP_POOL; i++)
+        if (g_disp_sent[i] < oldest) { oldest = g_disp_sent[i]; slot = i; }
+    uint8_t *d = g_disp_vaddr[slot];
+    if (d == NULL) return 0;  // 自有缓冲未分配 -> 退回送原始帧(无框)
+    memcpy(d,     base, y_sz);
+    memcpy(d + y_sz, base + y_sz, uv_sz);
+
+    // 画"逐物体跟踪缓存"里的框 + 标签 (送 VO 即带框显示, 参考 rknn 例 cv::rectangle/cv::putText)。
+    // 过期条目由 draw_boxes_on_nv12 内部跳过(不在此修改 g_track, 避免破坏跟踪状态)。
+    int n = 0;
+    pthread_mutex_lock(&g_track_lock);
+    n = g_track_n;
+    if (n > 0) {
+        int dx, dy, dw, dh;
+        lcd_preview_get_disp_rect(&dx, &dy, &dw, &dh);  // 屏幕子矩形偏移
+        draw_boxes_on_nv12(d, w, h, stride, g_track, n, dx, dy);
+        g_overlay_frames++;
+        if (g_overlay_frames == 1) {
+            printf("[rknn] overlay active: drawing %d tracked boxes (with labels) on own buffer\n", n);
+            fflush(stdout);
+        }
+    }
+    pthread_mutex_unlock(&g_track_lock);
+
+    // 填充分发帧: 复制 selfpath 帧的全部元数据(分辨率/格式/压缩/序列号等 VO 必需字段),
+    // 仅把像素缓冲替换成我们"自有 MB"(画了框的副本)。VO 显示完释放其引用, 我们仍持有可复用。
+    memset(out_frame, 0, sizeof(*out_frame));
+    const VIDEO_FRAME_S *sf = &frame->stVFrame;
+    VIDEO_FRAME_S *df = &out_frame->stVFrame;
+    df->u32Width      = sf->u32Width;
+    df->u32Height     = sf->u32Height;
+    df->u32VirWidth   = sf->u32VirWidth;
+    df->u32VirHeight  = sf->u32VirHeight;
+    df->enField       = sf->enField;
+    df->enPixelFormat = sf->enPixelFormat;
+    df->enVideoFormat = sf->enVideoFormat;
+    df->enCompressMode = sf->enCompressMode;
+    df->enDynamicRange = sf->enDynamicRange;
+    df->enColorGamut  = sf->enColorGamut;
+    df->u32TimeRef    = sf->u32TimeRef;
+    df->u64PTS        = sf->u64PTS;
+    df->u32FrameFlag  = sf->u32FrameFlag;
+    df->pMbBlk        = g_disp_mb[slot];
+    df->pVirAddr[0]   = d;
+    df->pVirAddr[1]   = d + (size_t)stride * h;  // NV12: UV 平面紧跟 Y 之后
+    g_disp_sent[slot] = now_ms();
+    return 1;  // 送 out_frame
 }
 
 // ===================================================================
@@ -450,8 +698,10 @@ static void *rknn_worker(void *arg) {
         struct timeval tvn; gettimeofday(&tvn, NULL);
         long long now = (long long)tvn.tv_sec * 1000000 + tvn.tv_usec;
         if (now - stat_us >= 5000000) {
-            printf("[rknn][STAT] cb_calls=%ld queued=%ld infers=%ld dets=%ld over=%ld\n",
-                   g_cb_calls, g_cb_queued, infers, dets, g_overlay_frames);
+            int cn = 0;
+            pthread_mutex_lock(&g_track_lock); cn = g_track_n; pthread_mutex_unlock(&g_track_lock);
+            printf("[rknn][STAT] cb_calls=%ld queued=%ld infers=%ld dets=%ld over=%ld track=%d\n",
+                   g_cb_calls, g_cb_queued, infers, dets, g_overlay_frames, cn);
             fflush(stdout);
             stat_us = now; infers = 0; dets = 0;
         }
@@ -460,11 +710,14 @@ static void *rknn_worker(void *arg) {
         frame_slot_t *s = &g_slots[g_cons_idx % FRAME_SLOTS];
         int fw = s->w, fh = s->h, fstride = s->stride;
 
-        uint8_t *bgr = (uint8_t *)malloc((size_t)fw * fh * 3);
-        nv12_to_bgr(s->nv12, fw, fh, fstride, bgr);
+        if (!g_bgr_buf || g_bgr_cap < (size_t)fw * fh * 3) {
+            free(g_bgr_buf);
+            g_bgr_buf = (uint8_t *)malloc((size_t)fw * fh * 3);
+            g_bgr_cap = (size_t)fw * fh * 3;
+        }
+        nv12_to_bgr(s->nv12, fw, fh, fstride, g_bgr_buf);
         uint8_t *in = (uint8_t *)g_app.input_mems[0]->virt_addr;  // 640*640*3 NHWC
-        bilinear_bgr_resize(bgr, fw, fh, in, RKNN_MODEL_W, RKNN_MODEL_H);
-        free(bgr);
+        bilinear_bgr_resize(g_bgr_buf, fw, fh, in, RKNN_MODEL_W, RKNN_MODEL_H);
 
         g_cons_idx++;  // 消费完成, 释放 slot (生产者可覆盖)
 
@@ -496,7 +749,8 @@ static void *rknn_worker(void *arg) {
             boxes[n].score = od.results[i].prop;
             n++;
         }
-        if (g_shm) bbox_shm_publish(g_shm, boxes, n);
+        update_box_cache(boxes, n);                  // 更新持久缓存 (时间平滑)
+        if (g_shm) bbox_shm_publish(g_shm, boxes, n);  // 仍发布给潜在 LVGL 消费端
     }
     printf("[rknn] worker stopped\n");
     return NULL;
@@ -574,6 +828,25 @@ int rknn_infer_start(void) {
     if (!g_shm) printf("[rknn] WARN: bbox_shm open failed (LVGL 收不到框)\n");
 
     g_quit = 0;
+    // 分配"自有显示缓冲"池 (画框副本送 VO 用, 避免与 VI 环形缓冲竞争)
+    {
+        int dw = 0, dh = 0, ddx = 0, ddy = 0;
+        lcd_preview_get_disp_rect(&ddx, &ddy, &dw, &dh);
+        if (dw <= 0 || dh <= 0) { dw = 720; dh = 720; }
+        g_disp_w = dw; g_disp_h = dh; g_disp_stride = dw;
+        for (int i = 0; i < DISP_POOL; i++) {
+            uint32_t bsz = (uint32_t)g_disp_stride * g_disp_h * 3 / 2;
+            MB_BLK mb = NULL;
+            if (RK_MPI_SYS_MmzAlloc(&mb, NULL, NULL, bsz) == RK_SUCCESS && mb != NULL) {
+                g_disp_mb[i] = mb;
+                g_disp_vaddr[i] = (uint8_t *)RK_MPI_MB_Handle2VirAddr(mb);
+                g_disp_sent[i] = 0;
+            } else {
+                g_disp_mb[i] = NULL; g_disp_vaddr[i] = NULL;
+                printf("[rknn] WARN: disp buffer %d alloc failed (MB %u bytes)\n", i, bsz);
+            }
+        }
+    }
     // 注册为 lcd_preview 帧消费者 + 复用其 selfpath 通道
     lcd_preview_register_frame_consumer(rknn_frame_cb, NULL);
     if (lcd_preview_ensure_source() != 0) {
@@ -610,5 +883,11 @@ void rknn_infer_stop(void) {
         g_slots[i].nv12 = NULL;
         g_slots[i].cap = 0;
     }
+    free(g_bgr_buf); g_bgr_buf = NULL; g_bgr_cap = 0;
+    for (int i = 0; i < DISP_POOL; i++) {
+        if (g_disp_mb[i]) { RK_MPI_SYS_MmzFree(g_disp_mb[i]); g_disp_mb[i] = NULL; }
+        g_disp_vaddr[i] = NULL; g_disp_sent[i] = 0;
+    }
+    pthread_mutex_lock(&g_track_lock); g_track_n = 0; pthread_mutex_unlock(&g_track_lock);
     printf("[rknn] stopped\n");
 }

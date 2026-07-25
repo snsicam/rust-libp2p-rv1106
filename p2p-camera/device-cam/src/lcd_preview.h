@@ -23,12 +23,17 @@ extern "C" {
 #endif
 
 // 帧消费者回调类型 (rknn 等注册)。
-//   frame: 本帧 selfpath 原始帧 (NV12), 回调返回前不可长期持有 — 泵随后会 Release。
-//   ctx  : 注册时传入的上下文指针。
-//   设计约束: 回调内只能做 µs 级操作 (如 memcpy 像素到自己的队列),
-//             绝不能在此跑推理等重活 (否则阻塞显示泵)。
+//   frame    : 本帧 selfpath 原始帧 (NV12), 回调返回前不可长期持有 — 泵随后会 Release。
+//   out_frame: 若回调想"替换"送 VO 的帧 (例如自己画了检测框的副本), 填入一个
+//              回调自身拥有的 VIDEO_FRAME_INFO_S (建议用 RK_MPI_SYS_MmzAlloc 分配的 MB,
+//              避免与 VI 环形缓冲竞争), 并返回 1; 泵将改送 *out_frame 而非 frame。
+//   ctx      : 注册时传入的上下文指针。
+//   返回 1   : 送 *out_frame (回调拥有, VO 显示完自动释放引用, 回调仍保留所有权可复用)。
+//   返回 0   : 送原始 frame (默认行为)。
+//   设计约束: 回调内只能做 µs 级操作 (memcpy 像素 + 画框), 绝不能跑推理等重活。
 #include "rk_mpi_vi.h"
-typedef void (*lcd_preview_frame_cb)(const VIDEO_FRAME_INFO_S *frame, void *ctx);
+typedef int (*lcd_preview_frame_cb)(const VIDEO_FRAME_INFO_S *frame,
+                                     VIDEO_FRAME_INFO_S *out_frame, void *ctx);
 
 // 配置 LCD 预览参数 (必须在 lcd_preview_start 之前调用)
 //   w, h : 预览分辨率

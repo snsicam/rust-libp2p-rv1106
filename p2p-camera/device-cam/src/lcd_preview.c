@@ -223,16 +223,19 @@ static void *lcd_vo_thread(void *arg) {
         }
 
         // 帧消费者 (rknn): 必须在 SendFrame 之前调用 — 回调内拷贝像素给推理队列,
-        // 并直接在本帧 NV12 上画检测框; 之后 SendFrame 送出去的就是"带框的帧"。
+        // 并 (可选) 把"带框的副本帧"通过 out_frame 交回, 由泵改送该帧而非原始 VI 帧。
         // 回调返回前不得长期持有 frame / 跑推理 (推理在 rknn 自己线程异步跑)。
+        VIDEO_FRAME_INFO_S outf;
+        int use_out = 0;
         if (g_frame_cb) {
-            g_frame_cb(&frame, g_frame_ctx);
+            use_out = g_frame_cb(&frame, &outf, g_frame_ctx);
         }
 
         // 视频显示: 仅 LCD 启用时送 VO video plane (VOP 硬件 CSC, 零 CPU)。
         // SendFrame 用 0 (非阻塞): VO 显示缓冲满时立即返回失败, 此处直接丢帧。
         if (g_lcd_use_vo) {
-            ret = RK_MPI_VO_SendFrame(g_lcd_vo_layer, g_lcd_vo_chn, &frame, 0);
+            ret = RK_MPI_VO_SendFrame(g_lcd_vo_layer, g_lcd_vo_chn,
+                                      use_out ? &outf : &frame, 0);
         }
 
         RK_MPI_VI_ReleaseChnFrame(LCD_VI_DEV_ID, g_lcd_vi_selfpath_chn, &frame);
