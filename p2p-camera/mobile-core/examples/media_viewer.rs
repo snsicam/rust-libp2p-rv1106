@@ -13,7 +13,7 @@
 //! GUI 模式 (play=true):
 //!   窗口左侧为设备管理面板，显示 viewer.toml 中 camera_serials 设备列表；
 //!   - 单击选中设备，双击设备开始连接并在右侧播放视频
-//!   - [+ Add] 添加设备 (键入或 Ctrl+V 粘贴 PeerId，Enter 确认，Esc 取消)
+//!   - [+ Add] 添加设备 (键入或 Ctrl+V 粘贴 16位序列号 SN，Enter 确认，Esc 取消)
 //!   - [- Del] 删除选中设备
 //!   - 增删自动保存回 viewer.toml (注意: 保存会丢失配置文件中的注释)
 //!   启动时不自动连接，双击设备才连接。
@@ -1477,7 +1477,7 @@ mod player {
             self.adding = true;
             self.input.clear();
             self.video_subsystem.text_input().start();
-            self.status = "Enter=OK  Esc=Cancel  Ctrl+V=Paste".to_string();
+            self.status = "Enter=OK  Esc=Cancel  输入16位序列号 SN (Ctrl+V粘贴)".to_string();
             self.panel_dirty = true;
         }
 
@@ -1495,9 +1495,11 @@ mod player {
                 self.cancel_add();
                 return None;
             }
-            // 轻量校验: base58 PeerId (ed25519 约 52 字符)
-            if cam.len() < 40 || !cam.chars().all(|c| c.is_ascii_alphanumeric()) {
-                self.status = "Invalid PeerId (base58, ~52 chars)".to_string();
+            // 校验: 16位序列号 SN 或完整 PeerId（连接时 Rust 侧自动判定）
+            let is_serial = cam.len() == 16 && cam.chars().all(|c| c.is_ascii_hexdigit());
+            let is_peerid = cam.len() >= 40 && cam.chars().all(|c| c.is_ascii_alphanumeric());
+            if !is_serial && !is_peerid {
+                self.status = "Invalid: 需要 16位序列号 或 完整 PeerId".to_string();
                 self.panel_dirty = true;
                 return None; // 停留在输入态, 让用户修改
             }
