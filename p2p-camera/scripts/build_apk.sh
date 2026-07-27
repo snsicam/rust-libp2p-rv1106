@@ -44,9 +44,19 @@ cd "$ANDROID_DIR"
 BUILD_TYPE="${1:-release}"
 
 echo "  构建类型: $BUILD_TYPE"
-./gradlew ":demo-media-player:assemble${BUILD_TYPE^}" --no-daemon 2>&1 | \
-    grep -E "BUILD|FAILED|deprecated|Error:|error:" | head -20
+
+# 完整捕获 gradle 输出, 直接取 gradle 自身退出码判断(避免管道+head截断导致 SIGPIPE 误判/吞掉失败)
+GRADLE_LOG=$(mktemp)
+./gradlew ":demo-media-player:assemble${BUILD_TYPE^}" --no-daemon > "$GRADLE_LOG" 2>&1
+GRADLE_RC=$?
+# 仅打印关键行供阅读
+grep -E "BUILD|FAILED|deprecated|Error:|error:" "$GRADLE_LOG" | head -20
 echo ""
+
+if [ "$GRADLE_RC" -ne 0 ]; then
+    echo "✗ Gradle 构建失败 (退出码 $GRADLE_RC), 完整日志: $GRADLE_LOG"
+    exit 1
+fi
 
 APK_DIR="$DEMO_DIR/$BUILD_DIR_NAME/outputs/apk/$BUILD_TYPE"
 APK_FILE=$(ls "$APK_DIR"/*.apk 2>/dev/null | head -1)

@@ -155,7 +155,10 @@ stop_emulator() {
 # --- 编译 APK ---
 build_apk() {
     info "编译 APK..."
-    bash "$SCRIPT_DIR/build_apk.sh"
+    if ! bash "$SCRIPT_DIR/build_apk.sh"; then
+        error "APK 编译失败, 中止 (不安装旧包)"
+        exit 1
+    fi
     find_apk
 }
 
