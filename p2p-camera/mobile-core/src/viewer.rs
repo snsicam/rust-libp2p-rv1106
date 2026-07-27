@@ -222,6 +222,9 @@ pub struct MediaPlayer {
     control_stream: Option<libp2p::Stream>,
     /// 当前已连接的 relay peer (用于 serial→peer_id 解析查询)
     connected_relay: Option<PeerId>,
+    /// 本地静态 serial→peer_id 映射 (来自配置 serial_map)。
+    /// 命中时无需连接 Relay 即可解析 SN，适合局域网 / Relay 不可达场景。
+    serial_map: std::collections::HashMap<String, String>,
 }
 
 /// 保存连接参数，用于断连后自动重连
@@ -232,6 +235,7 @@ struct ConnectParams {
     enable_mdns: bool,
     stream_type: String,
     no_audio: bool,
+    serial_map: std::collections::HashMap<String, String>,
 }
 
 impl MediaPlayer {
@@ -287,6 +291,7 @@ impl MediaPlayer {
             mdns_cache: std::collections::HashMap::new(),
             control_stream: None,
             connected_relay: None,
+            serial_map: std::collections::HashMap::new(),
         };
 
         // 监听本地 QUIC (指定端口或随机)
@@ -348,12 +353,14 @@ impl MediaPlayer {
         relay_addrs: &[String],
         device_cam_peer_id: &str,
         enable_mdns: bool,
+        serial_map: &std::collections::HashMap<String, String>,
         stream_type: &str,
     ) -> Result<()> {
         self.connect_with_options(
             relay_addrs,
             device_cam_peer_id,
             enable_mdns,
+            serial_map,
             stream_type,
             ConnectOptions::default(),
         ).await
@@ -365,13 +372,34 @@ impl MediaPlayer {
         relay_addrs: &[String],
         device_cam_peer_id: &str,
         enable_mdns: bool,
+        serial_map: &std::collections::HashMap<String, String>,
         stream_type: &str,
         options: ConnectOptions,
     ) -> Result<()> {
         // 判定输入是完整 PeerId 还是短序列号 (serial)
         // serial 形如树莓派 /proc/cpuinfo 的 Serial (如 e33700a6620dfddc)，
         // viewer 可仅凭它经 relay 注册表解析出真实 PeerId 再连接，无需手抄长串。
-        let known_device_cam: Option<PeerId> = device_cam_peer_id.parse().ok();
+        // 预解析目标 peer：完整 PeerId 直连，或经本地 serial_map 提前解析。
+        // 提前解析使 mDNS 循环期间即可直接匹配目标，避免等待整个 mDNS/relay 阶段结束。
+        let known_device_cam: Option<PeerId> = if let Ok(pid) = device_cam_peer_id.parse::<PeerId>() {
+            Some(pid)
+        } else {
+            match serial_map.get(device_cam_peer_id) {
+                Some(pid_str) => match pid_str.parse::<PeerId>() {
+                    Ok(pid) => {
+                        println!("[Viewer] Resolved serial {} -> peer {} via local serial_map", device_cam_peer_id, pid);
+                        Some(pid)
+                    }
+                    Err(_) => {
+                        anyhow::bail!(
+                            "serial_map 中 '{}' 的值 '{}' 不是合法 PeerId，请检查配置",
+                            device_cam_peer_id, pid_str
+                        );
+                    }
+                },
+                None => None,
+            }
+        };
         if known_device_cam.is_none() {
             println!(
                 "[Viewer] Input '{}' is not a PeerId — treating as serial, will resolve via relay registry",
@@ -380,12 +408,14 @@ impl MediaPlayer {
         }
 
         // 保存连接参数用于重连
+        self.serial_map = serial_map.clone();
         self.connect_params = Some(ConnectParams {
             relay_addrs: relay_addrs.to_vec(),
             device_cam_peer_id: device_cam_peer_id.to_string(),
             enable_mdns,
             stream_type: stream_type.to_string(),
             no_audio: options.no_audio,
+            serial_map: serial_map.clone(),
         });
 
         // 保存选项
@@ -522,14 +552,15 @@ impl MediaPlayer {
             }
         }
 
-        // 归一化: 若输入是 serial，经 relay registry 解析成真实 peer id (并验签)
+        // known_device_cam 已在连接前预解析完成（完整 PeerId 直连 / serial_map 命中）；
+        // 此处仅处理需经 relay registry 解析的剩余场景。
         let connected_relay_peer = connected_relay.as_ref().map(|(p, _)| *p);
         let device_cam = if let Some(pid) = known_device_cam {
             pid
         } else {
             let relay_pid = connected_relay_peer.ok_or_else(|| {
                 anyhow::anyhow!(
-                    "无法解析序列号 '{}'：未连接到任何 Relay（请检查 relays 配置）",
+                    "无法解析序列号 '{}'：未连接到任何 Relay（请检查 relays 配置或补充 serial_map）",
                     device_cam_peer_id
                 )
             })?;
@@ -540,6 +571,15 @@ impl MediaPlayer {
         };
         self.device_cam_peer_id = Some(device_cam);
         self.connected_relay = connected_relay_peer;
+
+        // serial/relay 注册表场景下，mDNS 循环期间 known_device_cam 尚为空，
+        // 未能在 Discovered 事件中直接匹配目标；但 mdns_cache 已缓存该 peer 的 LAN 地址，这里回退使用。
+        if mdns_discovered_addr.is_none() && enable_mdns {
+            if let Some(cached_addr) = self.mdns_cache.get(&device_cam) {
+                tracing::info!("[Viewer] Using cached mDNS address for {device_cam}: {cached_addr}");
+                mdns_discovered_addr = Some(cached_addr.clone());
+            }
+        }
 
         // 优先使用 mDNS 发现的 LAN 直连
         if let Some(lan_addr) = mdns_discovered_addr {
@@ -1140,6 +1180,7 @@ impl MediaPlayer {
             &params.relay_addrs,
             &params.device_cam_peer_id,
             params.enable_mdns,
+            &params.serial_map,
             &params.stream_type,
             ConnectOptions {
                 udp_port: self.udp_port,
@@ -1255,6 +1296,42 @@ impl MediaPlayer {
             return Err(anyhow::anyhow!(err));
         }
         tracing::info!("[Viewer] <<< SetEncoderConfig applied stream={stream}");
+        Ok(())
+    }
+
+    /// 通过控制通道从摄像头读取当前图像参数 (真正读取设备端配置, 非本地缓存)
+    pub async fn get_image_config(&mut self, cam_id: u32) -> Result<proto::control::ImageConfig> {
+        let req = proto::control::ControlRequest::GetImageConfig { cam_id };
+        tracing::info!("[Viewer] >>> GetImageConfig cam_id={cam_id}");
+        let resp = self.send_control(&req).await?;
+        if !resp.ok {
+            let err = resp.error.clone().unwrap_or_else(|| "unknown error".to_string());
+            tracing::warn!("[Viewer] <<< GetImageConfig failed: {err}");
+            return Err(anyhow::anyhow!(err));
+        }
+        match resp.image_config {
+            Some(cfg) => {
+                tracing::info!("[Viewer] <<< GetImageConfig response cam_id={cam_id}");
+                Ok(cfg)
+            }
+            None => Err(anyhow::anyhow!("control response missing image_config")),
+        }
+    }
+
+    /// 通过控制通道把图像参数下发到摄像头 (ISP AIQ 热改 + INI 持久化, 由 DeviceCam 端执行)
+    pub async fn set_image_config(&mut self, cam_id: u32, config: &proto::control::ImageConfig) -> Result<()> {
+        let req = proto::control::ControlRequest::SetImageConfig {
+            cam_id,
+            config: config.clone(),
+        };
+        tracing::info!("[Viewer] >>> SetImageConfig cam_id={cam_id}");
+        let resp = self.send_control(&req).await?;
+        if !resp.ok {
+            let err = resp.error.clone().unwrap_or_else(|| "unknown error".to_string());
+            tracing::warn!("[Viewer] <<< SetImageConfig failed: {err}");
+            return Err(anyhow::anyhow!(err));
+        }
+        tracing::info!("[Viewer] <<< SetImageConfig applied cam_id={cam_id}");
         Ok(())
     }
 

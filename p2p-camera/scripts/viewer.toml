@@ -4,6 +4,12 @@ relays = [
 ]
 
 enable_mdns = true
+
+# 本地静态 serial→peer_id 映射: 命中时无需连接 Relay 即可解析 SN，
+# 适合局域网 / Relay 不可达场景。键为短序列号, 值为完整 PeerId。
+# (也可在 app 侧通过 connect 的 serial_map 字段下发)
+serial_map = { "e33700a6620dfddc" = "12D3KooWG2ihY7Ne75KqkYyYrQWL1ACLUgUN8rp1nTskQB3RNNNt" }
+
 # 设备列表: 每个元素可以是长 PeerId 或短序列号 serial (如树莓派 /proc/cpuinfo 的
 # Serial: e33700a6620dfddc)。viewer 自动判定——能 parse 成 PeerId 就直连，否则当
 # serial 经 relay 注册表解析出真实 PeerId 再连接。

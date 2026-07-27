@@ -171,6 +171,7 @@ async fn run_headless(opt: Opt, config: ViewerConfig) -> Result<()> {
                 &relay_addrs,
                 &device_cam_str,
                 enable_mdns,
+                &config.serial_map,
                 &stream_type,
                 ConnectOptions {
                     udp_port,
@@ -447,6 +448,34 @@ async fn run_gui(opt: Opt, mut config: ViewerConfig) -> Result<()> {
                     player.set_status("未连接，无法下发参数".to_string());
                 }
             }
+
+            // ---- 1.6 配置窗体: 图像参数读取/下发 (控制通道) ----
+            if let Some(_peer) = player.take_config_image_fetch_request() {
+                if let Some(viewer) = session.as_mut() {
+                    match viewer.get_image_config(0).await {
+                        Ok(ic) => {
+                            player.apply_image_config(ic);
+                            player.set_status("已读取图像参数".to_string());
+                        }
+                        Err(e) => {
+                            player.set_status(format!("读取图像参数失败: {e}"));
+                            eprintln!("[Viewer] GetImageConfig failed: {e}");
+                        }
+                    }
+                } else {
+                    player.set_status("未连接，无法读取图像参数".to_string());
+                }
+            }
+            if let Some((_peer, ic)) = player.take_config_image_apply_request() {
+                if let Some(viewer) = session.as_mut() {
+                    match viewer.set_image_config(0, &ic).await {
+                        Ok(()) => player.set_status("图像参数已下发".to_string()),
+                        Err(e) => player.set_status(format!("图像下发失败: {e}")),
+                    }
+                } else {
+                    player.set_status("未连接，无法下发图像参数".to_string());
+                }
+            }
         }
 
         // ---- 2. 待连接设备 (带重试, 不阻塞 UI 退出) ----
@@ -469,6 +498,7 @@ async fn run_gui(opt: Opt, mut config: ViewerConfig) -> Result<()> {
                             &relay_addrs,
                             &cam,
                             enable_mdns,
+                            &config.serial_map,
                             &stream_type,
                             ConnectOptions {
                                 udp_port,
@@ -660,7 +690,7 @@ mod player {
     use sdl2::mouse::MouseButton;
     use sdl2::pixels::{Color, PixelFormatEnum};
     use sdl2::rect::Rect;
-    use proto::control::EncoderConfig;
+    use proto::control::{EncoderConfig, ImageConfig, ImageAdjustment};
 
     /// 左侧设备管理面板宽度 (px)
     pub const PANEL_W: u32 = 260;
@@ -720,14 +750,15 @@ mod player {
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-    pub enum Resolution { R1080p, R720p, R540p }
+    pub enum Resolution { R1080p, R720p, R540p, R360p }
     #[allow(dead_code)]
     impl Resolution {
         fn cycle(self) -> Self {
             match self {
                 Resolution::R1080p => Resolution::R720p,
                 Resolution::R720p => Resolution::R540p,
-                Resolution::R540p => Resolution::R1080p,
+                Resolution::R540p => Resolution::R360p,
+                Resolution::R360p => Resolution::R1080p,
             }
         }
         fn label(self) -> &'static str {
@@ -735,12 +766,15 @@ mod player {
                 Resolution::R1080p => "1920x1080",
                 Resolution::R720p => "1280x720",
                 Resolution::R540p => "960x540",
+                Resolution::R360p => "640x360",
             }
         }
         fn from_wh(w: u32, h: u32) -> Self {
             match (w, h) {
                 (1920, 1080) => Resolution::R1080p,
+                (1280, 720) => Resolution::R720p,
                 (960, 540) => Resolution::R540p,
+                (640, 360) => Resolution::R360p,
                 _ => Resolution::R720p,
             }
         }
@@ -749,18 +783,8 @@ mod player {
                 Resolution::R1080p => (1920, 1080),
                 Resolution::R720p => (1280, 720),
                 Resolution::R540p => (960, 540),
+                Resolution::R360p => (640, 360),
             }
-        }
-    }
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-    pub enum ExposureMode { Auto, Manual }
-    impl ExposureMode {
-        fn cycle(self) -> Self {
-            match self { ExposureMode::Auto => ExposureMode::Manual, ExposureMode::Manual => ExposureMode::Auto }
-        }
-        fn label(self) -> &'static str {
-            match self { ExposureMode::Auto => "Auto", ExposureMode::Manual => "Manual" }
         }
     }
 
@@ -771,8 +795,8 @@ mod player {
     /// 可编辑配置字段标识 (用于布局/点击命中)
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum ConfigField {
-        Stream, Codec, Resolution, Fps, Bitrate, Gop,
-        Brightness, Contrast, Saturation, Exposure,
+        Stream, Codec, Resolution, RcMode, Fps, Bitrate, Gop,
+        Brightness, Contrast, Saturation, Sharpness,
         DeviceName,
     }
 
@@ -794,6 +818,8 @@ mod player {
         // ---- 编码参数 ----
         pub codec: CodecType,
         pub resolution: Resolution,
+        #[serde(default = "default_rc_mode")]
+        pub rc_mode: String,
         pub fps: u32,
         pub bitrate_kbps: u32,
         pub gop: u32,
@@ -801,23 +827,27 @@ mod player {
         pub brightness: i32,
         pub contrast: i32,
         pub saturation: i32,
-        pub exposure_mode: ExposureMode,
+        #[serde(default)]
+        pub sharpness: i32,
         // ---- 系统参数 ----
         pub device_name: String,
     }
+
+    fn default_rc_mode() -> String { "CBR".to_string() }
 
     impl Default for DeviceConfig {
         fn default() -> Self {
             DeviceConfig {
                 codec: CodecType::H265,
                 resolution: Resolution::R720p,
+                rc_mode: "CBR".to_string(),
                 fps: 25,
                 bitrate_kbps: 2000,
                 gop: 50,
                 brightness: 0,
                 contrast: 0,
                 saturation: 0,
-                exposure_mode: ExposureMode::Auto,
+                sharpness: 0,
                 device_name: "Camera".to_string(),
             }
         }
@@ -870,6 +900,7 @@ mod player {
         DeviceConfig {
             codec: CodecType::from_proto(&ec.output_data_type),
             resolution: Resolution::from_wh(ec.width, ec.height),
+            rc_mode: ec.rc_mode.clone(),
             fps: ec.dst_frame_rate_num,
             bitrate_kbps: ec.max_rate,
             gop: ec.gop,
@@ -1020,6 +1051,14 @@ mod player {
         /// 待下发到摄像头的编码参数 (peer, stream, config)
         config_apply_pending: Option<(String, String, EncoderConfig)>,
 
+        // ---- 图像参数读取/下发 (控制通道) 状态 ----
+        /// 从摄像头读取的完整图像配置 (保留未编辑字段, 下发时回写)
+        image_raw: Option<ImageConfig>,
+        /// 待从摄像头读取图像参数的设备 PeerId (主循环异步处理)
+        config_image_fetch_pending: Option<String>,
+        /// 待下发到摄像头的图像参数 (peer, config)
+        config_image_apply_pending: Option<(String, ImageConfig)>,
+
         /// 右键菜单 / 配置窗体共用的 overlay 纹理 (ABGR8888)
         overlay_texture: Option<sdl2::render::Texture<'static>>,
 
@@ -1119,6 +1158,9 @@ mod player {
                 encoder_raw: None,
                 config_fetch_pending: None,
                 config_apply_pending: None,
+                image_raw: None,
+                config_image_fetch_pending: None,
+                config_image_apply_pending: None,
                 overlay_texture: None,
                 font,
                 font_cjk: load_cjk_font(),
@@ -1182,11 +1224,59 @@ mod player {
             let cfg = self.config.as_ref()?;
             let mut ec = self.encoder_raw.clone().unwrap_or_else(default_encoder);
             ec.output_data_type = cfg.codec.to_proto();
+            ec.rc_mode = cfg.rc_mode.clone();
+            let (w, h) = cfg.resolution.to_wh();
+            ec.width = w;
+            ec.height = h;
             ec.dst_frame_rate_num = cfg.fps;
             ec.dst_frame_rate_den = 1;
             ec.max_rate = cfg.bitrate_kbps;
             ec.gop = cfg.gop;
             Some(ec)
+        }
+
+        /// 用从摄像头读取到的图像配置刷新 UI 显示 (亮度/对比度/饱和度/锐度)
+        pub fn apply_image_config(&mut self, ic: ImageConfig) {
+            self.image_raw = Some(ic.clone());
+            let mut cfg = self.config.clone().unwrap_or_default();
+            if let Some(adj) = ic.adjustment {
+                if let Some(v) = adj.brightness { cfg.brightness = v; }
+                if let Some(v) = adj.contrast { cfg.contrast = v; }
+                if let Some(v) = adj.saturation { cfg.saturation = v; }
+                if let Some(v) = adj.sharpness { cfg.sharpness = v; }
+            }
+            self.config = Some(cfg);
+            self.panel_dirty = true;
+        }
+
+        /// 取出待读取请求 (取出后清空)
+        pub fn take_config_image_fetch_request(&mut self) -> Option<String> {
+            self.config_image_fetch_pending.take()
+        }
+
+        /// 取出待下发请求 (取出后清空)
+        pub fn take_config_image_apply_request(&mut self) -> Option<(String, ImageConfig)> {
+            self.config_image_apply_pending.take()
+        }
+
+        /// 根据 UI 编辑结果构造待下发的完整 ImageConfig
+        fn build_image_config(&self) -> Option<ImageConfig> {
+            let cfg = self.config.as_ref()?;
+            let adjustment = ImageAdjustment {
+                contrast: Some(cfg.contrast),
+                brightness: Some(cfg.brightness),
+                saturation: Some(cfg.saturation),
+                sharpness: Some(cfg.sharpness),
+                hue: None,
+            };
+            Some(ImageConfig {
+                adjustment: Some(adjustment),
+                exposure: None,
+                night_to_day: None,
+                white_balance: None,
+                enhancement: None,
+                video_adjustment: None,
+            })
         }
 
         /// 重置解码器状态，在重连后调用以清除旧的参考帧缓冲区
@@ -1464,6 +1554,8 @@ mod player {
                     self.config = Some(cfg);
                     self.config_stream = "main".to_string();
                     self.encoder_raw = None;
+                    self.image_raw = None;
+                    self.config_image_fetch_pending = Some(peer.clone());
                     self.config_tab = 0;
                     self.config_editing_name = false;
                     self.config_text.clear();
@@ -1491,8 +1583,8 @@ mod player {
                 (x0 + 12 + (tab_w + 8) * 2, tab_y, tab_w, tab_h),
             ];
             let fields: Vec<ConfigField> = match self.config_tab {
-                0 => vec![ConfigField::Stream, ConfigField::Codec, ConfigField::Resolution, ConfigField::Fps, ConfigField::Bitrate, ConfigField::Gop],
-                1 => vec![ConfigField::Brightness, ConfigField::Contrast, ConfigField::Saturation, ConfigField::Exposure],
+                0 => vec![ConfigField::Stream, ConfigField::Codec, ConfigField::Resolution, ConfigField::RcMode, ConfigField::Fps, ConfigField::Bitrate, ConfigField::Gop],
+                1 => vec![ConfigField::Brightness, ConfigField::Contrast, ConfigField::Saturation, ConfigField::Sharpness],
                 _ => vec![ConfigField::DeviceName],
             };
             let row_y0 = y0 + 78;
@@ -1520,13 +1612,14 @@ mod player {
                 ConfigField::Stream => "码流",
                 ConfigField::Codec => "编码格式",
                 ConfigField::Resolution => "分辨率",
+                ConfigField::RcMode => "码率模式",
                 ConfigField::Fps => "帧率",
                 ConfigField::Bitrate => "码率",
                 ConfigField::Gop => "GOP",
                 ConfigField::Brightness => "亮度",
                 ConfigField::Contrast => "对比度",
                 ConfigField::Saturation => "饱和度",
-                ConfigField::Exposure => "曝光模式",
+                ConfigField::Sharpness => "锐度",
                 ConfigField::DeviceName => "设备名称",
             }
         }
@@ -1537,16 +1630,15 @@ mod player {
             match f {
                 ConfigField::Stream => self.config_stream.clone(),
                 ConfigField::Codec => cfg.codec.label().to_string(),
-                ConfigField::Resolution => self.encoder_raw.as_ref()
-                    .map(|ec| format!("{}x{}", ec.width, ec.height))
-                    .unwrap_or_else(|| cfg.resolution.label().to_string()),
+                ConfigField::Resolution => cfg.resolution.label().to_string(),
+                ConfigField::RcMode => cfg.rc_mode.clone(),
                 ConfigField::Fps => format!("{} fps", cfg.fps),
                 ConfigField::Bitrate => format!("{} kbps", cfg.bitrate_kbps),
                 ConfigField::Gop => format!("{} 帧", cfg.gop),
                 ConfigField::Brightness => format!("{}", cfg.brightness),
                 ConfigField::Contrast => format!("{}", cfg.contrast),
                 ConfigField::Saturation => format!("{}", cfg.saturation),
-                ConfigField::Exposure => cfg.exposure_mode.label().to_string(),
+                ConfigField::Sharpness => format!("{}", cfg.sharpness),
                 ConfigField::DeviceName => cfg.device_name.clone(),
             }
         }
@@ -1573,15 +1665,17 @@ mod player {
                     };
                     match field {
                         ConfigField::Codec => cfg.codec = cfg.codec.cycle(),
-                        // 分辨率当前只读 (避免预设不匹配覆盖摄像头实际分辨率), 后续再放开编辑
-                        ConfigField::Resolution => {}
-                        ConfigField::Exposure => cfg.exposure_mode = cfg.exposure_mode.cycle(),
+                        // 分辨率放开编辑: cycle 预设 (1920x1080 / 1280x720 / 960x540 / 640x360)
+                        ConfigField::Resolution => cfg.resolution = cfg.resolution.cycle(),
+                        // 码率模式: CBR <-> VBR
+                        ConfigField::RcMode => cfg.rc_mode = if cfg.rc_mode == "VBR" { "CBR".to_string() } else { "VBR".to_string() },
                         ConfigField::Fps => cfg.fps = (cfg.fps as i32 + d * 5).clamp(5, 60) as u32,
                         ConfigField::Bitrate => cfg.bitrate_kbps = (cfg.bitrate_kbps as i32 + d * 500).clamp(100, 8000) as u32,
                         ConfigField::Gop => cfg.gop = (cfg.gop as i32 + d * 10).clamp(1, 300) as u32,
-                        ConfigField::Brightness => cfg.brightness = (cfg.brightness + d * 10).clamp(-100, 100),
-                        ConfigField::Contrast => cfg.contrast = (cfg.contrast + d * 10).clamp(-100, 100),
-                        ConfigField::Saturation => cfg.saturation = (cfg.saturation + d * 10).clamp(-100, 100),
+                        ConfigField::Brightness => cfg.brightness = (cfg.brightness + d * 10).clamp(0, 100),
+                        ConfigField::Contrast => cfg.contrast = (cfg.contrast + d * 10).clamp(0, 100),
+                        ConfigField::Saturation => cfg.saturation = (cfg.saturation + d * 10).clamp(0, 100),
+                        ConfigField::Sharpness => cfg.sharpness = (cfg.sharpness + d * 10).clamp(0, 100),
                         ConfigField::DeviceName => {}
                         ConfigField::Stream => unreachable!(),
                     }
@@ -1640,6 +1734,11 @@ mod player {
                             if self.config_tab == 0 {
                                 if let (Some(peer), Some(ec)) = (self.config_peer.clone(), self.build_encoder_config()) {
                                     self.config_apply_pending = Some((peer, self.config_stream.clone(), ec));
+                                }
+                            } else if self.config_tab == 1 {
+                                // 图像 tab: 实际下发到摄像头 (ISP AIQ 热改 + 持久化)
+                                if let (Some(peer), Some(ic)) = (self.config_peer.clone(), self.build_image_config()) {
+                                    self.config_image_apply_pending = Some((peer, ic));
                                 }
                             }
                             self.config = None;
@@ -2352,6 +2451,11 @@ struct ViewerConfig {
     /// 设置为 "4g" 后，NAT 诊断会将 4G CGNAT 的端口映射视为不可预测，DCUtR 预测更准确
     #[serde(default = "default_network_type")]
     network_type: String,
+    /// 本地静态 serial→peer_id 映射 (TOML table)。
+    /// 命中时无需连接 Relay 即可解析 SN，适合局域网 / Relay 不可达场景。
+    /// 例: serial_map = { "e33700a6620dfddc" = "12D3KooW..." }
+    #[serde(default)]
+    serial_map: std::collections::HashMap<String, String>,
 }
 
 fn default_stream() -> String { "auto".to_string() }
@@ -2370,6 +2474,7 @@ impl Default for ViewerConfig {
             play: false,
             udp_port: None,
             network_type: default_network_type(),
+            serial_map: std::collections::HashMap::new(),
         }
     }
 }

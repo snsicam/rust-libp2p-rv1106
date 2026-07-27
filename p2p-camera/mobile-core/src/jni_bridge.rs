@@ -51,6 +51,7 @@ enum Cmd {
         relays: Vec<String>,
         device_id: String,
         enable_mdns: bool,
+        serial_map: std::collections::HashMap<String, String>,
         stream_type: String,
         no_audio: bool,
         network_type: String,
@@ -153,7 +154,7 @@ pub extern "system" fn Java_com_p2pcamera_mediaplayer_RustBridge_nativeCreate(
             let device_id;
             let network_type;
             match cmd_rx.recv() {
-                Ok(Cmd::Connect { relays, device_id: did, enable_mdns, stream_type, no_audio, network_type: nt }) => {
+                Ok(Cmd::Connect { relays, device_id: did, enable_mdns, serial_map, stream_type, no_audio, network_type: nt }) => {
                     device_id = did.clone();
                     network_type = nt;
                     // 默认启用 DCUtR 打洞：锥形/EIM NAT（含多数 4G）可打洞成功，省中继带宽。
@@ -173,7 +174,7 @@ pub extern "system" fn Java_com_p2pcamera_mediaplayer_RustBridge_nativeCreate(
                     let _ = event_tx.send(ViewerEvent::Connecting);
                     let relay_strs: Vec<String> = relays.clone();
                     match viewer
-                        .connect(&relay_strs, &did, enable_mdns, &stream_type)
+                        .connect(&relay_strs, &did, enable_mdns, &serial_map, &stream_type)
                         .await
                     {
                         Ok(()) => {
@@ -203,7 +204,7 @@ pub extern "system" fn Java_com_p2pcamera_mediaplayer_RustBridge_nativeCreate(
                     // 继续等待 Connect 命令
                     loop {
                         match cmd_rx.recv() {
-                            Ok(Cmd::Connect { relays, device_id: did, enable_mdns, stream_type, no_audio, network_type: nt }) => {
+                            Ok(Cmd::Connect { relays, device_id: did, enable_mdns, serial_map, stream_type, no_audio, network_type: nt }) => {
                                 device_id = did.clone();
                                 network_type = nt;
                                 let enable_dcutr = true;
@@ -220,7 +221,7 @@ pub extern "system" fn Java_com_p2pcamera_mediaplayer_RustBridge_nativeCreate(
                                 let _ = event_tx.send(ViewerEvent::Connecting);
                                 let relay_strs: Vec<String> = relays.clone();
                                 match viewer
-                                    .connect(&relay_strs, &did, enable_mdns, &stream_type)
+                                    .connect(&relay_strs, &did, enable_mdns, &serial_map, &stream_type)
                                     .await
                                 {
                                     Ok(()) => {
@@ -458,6 +459,16 @@ pub extern "system" fn Java_com_p2pcamera_mediaplayer_RustBridge_nativeConnect(
         .unwrap_or("auto")
         .to_string();
 
+    // 可选: 本地 serial→peer_id 静态映射 (JSON object)。命中时无需 Relay 即可解析 SN。
+    let serial_map: std::collections::HashMap<String, String> = config["serial_map"]
+        .as_object()
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+
     if relays.is_empty() || device_id.is_empty() {
         let _ = env.throw_new(
             "java/lang/IllegalArgumentException",
@@ -470,7 +481,7 @@ pub extern "system" fn Java_com_p2pcamera_mediaplayer_RustBridge_nativeConnect(
         handles
             .get(idx)
             .and_then(|h| h.as_ref())
-            .map(|h| h.cmd_tx.send(Cmd::Connect { relays, device_id, enable_mdns, stream_type, no_audio, network_type }).is_ok())
+            .map(|h| h.cmd_tx.send(Cmd::Connect { relays, device_id, enable_mdns, serial_map, stream_type, no_audio, network_type }).is_ok())
             .unwrap_or(false)
     });
 
