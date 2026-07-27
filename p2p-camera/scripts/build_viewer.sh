@@ -1,5 +1,5 @@
 #!/bin/bash
-# build_viewer.sh — 仅编译 viewer_cli (with SDL player)
+# build_viewer.sh — 仅编译 media_viewer (with SDL player)
 #
 # 用法: ./build_viewer.sh
 #
@@ -26,16 +26,16 @@ setup_bindgen() {
 
 setup_bindgen
 
-echo "[INFO] Building viewer_cli (with SDL player, debug)..."
+echo "[INFO] Building media_viewer (with SDL player, debug)..."
 cd "$PROJECT_ROOT"
-if ! cargo build --example viewer_cli -p mobile-core --features player; then
+if ! cargo build --example media_viewer -p mobile-core --features player; then
     echo "[ERROR] Build failed. See errors above."
     exit 1
 fi
 
-VIEWER_BIN="$PROJECT_ROOT/target/debug/examples/viewer_cli"
+VIEWER_BIN="$PROJECT_ROOT/target/debug/examples/media_viewer"
 if [ ! -f "$VIEWER_BIN" ]; then
-    echo "[ERROR] viewer_cli not found at $VIEWER_BIN"
+    echo "[ERROR] media_viewer not found at $VIEWER_BIN"
     exit 1
 fi
 

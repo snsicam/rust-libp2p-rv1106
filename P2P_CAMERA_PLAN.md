@@ -433,7 +433,7 @@ impl MediaPacket {
 ├─────────────────────────────────────────┤
 │  Rust FFI Layer (.so / .a)              │
 │  ┌─────────────────────────────────────┐│
-│  │ p2p_viewer_lib (Rust)               ││
+│  │ media_player_lib (Rust)             ││
 │  │                                     ││
 │  │ - libp2p Swarm (QUIC + Noise)       ││
 │  │ - relay::client + dcutr            ││
@@ -699,7 +699,7 @@ Track: 0x01=Video(H.265 NAL), 0x02=Audio(PCM/AAC)
 ```
 任务:
 ├── [Day1-2] Rust FFI 核心库
-│   ├── p2p_viewer_lib crate
+│   ├── media_player_lib crate
 │   ├── C API 导出 (视频+音频分离接口)
 │   ├── Android: cargo-ndk 编译 .so
 │   └── iOS: cargo-lipo 编译 .a
@@ -748,9 +748,11 @@ Track: 0x01=Video(H.265 NAL), 0x02=Audio(PCM/AAC)
 │   ├── Gateway 单帧源 → 多 viewer 分发
 │   └── QUIC stream 优先级 (关键帧优先)
 │
-├── [ ] 断线重连
-│   ├── 连接断开自动重连
-│   └── 重连期间发送 I 帧
+├── [x] 断线重连
+│   ├── [x] 连接断开自动重连 (MediaPlayerEvent::Disconnected + reconnect())
+│   ├── [x] receive_frames EOF 时发送断连通知
+│   ├── [x] ConnectionClosed 时发送 ViewerEvent::Disconnected
+│   └── [ ] 重连期间发送 I 帧
 │
 ├── [ ] 录制/回放 (可选)
 │   └── Gateway 本地 SD 卡录制
@@ -793,7 +795,7 @@ p2p-camera/
 │   ├── Cargo.toml
 │   ├── src/
 │   │   ├── lib.rs             # FFI 导出 (视频+音频接口)
-│   │   ├── viewer.rs          # P2pViewer 核心
+│   │   ├── viewer.rs          # MediaPlayer 核心
 │   │   ├── behaviour.rs       # NetworkBehaviour
 │   │   ├── jitter_buffer.rs   # AvJitterBuffer (音视频分离)
 │   │   ├── media_packet.rs    # MediaPacket 解析
@@ -803,14 +805,14 @@ p2p-camera/
 │   ├── app/
 │   │   ├── build.gradle
 │   │   └── src/main/
-│   │       ├── java/.../P2pViewer.kt      # JNI 封装
+│   │       ├── java/.../MediaPlayer.kt      # JNI 封装
 │   │       ├── java/.../VideoDecoder.kt    # MediaCodec
 │   │       └── java/.../MainActivity.kt    # UI
 │   └── jniLibs/               # .so 文件
 │
 ├── mobile-ios/                # iOS APP (可选)
-│   ├── P2PViewer/
-│   │   ├── P2pViewer.swift    # C FFI 封装
+│   ├── MediaPlayer/
+│   │   ├── MediaPlayer.swift    # C FFI 封装
 │   │   ├── VideoDecoder.swift # VideoToolbox
 │   │   └── ContentView.swift  # UI
 │   └── libs/                  # .a 文件

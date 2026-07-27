@@ -2,6 +2,7 @@ use libp2p::{
     identify, ping, relay,
     swarm::NetworkBehaviour,
 };
+use libp2p_stream;
 use std::time::Duration;
 
 /// 组合所有 Relay Server 需要的行为
@@ -10,6 +11,8 @@ pub struct Behaviour {
     pub relay: relay::Behaviour,
     pub identify: identify::Behaviour,
     pub ping: ping::Behaviour,
+    /// 应用层注册表协议 (serial → peer_id 签名绑定)
+    pub stream: libp2p_stream::Behaviour,
 }
 
 impl Behaviour {
@@ -39,6 +42,7 @@ impl Behaviour {
             ping: ping::Behaviour::new(
                 ping::Config::default().with_interval(Duration::from_secs(15)),
             ),
+            stream: libp2p_stream::Behaviour::new(),
         }
     }
 }

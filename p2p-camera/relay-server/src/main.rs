@@ -19,17 +19,21 @@ use std::{
     error::Error,
     net::{Ipv4Addr, Ipv6Addr},
     path::PathBuf,
+    sync::Arc,
 };
 
 use behaviour::Behaviour;
 use clap::Parser;
-use futures::StreamExt;
+use futures::{AsyncReadExt, AsyncWriteExt, StreamExt};
 use libp2p::{
     core::multiaddr::{Multiaddr, Protocol},
     identify, identity, noise,
     swarm::SwarmEvent,
     tcp, yamux, PeerId,
 };
+use libp2p_stream::Control;
+use proto::registry::{RegistryMessage, REGISTRY_PROTOCOL};
+use tokio::sync::Mutex;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -37,13 +41,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!("[Relay] p2p-camera relay-server v{} ({})", env!("CARGO_PKG_VERSION"), env!("BUILD_TIME"));
 
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
+        .with_env_filter(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .init();
 
     let opt = Opt::parse();
 
     // ---- 加载配置文件 ----
-    let mut cfg = config::Config::load(&opt.config).unwrap_or_else(|e| {
+    let mut config = config::Config::load(&opt.config).unwrap_or_else(|e| {
         eprintln!("[Relay] {e}");
         std::process::exit(1);
     });
@@ -55,10 +62,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         port: opt.port,
         public_ip: opt.public_ip,
     };
-    cfg.apply_cli_overrides(&cli_overrides);
+    config.apply_cli_overrides(&cli_overrides);
 
     // 从文件加载固定身份密钥, 保证 PeerId 不变 (方便配置)
-    let keypair = load_or_create_keypair(&cfg.key_file)?;
+    let keypair = load_or_create_keypair(&config.key_file)?;
     let peer_id = keypair.public().to_peer_id();
 
     let mut swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
@@ -75,21 +82,34 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // ---- 监听 ----
     let tcp_addr = Multiaddr::empty()
-        .with(match cfg.use_ipv6 {
+        .with(match config.use_ipv6 {
             true => Protocol::from(Ipv6Addr::UNSPECIFIED),
             false => Protocol::from(Ipv4Addr::UNSPECIFIED),
         })
-        .with(Protocol::Tcp(cfg.port));
+        .with(Protocol::Tcp(config.port));
     swarm.listen_on(tcp_addr.clone())?;
 
     let quic_addr = Multiaddr::empty()
-        .with(match cfg.use_ipv6 {
+        .with(match config.use_ipv6 {
             true => Protocol::from(Ipv6Addr::UNSPECIFIED),
             false => Protocol::from(Ipv4Addr::UNSPECIFIED),
         })
-        .with(Protocol::Udp(cfg.port))
+        .with(Protocol::Udp(config.port))
         .with(Protocol::QuicV1);
     swarm.listen_on(quic_addr.clone())?;
+
+    // ---- 注册表 (serial → peer_id 签名绑定) ----
+    // 相机用私钥签名 (serial || peer_id) 后 REGISTER；viewer 用 serial QUERY 取回真实 peer_id。
+    // 共享表需跨 spawned 任务访问，用 Arc<Mutex<>> 保护。
+    let registry: Arc<Mutex<HashMap<String, RegistryEntry>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+
+    // 接受相机/viewer 的注册表应用流
+    let mut stream_control: Control = swarm.behaviour().stream.new_control();
+    let mut incoming_registry = stream_control
+        .accept(REGISTRY_PROTOCOL)
+        .map_err(|e| format!("Failed to register registry protocol: {e}"))?;
+    println!("[Relay] Registry protocol ready: {REGISTRY_PROTOCOL}");
 
     // ---- 打印关键信息 (DeviceCam / Viewer 需要) ----
     println!("╔══════════════════════════════════════════╗");
@@ -97,15 +117,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!("╠══════════════════════════════════════════╣");
     println!("║ PeerId: {peer_id}");
     println!("║");
-    println!("║ TCP:  /ip4/<PUBLIC_IP>/tcp/{}/p2p/{peer_id}", cfg.port);
-    println!("║ QUIC: /ip4/<PUBLIC_IP>/udp/{}/quic-v1/p2p/{peer_id}", cfg.port);
+    println!("║ TCP:  /ip4/<PUBLIC_IP>/tcp/{}/p2p/{peer_id}", config.port);
+    println!("║ QUIC: /ip4/<PUBLIC_IP>/udp/{}/quic-v1/p2p/{peer_id}", config.port);
     println!("║");
     println!("║ Listening TCP:  {tcp_addr}");
     println!("║ Listening QUIC: {quic_addr}");
     println!("╚══════════════════════════════════════════╝");
 
     // ---- 手动添加公网外部地址（若指定） ----
-    if let Some(ref ip_str) = cfg.public_ip {
+    if let Some(ref ip_str) = config.public_ip {
         let ip: std::net::IpAddr = ip_str.parse()
             .map_err(|e| format!("Invalid public_ip '{}': {e}", ip_str))?;
         if let std::net::IpAddr::V4(v4) = ip {
@@ -115,17 +135,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
         }
         if ip.is_ipv4() {
-            let ext_tcp: Multiaddr = format!("/ip4/{}/tcp/{}", ip_str, cfg.port).parse()
+            let ext_tcp: Multiaddr = format!("/ip4/{}/tcp/{}", ip_str, config.port).parse()
                 .map_err(|e| format!("Invalid external TCP address: {e}"))?;
-            let ext_quic: Multiaddr = format!("/ip4/{}/udp/{}/quic-v1", ip_str, cfg.port).parse()
+            let ext_quic: Multiaddr = format!("/ip4/{}/udp/{}/quic-v1", ip_str, config.port).parse()
                 .map_err(|e| format!("Invalid external QUIC address: {e}"))?;
             swarm.add_external_address(ext_tcp);
             swarm.add_external_address(ext_quic);
             tracing::info!("[Relay] Added external addresses for public IP: {}", ip_str);
         } else {
-            let ext_tcp: Multiaddr = format!("/ip6/{}/tcp/{}", ip_str, cfg.port).parse()
+            let ext_tcp: Multiaddr = format!("/ip6/{}/tcp/{}", ip_str, config.port).parse()
                 .map_err(|e| format!("Invalid external TCP address: {e}"))?;
-            let ext_quic: Multiaddr = format!("/ip6/{}/udp/{}/quic-v1", ip_str, cfg.port).parse()
+            let ext_quic: Multiaddr = format!("/ip6/{}/udp/{}/quic-v1", ip_str, config.port).parse()
                 .map_err(|e| format!("Invalid external QUIC address: {e}"))?;
             swarm.add_external_address(ext_tcp);
             swarm.add_external_address(ext_quic);
@@ -141,7 +161,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // ---- 事件循环 ----
     loop {
-        match swarm.select_next_some().await {
+        tokio::select! {
+            // libp2p Swarm 事件
+            event = swarm.select_next_some() => {
+                match event {
             SwarmEvent::Behaviour(behaviour::BehaviourEvent::Identify(
                 identify::Event::Received {
                     info: identify::Info { observed_addr, listen_addrs, .. },
@@ -288,8 +311,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
             e => {
                 tracing::debug!("[Relay] Event: {:?}", e);
             }
-        }
-    }
+                } // match event
+            }, // swarm 分支结束
+
+            // 注册表应用流: 相机注册 / viewer 查询
+            reg = incoming_registry.next() => {
+                if let Some((peer, stream)) = reg {
+                    let reg_table = registry.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = handle_registry_connection(peer, stream, reg_table).await {
+                            tracing::warn!("[Relay] registry handler error: {e}");
+                        }
+                    });
+                }
+            }
+        } // select!
+    } // loop
 }
 
 #[derive(Debug, Parser)]
@@ -335,4 +372,143 @@ fn load_or_create_keypair(key_file: &PathBuf) -> Result<identity::Keypair, Box<d
         tracing::info!("Generated new identity → {}", key_file.display());
         Ok(keypair)
     }
+}
+
+/// 注册表条目: 序列号绑定的相机身份 (protobuf 编码的二进制)
+#[derive(Clone)]
+struct RegistryEntry {
+    /// PeerId 的 protobuf/multihash 二进制
+    peer_id: Vec<u8>,
+    /// 相机公钥 (protobuf 编码)
+    pubkey: Vec<u8>,
+    /// 相机对 (serial || peer_id) 的 ed25519 签名
+    signature: Vec<u8>,
+}
+
+/// 处理一条注册表应用流 (相机注册 或 viewer 查询)
+///
+/// 关键安全校验:
+/// 1. 连接认证的 peer (`remote_peer`，noise 握手确定) 必须等于消息声明的 `peer_id`，
+///    防止第三方用自己合法身份为别人的 serial 抢注假 peer_id。
+/// 2. `pubkey` 推导出的 peer_id 必须等于声明的 `peer_id`。
+/// 3. 签名 `signature` 必须能用 `pubkey` 验证 `serial || peer_id`。
+async fn handle_registry_connection(
+    remote_peer: PeerId,
+    mut stream: libp2p::swarm::Stream,
+    registry: Arc<Mutex<HashMap<String, RegistryEntry>>>,
+) -> anyhow::Result<()> {
+    // 读取一条完整消息 (注册表消息很小，单次或少量读取即可)
+    let mut buf: Vec<u8> = Vec::with_capacity(512);
+    let mut tmp = [0u8; 1024];
+    loop {
+        let n = stream.read(&mut tmp).await?;
+        if n == 0 {
+            break; // EOF
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        // 尝试解码；成功说明消息已完整
+        if RegistryMessage::decode(&buf).is_ok() {
+            break;
+        }
+        if buf.len() >= 8192 {
+            break; // 防垃圾数据死循环
+        }
+    }
+    if buf.is_empty() {
+        anyhow::bail!("registry stream closed without data");
+    }
+    let msg = RegistryMessage::decode(&buf)?;
+
+    match msg {
+        RegistryMessage::Register {
+            serial,
+            peer_id,
+            pubkey,
+            signature,
+        } => {
+            // 1) 连接认证的 peer 必须等于声明的 peer_id
+            let claimed = PeerId::from_bytes(&peer_id)
+                .map_err(|e| anyhow::anyhow!("invalid peer_id: {e}"))?;
+            if claimed != remote_peer {
+                let err = RegistryMessage::Error {
+                    message: "peer_id 与连接身份不符 (未认证)".into(),
+                };
+                stream.write_all(&err.encode()).await?;
+                stream.flush().await?;
+                anyhow::bail!("register rejected: claimed {claimed} != connection {remote_peer}");
+            }
+
+            // 2) pubkey 推导的 peer_id 必须匹配
+            let pk = identity::PublicKey::try_decode_protobuf(&pubkey)
+                .map_err(|e| anyhow::anyhow!("invalid pubkey: {e}"))?;
+            if pk.to_peer_id() != claimed {
+                let err = RegistryMessage::Error {
+                    message: "pubkey 与 peer_id 不匹配".into(),
+                };
+                stream.write_all(&err.encode()).await?;
+                stream.flush().await?;
+                anyhow::bail!("register rejected: pubkey/peer_id mismatch");
+            }
+
+            // 3) 验签
+            let payload = RegistryMessage::sign_payload(&serial, &peer_id);
+            if !pk.verify(&payload, &signature) {
+                let err = RegistryMessage::Error {
+                    message: "签名无效".into(),
+                };
+                stream.write_all(&err.encode()).await?;
+                stream.flush().await?;
+                anyhow::bail!("register rejected: bad signature");
+            }
+
+            registry.lock().await.insert(
+                serial.clone(),
+                RegistryEntry {
+                    peer_id: peer_id.clone(),
+                    pubkey: pubkey.clone(),
+                    signature: signature.clone(),
+                },
+            );
+            tracing::info!("[Relay] Registered serial '{serial}' -> {claimed}");
+            let ack = RegistryMessage::Response {
+                peer_id,
+                pubkey,
+                signature,
+            };
+            stream.write_all(&ack.encode()).await?;
+            stream.flush().await?;
+        }
+
+        RegistryMessage::Query { serial } => {
+            let entry = registry.lock().await.get(&serial).cloned();
+            match entry {
+                Some(e) => {
+                    let resp = RegistryMessage::Response {
+                        peer_id: e.peer_id,
+                        pubkey: e.pubkey,
+                        signature: e.signature,
+                    };
+                    stream.write_all(&resp.encode()).await?;
+                    stream.flush().await?;
+                    tracing::info!("[Relay] Query serial '{serial}' -> found");
+                }
+                None => {
+                    let nf = RegistryMessage::NotFound;
+                    stream.write_all(&nf.encode()).await?;
+                    stream.flush().await?;
+                    tracing::info!("[Relay] Query serial '{serial}' -> not found");
+                }
+            }
+        }
+
+        other => {
+            let err = RegistryMessage::Error {
+                message: format!("unexpected message: {other:?}"),
+            };
+            stream.write_all(&err.encode()).await?;
+            stream.flush().await?;
+            anyhow::bail!("unexpected registry message");
+        }
+    }
+    Ok(())
 }

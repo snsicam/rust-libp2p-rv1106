@@ -79,7 +79,7 @@ echo "  Ctrl+C to stop"
 echo "============================================"
 echo ""
 
-export RUST_LOG="${RUST_LOG:+$RUST_LOG,}libp2p_dcutr=debug,libp2p_relay=debug"
+export RUST_LOG=info
 
 # 前台运行, 输出到终端同时写日志
 "$DEVICE_CAM_BIN" "${ARGS[@]}" \

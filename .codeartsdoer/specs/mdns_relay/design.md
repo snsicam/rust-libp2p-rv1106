@@ -169,7 +169,7 @@ struct ViewerConfig {
 }
 ```
 
-**P2pViewer 库 (`mobile-core/src/viewer.rs`)**
+**MediaPlayer 库 (`mobile-core/src/viewer.rs`)**
 
 `connect()` 方法签名改造：
 ```rust
@@ -468,11 +468,11 @@ struct Opt {
 
 ## 2.1 总体设计
 
-本次改造主要涉及内部接口变更，不涉及外部 API（P2pViewer 的 FFI 接口需要同步更新）。
+本次改造主要涉及内部接口变更，不涉及外部 API（MediaPlayer 的 FFI 接口需要同步更新）。
 
 ## 2.2 接口清单
 
-### 2.2.1 P2pViewer::connect() 接口变更
+### 2.2.1 MediaPlayer::connect() 接口变更
 
 **文件**: `mobile-core/src/viewer.rs`
 

@@ -49,7 +49,7 @@ p2p-camera/
 │   └── src/{main.rs, config.rs, behaviour.rs, net_diag.rs}
 ├── mobile-core/           # 移动端 Rust 核心库
 │   ├── src/{viewer.rs, net_diag.rs, media_packet.rs}
-│   └── examples/viewer_cli.rs
+│   └── examples/media_viewer.rs
 └── docs/                  # 本目录
 ```
 

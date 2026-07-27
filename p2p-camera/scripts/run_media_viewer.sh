@@ -1,0 +1,96 @@
+#!/bin/bash
+# run_media_viewer.sh — 启动 media_viewer 并实时播放
+#
+# 用法:
+#   方式1 (配置文件): ./run_media_viewer.sh
+#     → 首次运行自动生成 viewer.toml，编辑后重启
+#
+#   方式2 (命令行覆盖): ./run_media_viewer.sh <relay_addr> <device_cam_peer> [udp_port]
+#     → 命令行参数覆盖配置文件中的值
+#
+# 示例:
+#   ./run_media_viewer.sh
+#   ./run_media_viewer.sh /ip4/101.35.90.171/udp/4001/quic-v1/p2p/12D3KooW... 12D3KooW...
+#   ./run_media_viewer.sh /ip4/101.35.90.171/udp/4001/quic-v1/p2p/12D3KooW... 12D3KooW... 34501
+#
+# 注意: 外部地址由 identify 协议自动发现（公网 IP）和 NewListenAddr 事件自动注入（本地 IP），
+#       无需手动指定 --external-ip。
+#
+# 前置条件: 已运行 build_viewer.sh 编译成功
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+VIEWER_BIN="$PROJECT_ROOT/target/debug/examples/media_viewer"
+LOG_DIR="$SCRIPT_DIR/logs"
+
+if [ ! -f "$VIEWER_BIN" ]; then
+    echo "[ERROR] media_viewer not found at $VIEWER_BIN"
+    echo "  Please run './build_viewer.sh' first to compile."
+    exit 1
+fi
+
+mkdir -p "$LOG_DIR"
+
+# 构建命令参数
+VIEWER_ARGS=()
+
+# 参数模式判断:
+#   - 若首个实参以 "-" 开头 (如 --stream / --relay / --camera)，视为「配置 + flag 透传」模式，
+#     把所有参数原样交给 binary (binary 自己解析 viewer.toml + CLI flag 覆盖)。
+#   - 否则视为「位置参数模式」: <relay> <device> [udp_port]
+if [ $# -gt 0 ] && [[ "$1" == -* ]]; then
+    VIEWER_ARGS+=("$@")
+    echo ""
+    echo "============================================"
+    echo "  P2P Camera Viewer (SDL Player)"
+    echo "============================================"
+    echo "  Mode: config (viewer.toml) + CLI flags"
+else
+    if [ $# -ge 2 ]; then
+        # 位置参数模式
+        RELAY_ADDR="$1"
+        DEVICE_CAM_PEER="$2"
+        UDP_PORT="${3:-}"
+
+        VIEWER_ARGS+=(--relay "$RELAY_ADDR" --camera "$DEVICE_CAM_PEER")
+
+        if [ -n "$UDP_PORT" ]; then
+            VIEWER_ARGS+=(--udp-port "$UDP_PORT")
+        fi
+
+        echo ""
+        echo "============================================"
+        echo "  P2P Camera Viewer (SDL Player)"
+        echo "============================================"
+        echo "  Relay:      $RELAY_ADDR"
+        echo "  DeviceCam:  $DEVICE_CAM_PEER"
+        if [ -n "$UDP_PORT" ]; then
+            echo "  UDP Port:   $UDP_PORT"
+        fi
+    else
+        # 配置文件模式
+        echo ""
+        echo "============================================"
+        echo "  P2P Camera Viewer (SDL Player)"
+        echo "============================================"
+        echo "  Config: viewer.toml"
+    fi
+fi
+
+echo ""
+echo "  ESC / Close window to quit"
+echo "============================================"
+echo ""
+
+export RUST_LOG=info
+
+# 检测是否支持 --play (需要 --features player 编译)
+if "$VIEWER_BIN" --help 2>&1 | grep -q -- '--play'; then
+    VIEWER_ARGS+=(--play)
+fi
+
+# 前台运行, Ctrl+C 或关窗退出
+"$VIEWER_BIN" "${VIEWER_ARGS[@]}" \
+    2>&1 | tee "$LOG_DIR/viewer.log"

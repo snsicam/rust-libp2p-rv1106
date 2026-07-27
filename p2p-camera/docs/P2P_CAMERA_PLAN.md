@@ -360,11 +360,11 @@ Track:
   0x03-0xFF = 保留 (未来扩展: 字幕、控制等)
 
 Flags (Track=0x01 视频):
-  bit 0: 0=IDR关键帧, 1=非关键帧
-  bit 1-7: 保留
+  保留 (置 0)。关键帧不再经此字段传递——接收端 (viewer) 自行扫描 NAL 字节判定
+  IDR (H.265 IRAP 16-21 / H.264 IDR 5), cam 侧不计算也不传该标志, JNI 桥也不转发。
 
 Flags (Track=0x02 音频):
-  bit 0-1: 音频格式 (0=PCM16LE, 1=AAC)
+  bit 0-1: 音频格式 (0=PCM16LE, 1=AAC, 2=G711A, 3=G711U)
   bit 2-7: 保留
 ```
 
@@ -479,7 +479,7 @@ impl MediaPacket {
 ├─────────────────────────────────────────┤
 │  Rust FFI Layer (.so / .a)              │
 │  ┌─────────────────────────────────────┐│
-│  │ p2p_viewer_lib (Rust)               ││
+│  │ media_player_lib (Rust)             ││
 │  │                                     ││
 │  │ - libp2p Swarm (QUIC + Noise)       ││
 │  │ - relay::client + dcutr            ││
@@ -745,7 +745,7 @@ Track: 0x01=Video(H.265 NAL), 0x02=Audio(PCM/AAC)
 ```
 任务:
 ├── [Day1-2] Rust FFI 核心库
-│   ├── p2p_viewer_lib crate
+│   ├── media_player_lib crate
 │   ├── C API 导出 (视频+音频分离接口)
 │   ├── Android: cargo-ndk 编译 .so
 │   └── iOS: cargo-lipo 编译 .a
@@ -794,9 +794,11 @@ Track: 0x01=Video(H.265 NAL), 0x02=Audio(PCM/AAC)
 │   ├── DeviceCam 单帧源 → 多 viewer 分发
 │   └── QUIC stream 优先级 (关键帧优先)
 │
-├── [ ] 断线重连
-│   ├── 连接断开自动重连
-│   └── 重连期间发送 I 帧
+├── [x] 断线重连
+│   ├── [x] 连接断开自动重连 (MediaPlayerEvent::Disconnected + reconnect())
+│   ├── [x] receive_frames EOF 时发送断连通知
+│   ├── [x] ConnectionClosed 时发送 ViewerEvent::Disconnected
+│   └── [ ] 重连期间发送 I 帧
 │
 ├── [ ] 录制/回放 (可选)
 │   └── DeviceCam 本地 SD 卡录制
@@ -844,27 +846,27 @@ p2p-camera/
 │   ├── build.rs               # 编译时间戳
 │   ├── src/
 │   │   ├── lib.rs             # FFI 导出 (视频+音频接口)
-│   │   ├── viewer.rs          # P2pViewer 核心
+│   │   ├── viewer.rs          # MediaPlayer 核心 (含断连检测 + 自动重连)
 │   │   ├── behaviour.rs       # NetworkBehaviour
 │   │   ├── jitter_buffer.rs   # AvJitterBuffer (音视频分离)
 │   │   ├── media_packet.rs    # MediaPacket 解析
 │   │   ├── net_diag.rs        # NAT 诊断 + ConnectionType
 │   │   └── stream_protocols.rs # 协议常量
 │   └── examples/
-│       └── viewer_cli.rs      # PC 端 Viewer (含 TOML 配置支持)
+│       └── media_viewer.rs    # PC 端 Media Viewer (含 TOML 配置支持)
 │
 ├── mobile-android/            # Android APP
 │   ├── app/
 │   │   ├── build.gradle
 │   │   └── src/main/
-│   │       ├── java/.../P2pViewer.kt      # JNI 封装
+│   │       ├── java/.../MediaPlayer.kt      # JNI 封装
 │   │       ├── java/.../VideoDecoder.kt    # MediaCodec
 │   │       └── java/.../MainActivity.kt    # UI
 │   └── jniLibs/               # .so 文件
 │
 ├── mobile-ios/                # iOS APP (可选)
-│   ├── P2PViewer/
-│   │   ├── P2pViewer.swift    # C FFI 封装
+│   ├── MediaPlayer/
+│   │   ├── MediaPlayer.swift    # C FFI 封装
 │   │   ├── VideoDecoder.swift # VideoToolbox
 │   │   └── ContentView.swift  # UI
 │   └── libs/                  # .a 文件
@@ -998,9 +1000,9 @@ cd device-cam && cargo run -- \
 
 # 终端3: Viewer (首次运行自动生成 viewer.toml)
 # 方式1: 编辑 viewer.toml 填入 relay 和 camera 后运行
-cd mobile-core && cargo run --example viewer_cli --features player
+cd mobile-core && cargo run --example media_viewer --features player
 # 方式2: 命令行参数覆盖
-cd mobile-core && cargo run --example viewer_cli --features player -- \
+cd mobile-core && cargo run --example media_viewer --features player -- \
     --relay /ip4/127.0.0.1/tcp/4001/p2p/<relay_peer> \
     --camera 12D3KooX... --play
 # 输出: 保存视频到 output.h265 + SDL 实时播放

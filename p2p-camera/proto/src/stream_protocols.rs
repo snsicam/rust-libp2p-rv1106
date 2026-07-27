@@ -14,3 +14,6 @@ pub const VIDEO_THIRD_PROTOCOL: StreamProtocol = StreamProtocol::new("/p2p-camer
 
 /// 音频流协议: PCM/G711A/G711U/AAC 封装在 MediaPacket 中
 pub const AUDIO_PROTOCOL: StreamProtocol = StreamProtocol::new("/p2p-camera/audio/1.0.0");
+
+/// 控制通道协议: 双向 request/response (查询/设置编码参数、图像参数、系统参数等)
+pub const CONTROL_PROTOCOL: StreamProtocol = StreamProtocol::new("/p2p-camera/control/1.0.0");

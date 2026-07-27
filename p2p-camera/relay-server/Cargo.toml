@@ -14,3 +14,7 @@ clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 anyhow = "1"
+libp2p-stream = { workspace = true }
+
+# 共享协议 (注册表消息编解码)
+proto = { path = "../proto" }

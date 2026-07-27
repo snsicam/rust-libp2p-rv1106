@@ -7,10 +7,22 @@
 //!
 //! Track:  0x01=Video(H.265 NAL), 0x02=Audio(PCM/AAC/G711)
 //!
-//! Flags (Video):  bit 0: 0=IDR关键帧, 1=非关键帧
-//! Flags (Audio):  bit 0-1: 0=PCM16LE, 1=AAC, 2=G711A, 3=G711U
+//! Flags: 音频包用低 2 位区分 codec: 0=PCM16LE, 1=AAC, 2=G711A, 3=G711U;
+//!        视频包用 bit 2 (FLAG_VIDEO_KEYFRAME=0x04) 标记关键帧。
+//!        关键帧由接收端字节扫描判定(见 viewer 的 is_nal_keyframe, H.265 IRAP 16-21 / H.264 IDR 5),
+//!        cam 不计算也不传该标志(实测不可靠), 接收端扫描后写入 flags 的 bit 2 供下游复用,
+//!        避免每帧重复字节扫描。JNI 桥可顺带转发该 bit 给原生 APP。
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+
+/// 音频包 flags 低 2 位: 音频 codec 类型
+pub const AUDIO_CODEC_PCM: u8 = 0;
+pub const AUDIO_CODEC_AAC: u8 = 1;
+pub const AUDIO_CODEC_G711A: u8 = 2;
+pub const AUDIO_CODEC_G711U: u8 = 3;
+
+/// 视频包 flags bit 2: 关键帧标志 (由接收端字节扫描判定, 非 cam wire 值)
+pub const FLAG_VIDEO_KEYFRAME: u8 = 0x04;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[repr(u8)]
@@ -40,12 +52,21 @@ pub struct MediaPacket {
 impl MediaPacket {
     const HEADER_SIZE: usize = 1 + 8 + 1 + 4; // track + ts + flags + data_len
 
+    /// 是否关键帧: 仅视频包有效。由接收端字节扫描 `is_nal_keyframe` 后写入 `flags` 的
+    /// `FLAG_VIDEO_KEYFRAME` bit (cam 不计算该标志, 实测不可靠), 此处为唯一权威判定。
+    /// 下游 (drain / media_viewer / JNI) 直接复用, 避免每帧重复字节扫描。
+    pub fn is_keyframe(&self) -> bool {
+        self.track == MediaTrack::Video && (self.flags & FLAG_VIDEO_KEYFRAME) != 0
+    }
+
     /// 创建视频帧包
-    pub fn video(timestamp_ms: u64, is_keyframe: bool, data: Bytes) -> Self {
+    /// 注意: 不接收 is_keyframe 参数 —— 关键帧由接收端字节扫描判定后写入 `flags` 的
+    /// `FLAG_VIDEO_KEYFRAME` bit (cam 不计算也不传该标志, 实测不可靠), 下游用 `is_keyframe()` 读取。
+    pub fn video(timestamp_ms: u64, data: Bytes) -> Self {
         MediaPacket {
             track: MediaTrack::Video,
             timestamp_ms,
-            flags: if is_keyframe { 0 } else { 1 },
+            flags: 0, // 视频包关键帧 bit 由 viewer receive_frames 扫描后设置
             data,
         }
     }
@@ -55,7 +76,7 @@ impl MediaPacket {
         MediaPacket {
             track: MediaTrack::Audio,
             timestamp_ms,
-            flags: 0, // PCM16LE
+            flags: AUDIO_CODEC_PCM, // PCM16LE
             data,
         }
     }
@@ -65,7 +86,7 @@ impl MediaPacket {
         MediaPacket {
             track: MediaTrack::Audio,
             timestamp_ms,
-            flags: 2, // G711A
+            flags: AUDIO_CODEC_G711A, // G711A
             data,
         }
     }
@@ -75,13 +96,9 @@ impl MediaPacket {
         MediaPacket {
             track: MediaTrack::Audio,
             timestamp_ms,
-            flags: 3, // G711U
+            flags: AUDIO_CODEC_G711U, // G711U
             data,
         }
-    }
-
-    pub fn is_keyframe(&self) -> bool {
-        self.track == MediaTrack::Video && (self.flags & 0x01) == 0
     }
 
     /// 编码为字节
@@ -144,7 +161,7 @@ mod tests {
     #[test]
     fn test_video_packet_roundtrip() {
         let data = Bytes::from_static(&[0, 0, 0, 1, 0x65, 0x01, 0x02]); // fake NAL
-        let pkt = MediaPacket::video(12345, true, data);
+        let pkt = MediaPacket::video(12345, data);
         let encoded = pkt.encode();
 
         let mut buf = BytesMut::from(encoded.as_ref());
@@ -152,7 +169,7 @@ mod tests {
 
         assert_eq!(decoded.track, MediaTrack::Video);
         assert_eq!(decoded.timestamp_ms, 12345);
-        assert!(decoded.is_keyframe());
+        assert_eq!(decoded.flags, 0); // 视频包 flags 保留未用
         assert_eq!(decoded.data.len(), 7);
     }
 

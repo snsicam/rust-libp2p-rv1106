@@ -1,2 +1,24 @@
-# p2p-camera 已并入父 workspace (rust-libp2p/Cargo.toml)
-# 此文件仅为占位，不再声明独立的 [workspace]
+[workspace]
+resolver = "2"
+members = [
+    "proto",
+    "mobile-core",
+    "device-cam",
+    "relay-server",
+]
+
+[workspace.dependencies]
+# libp2p 内部 crate（path 指向父 workspace 源码）
+libp2p = { version = "0.57.0", path = "../libp2p" }
+libp2p-stream = { version = "0.5.0-alpha", path = "../protocols/stream" }
+libp2p-swarm = { version = "0.48.0", path = "../swarm" }
+
+# 外部依赖（版本与父 workspace 保持一致）
+bytes = "1.11.1"
+futures = "0.3.30"
+tokio = { version = "1.52", default-features = false }
+tracing = "0.1.44"
+tracing-subscriber = "0.3.23"
+
+# 用于 build android 时跳过 device-cam 和 relay-server:
+# cargo ndk -t aarch64-linux-android -p 26 -- build --release -p mobile-core

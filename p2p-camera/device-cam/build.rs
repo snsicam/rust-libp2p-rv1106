@@ -74,6 +74,36 @@ fn main() {
         }
     }
 
+    // RGA (2D 加速器) — NV12→BGRA 硬件转换, 静态链接避免运行时依赖
+    let rga_include = std::env::var("RV1106_RGA_INCLUDE")
+        .unwrap_or_else(|_| {
+            let sdk_root = std::env::var("RV1106_SDK_ROOT")
+                .unwrap_or_else(|_| "/workspace/rv1106/RV1106_Linux_SDK".to_string());
+            let inc = std::path::Path::new(&sdk_root)
+                .join("media/rga/release_rga_rv1106_arm-rockchip830-linux-uclibcgnueabihf/include/rga");
+            println!("cargo:warning=RGA auto-detect: checking {}", inc.display());
+            if inc.exists() {
+                println!("cargo:warning=RGA include found: {}", inc.display());
+                return inc.display().to_string();
+            }
+            "/usr/include/rga".to_string()
+        });
+    let rga_lib = std::env::var("RV1106_RGA_LIB")
+        .unwrap_or_else(|_| {
+            let sdk_root = std::env::var("RV1106_SDK_ROOT")
+                .unwrap_or_else(|_| "/workspace/rv1106/RV1106_Linux_SDK".to_string());
+            let lib = std::path::Path::new(&sdk_root)
+                .join("media/rga/release_rga_rv1106_arm-rockchip830-linux-uclibcgnueabihf/lib");
+            if lib.exists() {
+                return lib.display().to_string();
+            }
+            "/usr/lib".to_string()
+        });
+    println!("cargo:warning=RGA include path: {}", rga_include);
+    println!("cargo:warning=RGA lib path: {}", rga_lib);
+
+    cc_build.include(&rga_include);
+
     cc_build.compile("rk_camera");
 
     // SDK 库路径 — 支持多个路径 (用冒号分隔)
@@ -92,6 +122,9 @@ fn main() {
     println!("cargo:rustc-link-arg=-Wl,--allow-shlib-undefined");
     println!("cargo:rustc-link-lib=dylib=rockit_full");
     println!("cargo:rustc-link-lib=dylib=rkaiq");
+    println!("cargo:rustc-link-search=native={}", rga_lib);
+    println!("cargo:rustc-link-lib=static=rga");
+    println!("cargo:rustc-link-lib=static=stdc++");  // RGA 是 C++ 库, 需要 libstdc++
 }
 
 fn chrono_now() -> String {

@@ -1,12 +1,14 @@
 # 编码任务清单
 
+> **状态: 已完成** (2026-07-16)
+
 基于 spec.md 需求规格和 design.md 技术设计，将实现工作拆解为以下编码任务。
 
 ---
 
 ## 阶段一：配置系统改造（基础设施）
 
-### 任务 1：DeviceCam 配置系统改造
+### 任务 1：DeviceCam 配置系统改造 ✅
 
 **文件**: `p2p-camera/device-cam/src/config.rs`
 
@@ -27,7 +29,7 @@
 
 ---
 
-### 任务 2：DeviceCam CLI 参数改造
+### 任务 2：DeviceCam CLI 参数改造 ✅
 
 **文件**: `p2p-camera/device-cam/src/main.rs`
 
@@ -45,7 +47,7 @@
 
 ---
 
-### 任务 3：Viewer CLI 配置系统改造
+### 任务 3：Viewer CLI 配置系统改造 ✅
 
 **文件**: `p2p-camera/mobile-core/examples/viewer_cli.rs`
 
@@ -68,7 +70,7 @@
 
 ## 阶段二：mDNS 集成
 
-### 任务 4：DeviceCam Cargo.toml 新增 mdns feature
+### 任务 4：DeviceCam Cargo.toml 新增 mdns feature ✅
 
 **文件**: `p2p-camera/device-cam/Cargo.toml`
 
@@ -80,7 +82,7 @@
 
 ---
 
-### 任务 5：DeviceCam Behaviour 新增 mDNS
+### 任务 5：DeviceCam Behaviour 新增 mDNS ✅
 
 **文件**: `p2p-camera/device-cam/src/behaviour.rs`
 
@@ -102,7 +104,7 @@
 
 ---
 
-### 任务 6：mobile-core Cargo.toml 新增 mdns feature
+### 任务 6：mobile-core Cargo.toml 新增 mdns feature ✅
 
 **文件**: `p2p-camera/mobile-core/Cargo.toml`
 
@@ -114,7 +116,7 @@
 
 ---
 
-### 任务 7：Viewer Behaviour 新增 mDNS（viewer.rs）
+### 任务 7：Viewer Behaviour 新增 mDNS（viewer.rs） ✅
 
 **文件**: `p2p-camera/mobile-core/src/viewer.rs`
 
@@ -129,7 +131,7 @@
 
 ---
 
-### 任务 8：Viewer Behaviour 新增 mDNS（viewer_cli.rs）
+### 任务 8：Viewer Behaviour 新增 mDNS（viewer_cli.rs） ✅
 
 **文件**: `p2p-camera/mobile-core/examples/viewer_cli.rs`
 
@@ -146,7 +148,7 @@
 
 ## 阶段三：DeviceCam 多路预约
 
-### 任务 9：DeviceCam main.rs 多路预约逻辑
+### 任务 9：DeviceCam main.rs 多路预约逻辑 ✅
 
 **文件**: `p2p-camera/device-cam/src/main.rs`
 
@@ -174,7 +176,7 @@
 
 ## 阶段四：Viewer mDNS 优先 + 多 Relay 并发拨号
 
-### 任务 10：P2pViewer::connect() 改造（viewer.rs）
+### 任务 10：MediaPlayer::connect() 改造（viewer.rs） ✅
 
 **文件**: `p2p-camera/mobile-core/src/viewer.rs`
 
@@ -196,7 +198,7 @@
 
 ---
 
-### 任务 11：viewer_cli.rs 连接逻辑改造
+### 任务 11：viewer_cli.rs 连接逻辑改造 ✅
 
 **文件**: `p2p-camera/mobile-core/examples/viewer_cli.rs`
 
@@ -220,7 +222,7 @@
 
 ## 阶段五：集成测试与验证
 
-### 任务 12：编译验证与修复
+### 任务 12：编译验证与修复 ✅
 
 **改动内容**:
 1. 执行 `cargo check` 验证所有 crate 编译通过
@@ -233,7 +235,7 @@
 
 ---
 
-### 任务 13：配置文件向后兼容验证
+### 任务 13：配置文件向后兼容验证 ✅
 
 **改动内容**:
 1. 使用旧格式 `device-cam.toml`（只有 `relay = "..."`）启动 DeviceCam，验证正常工作
@@ -255,7 +257,7 @@
                                                                     │
 任务 4 (DeviceCam Cargo.toml) ──→ 任务 5 (DeviceCam Behaviour) ──→ │
                                                                     │
-任务 6 (mobile-core Cargo.toml) ──→ 任务 7 (viewer.rs Behaviour) ──→ 任务 10 (P2pViewer connect)
+任务 6 (mobile-core Cargo.toml) ──→ 任务 7 (viewer.rs Behaviour) ──→ 任务 10 (MediaPlayer connect)
                   │                                                 │
                   └──→ 任务 8 (viewer_cli Behaviour) ──────────────→│
                                                                     │

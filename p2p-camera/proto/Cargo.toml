@@ -7,3 +7,7 @@ publish = false
 [dependencies]
 libp2p-swarm = { workspace = true }
 bytes = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+futures = { workspace = true }

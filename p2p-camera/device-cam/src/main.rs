@@ -19,6 +19,7 @@
 
 mod behaviour;
 mod config;
+mod control_handler;
 mod media_source;
 mod net_diag;
 #[cfg(feature = "rv1106")]
@@ -32,10 +33,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use behaviour::Behaviour;
-use bytes::Bytes;
 use clap::Parser;
 use crossbeam_channel::Sender;
-use futures::{AsyncWriteExt, StreamExt};
+use futures::{AsyncReadExt, AsyncWriteExt, StreamExt};
 use libp2p::{
     core::multiaddr::{Multiaddr, Protocol},
     dcutr, identify, identity, noise, relay,
@@ -43,9 +43,11 @@ use libp2p::{
     tcp,
     PeerId,
 };
-use net_diag::{NatDiagnostic, NatType};
+use libp2p_stream::Control;
+use net_diag::{ConnectionStrategy, NatDiagnostic, NatType};
 use proto::{
     media_packet::MediaPacket,
+    registry::{RegistryMessage, REGISTRY_PROTOCOL},
     stream_protocols,
 };
 use tokio::sync::broadcast;
@@ -84,13 +86,16 @@ async fn main() -> Result<()> {
         env!("CARGO_PKG_VERSION"), env!("BUILD_TIME"));
 
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
+        .with_env_filter(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .init();
 
     let opt = Opt::parse();
 
     // ---- 加载配置文件 ----
-    let mut cfg = config::Config::load(&opt.config).unwrap_or_else(|e| {
+    let mut config = config::Config::load(&opt.config).unwrap_or_else(|e| {
         eprintln!("[DeviceCam] {e}");
         std::process::exit(1);
     });
@@ -105,21 +110,21 @@ async fn main() -> Result<()> {
         udp_port: opt.udp_port,
         video_file: None,
     };
-    cfg.apply_cli_overrides(&cli_overrides);
+    config.apply_cli_overrides(&cli_overrides);
 
     // video_file 只在非 rv1106 模式下有效
     #[cfg(not(feature = "rv1106"))]
     if let Some(ref vf) = opt.video_file {
-        cfg.video_file = Some(vf.clone());
+        config.video_file = Some(vf.clone());
     }
 
-    if cfg.relays.is_empty() && !cfg.enable_mdns {
+    if config.relays.is_empty() && !config.enable_mdns {
         eprintln!("[DeviceCam] Error: no relay addresses and mDNS is disabled. \
                    Edit {} or use --relay / --enable-mdns", opt.config.display());
         std::process::exit(1);
     }
 
-    validate_device_cam_config(&cfg);
+    validate_device_cam_config(&config);
 
     // ---- 初始化媒体源 ----
     // 三路视频 broadcast channel
@@ -130,23 +135,30 @@ async fn main() -> Result<()> {
 
     // 标记每个码流是否启用 (仅在 rv1106 特性下使用)
     #[allow(unused_variables)]
-    let main_enabled = cfg.video.main.enabled;
+    let main_enabled = config.video.main.enabled;
     #[allow(unused_variables)]
-    let sub_enabled = cfg.video.sub.enabled;
+    let sub_enabled = config.video.sub.enabled;
     #[allow(unused_variables)]
-    let third_enabled = cfg.video.third.enabled;
+    let third_enabled = config.video.third.enabled;
+
+    // RkVideoSource 必须在整个 main() 生命周期内保持存活，因为：
+    //   spawn(&self) 后 self 仍被借用 → Drop 不清空 GLOBAL_SENDERS。
+    //   若在 cfg 块内 drop, GLOBAL_SENDERS → None → 线程探测到后立即退出
+    //   → rk_camera_deinit 段错误。
+    #[cfg(feature = "rv1106")]
+    let mut _cam_source: Option<rk_video_source::RkVideoSource> = None;
 
     #[cfg(feature = "rv1106")]
     {
         if main_enabled {
-            let main_params = stream_config_to_params(&cfg.video.main);
+            let main_params = stream_config_to_params(&config.video.main);
             let sub_params = if sub_enabled {
-                Some(stream_config_to_params(&cfg.video.sub))
+                Some(stream_config_to_params(&config.video.sub))
             } else {
                 None
             };
             let third_params = if third_enabled {
-                Some(stream_config_to_params(&cfg.video.third))
+                Some(stream_config_to_params(&config.video.third))
             } else {
                 None
             };
@@ -169,20 +181,31 @@ async fn main() -> Result<()> {
                          p.bitrate_kbps, p.codec);
             }
 
-            let source = rk_video_source::RkVideoSource::new(
+            let mut source = rk_video_source::RkVideoSource::new(
                 main_params, sub_params, third_params,
+                config.sensor_frame_rate,
             );
-            let (_, _start_tx) = source.spawn(
+            if config.lcd.enabled {
+                source = source.with_lcd(config.lcd.width, config.lcd.height);
+            }
+            let (_, start_tx) = source.spawn(
                 broadcast_sender_to_crossbeam(main_tx.clone()),
                 if sub_enabled { Some(broadcast_sender_to_crossbeam(sub_tx.clone())) } else { None },
                 if third_enabled { Some(broadcast_sender_to_crossbeam(third_tx.clone())) } else { None },
             );
+            // 立即启动摄像头：RkVideoSource 内部线程在 start_rx.recv() 处阻塞，
+            // 必须发送开始信号才会初始化摄像头并开始取流 (rk_camera_init)。
+            // 否则 on_frame 回调永不触发，main_tx 永远为空，viewer 收不到任何视频帧。
+            let _ = start_tx.send(());
+
+            // 将 source 移出块作用域: 它必须在整个 main() 生命周期保持存活
+            _cam_source = Some(source);
         }
     }
 
     #[cfg(not(feature = "rv1106"))]
     {
-        if let Some(video_path) = &cfg.video_file {
+        if let Some(video_path) = &config.video_file {
             let data = std::fs::read(video_path)
                 .context("Failed to read video file")?;
             println!("[DeviceCam] Video file: {:?} ({} bytes)", video_path, data.len());
@@ -198,41 +221,51 @@ async fn main() -> Result<()> {
     // 音频源
     #[cfg(feature = "rv1106")]
     {
-        if cfg.audio.enabled {
+        if config.audio.enabled {
             let source = rk_video_source::RkAudioSource::new(
-                cfg.audio.sample_rate,
-                cfg.audio.card_name.clone(),
-                cfg.audio.channels,
-                cfg.audio.frame_size,
-                cfg.audio.volume,
-                cfg.audio.format.clone(),
-                cfg.audio.encode_type.clone(),
-                cfg.audio.bit_rate,
-                cfg.audio.enable_vqe,
-                cfg.audio.vqe_cfg.clone(),
+                config.audio.sample_rate,
+                config.audio.card_name.clone(),
+                config.audio.channels,
+                config.audio.frame_size,
+                config.audio.volume,
+                config.audio.format.clone(),
+                config.audio.encode_type.clone(),
+                config.audio.bit_rate,
+                config.audio.enable_vqe,
+                config.audio.vqe_cfg.clone(),
             );
             source.spawn(broadcast_sender_to_crossbeam(audio_tx.clone()));
             println!("[DeviceCam] Audio source: RV1106 AI ({}Hz mono, frame={}, encode={})",
-                cfg.audio.sample_rate, cfg.audio.frame_size, cfg.audio.encode_type);
+                config.audio.sample_rate, config.audio.frame_size, config.audio.encode_type);
         }
     }
 
     #[cfg(not(feature = "rv1106"))]
     {
-        if cfg.audio.enabled {
-            let source = media_source::SilenceAudioSource::new(cfg.audio.sample_rate, cfg.audio.channels as u8);
+        if config.audio.enabled {
+            let source = media_source::SilenceAudioSource::new(config.audio.sample_rate, config.audio.channels as u8);
             source.spawn(broadcast_sender_to_crossbeam(audio_tx.clone()));
             println!("[DeviceCam] Audio source: silence (16kHz mono)");
         }
     }
 
     // ---- 加载/生成固定身份密钥 ----
-    let keypair = load_or_create_keypair(&cfg.key_file)?;
+    let keypair = load_or_create_keypair(&config.key_file)?;
     let peer_id = keypair.public().to_peer_id();
     println!("[DeviceCam] PeerId: {peer_id}");
 
+    // 保留一份私钥副本用于向 relay 注册签名 (swarm 会拿走原 keypair)
+    let signing_keypair = keypair.clone();
+
+    // 读取板载序列号 (Linux /proc/cpuinfo 的 Serial；非 Linux 无硬件则返回 None)
+    let serial = read_board_serial();
+    match &serial {
+        Some(s) => println!("[DeviceCam] Board serial: {s} (will register with relay)"),
+        None => println!("[DeviceCam] No board serial configured — relay registry skipped (viewer must use full PeerId)"),
+    }
+
     // ---- 解析 Relay 地址列表 ----
-    let relay_states: Vec<RelayState> = cfg.relays.iter().map(|addr_str| {
+    let relay_states: Vec<RelayState> = config.relays.iter().map(|addr_str| {
         let addr: Multiaddr = addr_str.parse()
             .context(format!("Invalid relay address: {addr_str}"))
             .unwrap();
@@ -259,7 +292,7 @@ async fn main() -> Result<()> {
             println!("[DeviceCam]   Relay #{}: {}", i + 1, state.peer_id);
         }
     }
-    if cfg.enable_mdns {
+    if config.enable_mdns {
         println!("[DeviceCam] mDNS enabled - LAN discovery active");
     }
 
@@ -283,6 +316,7 @@ async fn main() -> Result<()> {
                 key.public().clone(),
                 relay_client,
                 identify_config,
+                config.enable_dcutr,
             )
         })?
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(120)))
@@ -291,7 +325,7 @@ async fn main() -> Result<()> {
     tracing::info!("[DeviceCam] push_listen_addr_updates enabled for DCUtR");
 
     // ---- 监听本地 QUIC / TCP ----
-    let udp_port = cfg.udp_port.unwrap_or(0);
+    let udp_port = config.udp_port.unwrap_or(0);
     let udp_addr = format!("/ip4/0.0.0.0/udp/{}/quic-v1", udp_port).parse()
         .context("Invalid local QUIC listen addr")?;
     swarm.listen_on(udp_addr)?;
@@ -302,6 +336,8 @@ async fn main() -> Result<()> {
 
     // ---- Stream 控制 (三路视频 + 音频 + 向后兼容旧协议) ----
     let mut stream_control = swarm.behaviour().new_stream_control();
+    // 用于向 relay 发送注册表流的独立控制句柄 (可并发)
+    let registry_control = stream_control.clone();
 
     // 主码流
     let mut incoming_main = stream_control
@@ -319,6 +355,10 @@ async fn main() -> Result<()> {
     let mut incoming_audio = stream_control
         .accept(stream_protocols::AUDIO_PROTOCOL)
         .context("Failed to accept audio protocol")?;
+    // 控制通道
+    let mut incoming_control = stream_control
+        .accept(stream_protocols::CONTROL_PROTOCOL)
+        .context("Failed to accept control protocol")?;
 
     // ---- 状态 ----
     let mut connection_times: HashMap<PeerId, Instant> = HashMap::new();
@@ -328,6 +368,9 @@ async fn main() -> Result<()> {
     let mut local_ips: Vec<Ipv4Addr> = Vec::new();
     let mut local_quic_port: u16 = 0;
     let mut relay_states: Vec<RelayState> = relay_states;
+    // 每个 viewer 的 DCUtR 失败次数。4G/CGNAT 等入站 UDP 被屏蔽的网络下打洞必然失败，
+    // 反复失败说明该 peer 无法直连，应停用 DCUtR 以免其握手挤占中继视频流带宽。
+    let mut dcutr_fail_count: HashMap<PeerId, u32> = HashMap::new();
 
     // 初始连接所有 Relay
     for state in &relay_states {
@@ -338,6 +381,11 @@ async fn main() -> Result<()> {
     }
 
     // ---- 事件循环 ----
+    // 活跃视频/音频发送任务注册表: (PeerId, 流类型) -> 任务句柄
+    // 用于同 peer 同路流去重: viewer 最小化/重连可能重复打开同一路流,
+    // 若不及时 abort 旧任务, 会出现多路流同时推送 (两路视频流打架)。
+    let mut active_streams: HashMap<(PeerId, &str), tokio::task::JoinHandle<()>> = HashMap::new();
+
     loop {
         tokio::select! {
             // Swarm 事件 (与之前相同)
@@ -371,10 +419,28 @@ async fn main() -> Result<()> {
                         Err(err) => {
                             let local_nat = local_nat_type.map(|t| t.short_name()).unwrap_or("Unknown");
                             tracing::warn!("[DeviceCam] DCUtR failed with {remote_peer_id}: {err}");
+                            // 按 peer 累计打洞失败次数；反复失败说明该 viewer 无法直连
+                            // (典型为 4G/CGNAT 入站 UDP 被屏蔽)，应停用 DCUtR 以免其握手
+                            // 挤占中继视频流写入带宽，导致 SLOW write / 卡顿。
+                            let fails = dcutr_fail_count.entry(remote_peer_id).or_insert(0);
+                            *fails += 1;
+                            if *fails >= 2 && config.enable_dcutr {
+                                tracing::warn!(
+                                    "[DeviceCam] DCUtR 对该 viewer 已失败 {} 次，打洞对本端无效。\
+                                     建议在该 device-cam.toml 设置 enable_dcutr = false 仅走中继，\
+                                     可消除打洞握手对视频流的干扰与卡顿。",
+                                    *fails
+                                );
+                            }
                             tracing::warn!("[DeviceCam] NAT context: local={}", local_nat);
                             if let Some(ref diag) = nat_diagnostic {
                                 let result = diag.diagnose();
                                 tracing::warn!("[DeviceCam] Suggestion: {}", result.dcutr_suggestion);
+                                // 连接策略结果日志
+                                let (strategy, _) = diag.connection_strategy();
+                                if matches!(strategy, ConnectionStrategy::SkipDcutr) {
+                                    tracing::info!("[DeviceCam] Connection strategy result: DCUtR failed as predicted (Symmetric NAT/4G), fallback to Relay Circuit");
+                                }
                             } else {
                                 let err_str = err.to_string();
                                 if err_str.contains("timeout") {
@@ -537,6 +603,19 @@ async fn main() -> Result<()> {
                                         }
                                     }
                                 }
+
+                                // 向 relay 注册 (serial → peer_id) 签名绑定，
+                                // 使 viewer 仅凭短 serial 即可经 relay 解析出真实 PeerId 并连接。
+                                if let Some(ref s) = serial {
+                                    let ctrl = registry_control.clone();
+                                    let kp = signing_keypair.clone();
+                                    let ser = s.clone();
+                                    let self_pid = kp.public().to_peer_id();
+                                    let relay_pid = peer_id; // 此分支内 peer_id 即 relay
+                                    tokio::spawn(async move {
+                                        register_camera_with_relay(ctrl, relay_pid, kp, ser, self_pid).await;
+                                    });
+                                }
                             }
                         } else {
                             println!("[DeviceCam] *** Viewer connected: {peer_id} via {conn_type} ***");
@@ -548,6 +627,10 @@ async fn main() -> Result<()> {
                                     } else {
                                         tracing::warn!("[DeviceCam] DCUtR prediction: likely FAIL - {}", prediction.reason);
                                     }
+
+                                    // 连接策略日志：输出本端 NAT 类型和 DCUtR 策略
+                                    let (strategy, reason) = diag.connection_strategy();
+                                    tracing::info!("[DeviceCam] Connection strategy: {} - {}", strategy.name(), reason);
                                 }
                             }
                         }
@@ -616,45 +699,82 @@ async fn main() -> Result<()> {
             // 主码流请求
             main_video = incoming_main.next() => {
                 if let Some((peer_id, stream)) = main_video {
-                    let rx = main_tx.subscribe();
                     let conn_type = peer_conn_type.get(&peer_id).map(|s| s.as_str()).unwrap_or("Unknown");
                     println!("[DeviceCam] New MAIN video viewer: {peer_id} via {conn_type}");
-                    let init_nals = get_init_nals(0);
-                    tokio::spawn(stream_video_to_viewer(peer_id, stream, rx, init_nals, "main"));
+                    // 同 peer 同路流去重: 新请求到达时先 abort 旧任务, 避免多路流打架
+                    let key = (peer_id, "main");
+                    match active_streams.get(&key).map(|h| h.is_finished()) {
+                        Some(true) => { active_streams.remove(&key); }
+                        Some(false) => { active_streams.get(&key).unwrap().abort(); }
+                        None => {}
+                    }
+                    let rx = main_tx.subscribe();
+                    let handle = tokio::spawn(stream_video_to_viewer(peer_id, stream, rx, "main"));
+                    active_streams.insert(key, handle);
                 }
             }
 
             // 子码流请求
             sub_video = incoming_sub.next() => {
                 if let Some((peer_id, stream)) = sub_video {
-                    let rx = sub_tx.subscribe();
                     let conn_type = peer_conn_type.get(&peer_id).map(|s| s.as_str()).unwrap_or("Unknown");
                     println!("[DeviceCam] New SUB video viewer: {peer_id} via {conn_type}");
-                    let init_nals = get_init_nals(1);
-                    tokio::spawn(stream_video_to_viewer(peer_id, stream, rx, init_nals, "sub"));
+                    let key = (peer_id, "sub");
+                    match active_streams.get(&key).map(|h| h.is_finished()) {
+                        Some(true) => { active_streams.remove(&key); }
+                        Some(false) => { active_streams.get(&key).unwrap().abort(); }
+                        None => {}
+                    }
+                    let rx = sub_tx.subscribe();
+                    let handle = tokio::spawn(stream_video_to_viewer(peer_id, stream, rx, "sub"));
+                    active_streams.insert(key, handle);
                 }
             }
 
             // 第三码流请求
             third_video = incoming_third.next() => {
                 if let Some((peer_id, stream)) = third_video {
-                    let rx = third_tx.subscribe();
                     let conn_type = peer_conn_type.get(&peer_id).map(|s| s.as_str()).unwrap_or("Unknown");
                     println!("[DeviceCam] New THIRD video viewer: {peer_id} via {conn_type}");
-                    let init_nals = get_init_nals(2);
-                    tokio::spawn(stream_video_to_viewer(peer_id, stream, rx, init_nals, "third"));
+                    let key = (peer_id, "third");
+                    match active_streams.get(&key).map(|h| h.is_finished()) {
+                        Some(true) => { active_streams.remove(&key); }
+                        Some(false) => { active_streams.get(&key).unwrap().abort(); }
+                        None => {}
+                    }
+                    let rx = third_tx.subscribe();
+                    let handle = tokio::spawn(stream_video_to_viewer(peer_id, stream, rx, "third"));
+                    active_streams.insert(key, handle);
                 }
             }
 
             // 音频
             audio = incoming_audio.next() => {
                 if let Some((peer_id, stream)) = audio {
-                    let rx = audio_tx.subscribe();
                     let conn_type = peer_conn_type.get(&peer_id).map(|s| s.as_str()).unwrap_or("Unknown");
                     println!("[DeviceCam] New audio viewer: {peer_id} via {conn_type}");
-                    tokio::spawn(stream_audio_to_viewer(peer_id, stream, rx));
+                    let key = (peer_id, "audio");
+                    match active_streams.get(&key).map(|h| h.is_finished()) {
+                        Some(true) => { active_streams.remove(&key); }
+                        Some(false) => { active_streams.get(&key).unwrap().abort(); }
+                        None => {}
+                    }
+                    let rx = audio_tx.subscribe();
+                    let handle = tokio::spawn(stream_audio_to_viewer(peer_id, stream, rx));
+                    active_streams.insert(key, handle);
                 } else {
                     tracing::error!("[DeviceCam] Audio stream accept channel closed");
+                }
+            }
+
+            // 控制通道
+            control = incoming_control.next() => {
+                if let Some((peer_id, stream)) = control {
+                    let conn_type = peer_conn_type.get(&peer_id).map(|s| s.as_str()).unwrap_or("Unknown");
+                    println!("[DeviceCam] New control connection: {peer_id} via {conn_type}");
+                    tokio::spawn(control_handler::handle_control_stream(peer_id, stream));
+                } else {
+                    tracing::error!("[DeviceCam] Control stream accept channel closed");
                 }
             }
 
@@ -697,19 +817,6 @@ async fn main() -> Result<()> {
     }
 }
 
-/// 获取初始化 NAL units (VPS/SPS/PPS)
-fn get_init_nals(chn_id: usize) -> Vec<Vec<u8>> {
-    #[cfg(feature = "rv1106")]
-    {
-        rk_video_source::get_param_sets(chn_id)
-    }
-    #[cfg(not(feature = "rv1106"))]
-    {
-        let _ = chn_id;
-        Vec::new()
-    }
-}
-
 /// 将 config::StreamConfig 转换为 rk_video_source::StreamParams
 #[cfg(feature = "rv1106")]
 fn stream_config_to_params(s: &config::StreamConfig) -> rk_video_source::StreamParams {
@@ -730,6 +837,85 @@ fn stream_config_to_params(s: &config::StreamConfig) -> rk_video_source::StreamP
         smartp_viridrlen: s.smartp_viridrlen,
         stream_buf_cnt: s.stream_buf_cnt,
         mirror: s.mirror.clone(),
+    }
+}
+
+/// 读取板载序列号
+///
+/// 在 Linux 上从 `/proc/cpuinfo` 的 `Serial` 字段读取板载序列号
+/// (树莓派等单板机每块板唯一，如 `e33700a6620dfddc`)；非 Linux (如 Windows 测试环境)
+/// 无该硬件信息，返回 None，此时不向 relay 注册，viewer 须用完整 PeerId 直连。
+/// 该序列号仅作**公开查找键**，不进入密钥；viewer 经 relay 注册表解析成真实 PeerId。
+fn read_board_serial() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(content) = std::fs::read_to_string("/proc/cpuinfo") {
+            for line in content.lines() {
+                let line = line.trim();
+                if let Some(rest) = line.strip_prefix("Serial") {
+                    if let Some(val) = rest.split(':').nth(1) {
+                        let val = val.trim();
+                        if !val.is_empty() {
+                            return Some(val.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// 打开到 relay 的注册表流，发送 `(serial, peer_id, pubkey, signature)` 注册消息。
+/// 签名 = ed25519(privkey, serial || peer_id)，使绑定不可伪造。
+async fn register_camera_with_relay(
+    mut control: Control,
+    relay_peer: PeerId,
+    keypair: identity::Keypair,
+    serial: String,
+    self_peer: PeerId,
+) {
+    let result: anyhow::Result<()> = async {
+        let mut stream = control
+            .open_stream(relay_peer, REGISTRY_PROTOCOL)
+            .await
+            .map_err(|e| anyhow::anyhow!("open registry stream: {e}"))?;
+        let pubkey = keypair.public().encode_protobuf();
+        let peer_bytes = self_peer.to_bytes();
+        let payload = RegistryMessage::sign_payload(&serial, &peer_bytes);
+        let signature = keypair
+            .sign(&payload)
+            .map_err(|e| anyhow::anyhow!("sign: {e}"))?;
+        let msg = RegistryMessage::Register {
+            serial,
+            peer_id: peer_bytes,
+            pubkey,
+            signature,
+        };
+        stream.write_all(&msg.encode()).await?;
+        stream.flush().await?;
+        // 读取 relay 回执 (用于日志，失败不影响注册)
+        use tokio::time::timeout;
+        let _ = timeout(std::time::Duration::from_secs(3), async {
+            let mut ack = vec![0u8; 1024];
+            let n = stream.read(&mut ack).await?;
+            if n > 0 {
+                if let Ok(RegistryMessage::Error { message }) = RegistryMessage::decode(&ack[..n]) {
+                    tracing::warn!("[DeviceCam] relay rejected registration: {message}");
+                }
+            }
+            Ok::<(), std::io::Error>(())
+        })
+        .await;
+        Ok(())
+    }
+    .await;
+
+    match result {
+        Ok(()) => tracing::info!("[DeviceCam] Registered serial with relay {relay_peer}"),
+        Err(e) => {
+            tracing::warn!("[DeviceCam] Failed to register serial with relay {relay_peer}: {e}")
+        }
     }
 }
 
@@ -760,7 +946,6 @@ async fn stream_video_to_viewer(
     peer_id: PeerId,
     mut stream: libp2p::swarm::Stream,
     mut source: broadcast::Receiver<MediaPacket>,
-    init_nals: Vec<Vec<u8>>,
     stream_name: &str,
 ) {
     let mut frame_count: u64 = 0;
@@ -773,27 +958,27 @@ async fn stream_video_to_viewer(
     let peer_short = &peer_short[peer_short.len().saturating_sub(7)..];
     // write_all+flush 耗时超过此阈值则输出警告
     const WRITE_SLOW_THRESHOLD_MS: u64 = 100;
-    // write_all+flush 超过此时间则断开该 viewer（防止慢 viewer 阻塞帧发送）
-    const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    // write_all+flush 超过此阈值则视为 DCUtR 握手干扰（yamux 竞争导致写堵塞 500ms+）
+    const WRITE_DCUTR_STALL_THRESHOLD_MS: u64 = 500;
+    // write_all+flush 超过此时间视为写入受阻。注意：relay 电路在跨网(4G/公网)场景下
+    // 偶发 3-5s 的慢写是正常的，阈值必须留足余量，否则会误判为断连。
+    // 旧值 5s 偏小，relay 拥塞时单帧写超 5s 就触发断连→viewer 重连风暴，反而更卡。
+    const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
-    // 先发送 VPS/SPS/PPS
-    for nal in &init_nals {
-        let mut au_with_sc = Vec::with_capacity(4 + nal.len());
-        au_with_sc.extend_from_slice(&[0, 0, 0, 1]);
-        au_with_sc.extend_from_slice(nal);
-        let packet = MediaPacket::video(0, true, Bytes::from(au_with_sc));
-        let encoded = packet.encode();
-        if let Err(e) = stream.write_all(&encoded).await {
-            tracing::warn!("Init NAL write to {peer_id} failed: {e}");
-            return;
-        }
-    }
-    if !init_nals.is_empty() {
-        if let Err(e) = stream.flush().await {
-            tracing::warn!("Init flush to {peer_id} failed: {e}");
-            return;
-        }
-        println!("[DeviceCam] Sent {} init NALs to ..{peer_short} ({stream_name})", init_nals.len());
+    // 新 Viewer 接入时主动请求一帧 IDR：
+    // 若连接时编码器正处于 GOP 中段，broadcast 里先到的会是 P 帧，viewer
+    // 缺少参考帧无法解码，需等到下一个 GOP（约 2s@gop=50）才起播。
+    // 主动请求 IDR 让编码器立即产出关键帧，显著缩短起播延迟。
+    #[cfg(feature = "rv1106")]
+    {
+        let chn = match stream_name {
+            "main" | "main(legacy)" => 0u8,
+            "sub" => 1,
+            "third" => 2,
+            _ => 0,
+        };
+        rk_video_source::request_idr(chn);
+        println!("[DeviceCam] Requested IDR for new viewer ..{peer_short} ({stream_name}, chn={chn})");
     }
 
     loop {
@@ -813,7 +998,12 @@ async fn stream_video_to_viewer(
                     Ok(Ok(())) => {
                         let write_ms = write_start.elapsed().as_millis() as u64;
                         if write_ms > WRITE_SLOW_THRESHOLD_MS {
-                            println!("[DeviceCam] SLOW write ..{peer_short}: {write_ms}ms frame #{frame_count} ({stream_name}, {} bytes)",
+                            let cause = if write_ms > WRITE_DCUTR_STALL_THRESHOLD_MS {
+                                " (likely relay congestion / peer DCUtR handshake interference)"
+                            } else {
+                                " (relay congestion or backpressure)"
+                            };
+                            println!("[DeviceCam] SLOW write ..{peer_short}: {write_ms}ms frame #{frame_count} ({stream_name}, {} bytes){cause}",
                                 encoded.len());
                         }
 
@@ -829,9 +1019,10 @@ async fn stream_video_to_viewer(
                                 let elapsed = start.elapsed().as_secs_f64();
                                 let fps = frame_count as f64 / elapsed;
                                 let kbps = (bytes_sent * 8) as f64 / elapsed / 1000.0;
-                                let keyframe = if packet.is_keyframe() { "[I]" } else { "   " };
+                                // 注意: cam 端已不再计算 keyframe 标志(见 rk_video_source.rs),
+                                // 关键帧判定改由 viewer 侧字节扫描完成, 故此处不再显示 [I] 标记。
                                 println!(
-                                    "[DeviceCam] {keyframe} frame #{} | {:.1} fps | {:.0} kbps | ts={} | ..{peer_short} {stream_name}",
+                                    "[DeviceCam] frame #{} | {:.1} fps | {:.0} kbps | ts={} | ..{peer_short} {stream_name}",
                                     frame_count, fps, kbps, packet.timestamp_ms
                                 );
                             }
@@ -842,11 +1033,14 @@ async fn stream_video_to_viewer(
                         break;
                     }
                     Err(_) => {
-                        // 写入超时：viewer 处理太慢，断开连接
+                        // 写入超时：relay 拥塞或 viewer 暂忙（如 DCUtR 打洞占用 4G 上行）。
+                        // 关键修复：不再断开连接！断开会触发 viewer 重连风暴(每 16-25s 重连一次，
+                        // 每次只传几帧)，viewer 平均仅 2-3fps。改为丢弃本帧并继续，连接保持，
+                        // relay 通畅后写入自动恢复。真正的断连由 Ok(Err(e)) 分支(流已死)处理。
                         dropped_count += 1;
-                        println!("[DeviceCam] WRITE TIMEOUT ..{peer_short}: write blocked >{}s, disconnecting ({stream_name}, frame #{frame_count}, dropped: {dropped_count})",
+                        println!("[DeviceCam] WRITE TIMEOUT ..{peer_short}: write blocked >{}s, DROPPING frame (keep connection) ({stream_name}, frame #{frame_count}, dropped: {dropped_count})",
                             WRITE_TIMEOUT.as_secs());
-                        break;
+                        continue;
                     }
                 }
             }
@@ -957,9 +1151,9 @@ struct Opt {
     udp_port: Option<u16>,
 }
 
-fn validate_device_cam_config(cfg: &config::Config) {
-    for (i, relay_str) in cfg.relays.iter().enumerate() {
-        let label = if cfg.relays.len() == 1 {
+fn validate_device_cam_config(config: &config::Config) {
+    for (i, relay_str) in config.relays.iter().enumerate() {
+        let label = if config.relays.len() == 1 {
             "Relay".to_string()
         } else {
             format!("Relay #{}", i + 1)
@@ -971,13 +1165,13 @@ fn validate_device_cam_config(cfg: &config::Config) {
         }
     }
 
-    if let Some(port) = cfg.udp_port {
+    if let Some(port) = config.udp_port {
         if port == 0 {
             tracing::warn!("[DeviceCam] WARNING: Using random UDP port - cannot configure port forwarding for DCUtR");
         }
     }
 
-    if cfg.enable_mdns {
+    if config.enable_mdns {
         tracing::info!("[DeviceCam] mDNS enabled - LAN discovery active");
     } else {
         tracing::info!("[DeviceCam] mDNS disabled");
@@ -986,32 +1180,32 @@ fn validate_device_cam_config(cfg: &config::Config) {
     // 打印三码流状态
     println!("[DeviceCam] Stream config:");
     println!("  Main:  {} ({}x{} @{}/{}fps {}kbps {})",
-        if cfg.video.main.enabled { "ON" } else { "OFF" },
-        cfg.video.main.width, cfg.video.main.height,
-        cfg.video.main.dst_frame_rate_num, cfg.video.main.dst_frame_rate_den,
-        cfg.video.main.bitrate_kbps, cfg.video.main.codec);
+        if config.video.main.enabled { "ON" } else { "OFF" },
+        config.video.main.width, config.video.main.height,
+        config.video.main.dst_frame_rate_num, config.video.main.dst_frame_rate_den,
+        config.video.main.bitrate_kbps, config.video.main.codec);
     println!("  Sub:   {} ({}x{} @{}/{}fps {}kbps {})",
-        if cfg.video.sub.enabled { "ON" } else { "OFF" },
-        cfg.video.sub.width, cfg.video.sub.height,
-        cfg.video.sub.dst_frame_rate_num, cfg.video.sub.dst_frame_rate_den,
-        cfg.video.sub.bitrate_kbps, cfg.video.sub.codec);
+        if config.video.sub.enabled { "ON" } else { "OFF" },
+        config.video.sub.width, config.video.sub.height,
+        config.video.sub.dst_frame_rate_num, config.video.sub.dst_frame_rate_den,
+        config.video.sub.bitrate_kbps, config.video.sub.codec);
     println!("  Third: {} ({}x{} @{}/{}fps {}kbps {})",
-        if cfg.video.third.enabled { "ON" } else { "OFF" },
-        cfg.video.third.width, cfg.video.third.height,
-        cfg.video.third.dst_frame_rate_num, cfg.video.third.dst_frame_rate_den,
-        cfg.video.third.bitrate_kbps, cfg.video.third.codec);
+        if config.video.third.enabled { "ON" } else { "OFF" },
+        config.video.third.width, config.video.third.height,
+        config.video.third.dst_frame_rate_num, config.video.third.dst_frame_rate_den,
+        config.video.third.bitrate_kbps, config.video.third.codec);
 
     // 打印音频状态
     println!("[DeviceCam] Audio: {} ({}Hz, {}ch, {}samples/frame, card={}, fmt={}, encode={}, bitrate={}, vqe={})",
-        if cfg.audio.enabled { "ON" } else { "OFF" },
-        cfg.audio.sample_rate,
-        cfg.audio.channels,
-        cfg.audio.frame_size,
-        cfg.audio.card_name,
-        cfg.audio.format,
-        cfg.audio.encode_type,
-        cfg.audio.bit_rate,
-        cfg.audio.enable_vqe);
+        if config.audio.enabled { "ON" } else { "OFF" },
+        config.audio.sample_rate,
+        config.audio.channels,
+        config.audio.frame_size,
+        config.audio.card_name,
+        config.audio.format,
+        config.audio.encode_type,
+        config.audio.bit_rate,
+        config.audio.enable_vqe);
 }
 
 fn is_same_subnet(a: Ipv4Addr, b: Ipv4Addr) -> bool {

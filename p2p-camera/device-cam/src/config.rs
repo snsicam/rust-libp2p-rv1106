@@ -102,6 +102,34 @@ pub struct VideoConfig {
     pub third: StreamConfig,
 }
 
+/// LCD 显示配置 (VO → MIPI 接口)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LcdConfig {
+    /// 是否启用 LCD 显示
+    #[serde(default = "default_lcd_enabled")]
+    pub enabled: bool,
+    /// LCD 宽度 (0 = 自动检测)
+    #[serde(default = "default_lcd_width")]
+    pub width: u32,
+    /// LCD 高度 (0 = 自动检测)
+    #[serde(default = "default_lcd_height")]
+    pub height: u32,
+}
+
+fn default_lcd_enabled() -> bool { false }
+fn default_lcd_width() -> u32 { 800 }
+fn default_lcd_height() -> u32 { 480 }
+
+impl Default for LcdConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            width: 800,
+            height: 480,
+        }
+    }
+}
+
 impl Default for StreamConfig {
     fn default() -> Self {
         Self {
@@ -236,6 +264,13 @@ pub struct Config {
     #[serde(default = "default_enable_mdns")]
     pub enable_mdns: bool,
 
+    /// 是否启用 DCUtR 直连打洞 (默认 true)。
+    /// 4G/CGNAT 等入站 UDP 被屏蔽的网络下打洞必然失败，且打洞握手会挤占
+    /// 中继视频流的写入带宽，导致 SLOW write / 帧丢弃 / 卡顿。此类网络应设为 false，
+    /// 仅走中继电路 (relay circuit) 即可稳定传输。
+    #[serde(default = "default_enable_dcutr")]
+    pub enable_dcutr: bool,
+
     #[serde(default = "default_mode")]
     pub mode: String,
     #[serde(default = "default_key_file")]
@@ -250,6 +285,17 @@ pub struct Config {
     #[serde(default)]
     pub video: VideoConfig,
 
+    /// LCD 显示配置 (VO → MIPI 接口)
+    #[serde(default)]
+    pub lcd: LcdConfig,
+
+    /// sensor 原生输出帧率 (摄像头模组实际产出率, 如 30)。
+    /// 注意: 这是 VI/编码器的输入源帧率, 与各码流的目标帧率(dst_frame_rate)不同。
+    /// 帧率控制逻辑(对标 rkipc isp.0.adjustment:fps): VENC 的 u32SrcFrameRate 必须等于此值,
+    /// 编码器才能按目标帧率正确丢帧; 若误用某码流的配置 fps, 会导致 ratio=1 不丢帧、实测跑满原生帧率。
+    #[serde(default = "default_sensor_frame_rate")]
+    pub sensor_frame_rate: u32,
+
     // 文件源 (非 rv1106)
     #[serde(default)]
     pub video_file: Option<PathBuf>,
@@ -258,6 +304,8 @@ pub struct Config {
 fn default_mode() -> String { "listen".to_string() }
 fn default_key_file() -> PathBuf { PathBuf::from("device-cam.key") }
 fn default_enable_mdns() -> bool { true }
+fn default_enable_dcutr() -> bool { true }
+fn default_sensor_frame_rate() -> u32 { 30 }
 
 impl Default for Config {
     fn default() -> Self {
@@ -265,11 +313,14 @@ impl Default for Config {
             relays: Vec::new(),
             relay: String::new(),
             enable_mdns: default_enable_mdns(),
+            enable_dcutr: default_enable_dcutr(),
             mode: default_mode(),
             key_file: default_key_file(),
             audio: AudioConfig::default(),
             udp_port: None,
             video: VideoConfig::default(),
+            lcd: LcdConfig::default(),
+            sensor_frame_rate: default_sensor_frame_rate(),
             video_file: None,
         }
     }
@@ -332,6 +383,7 @@ impl Config {
     }
 
     /// 返回所有启用码流的配置列表
+    #[allow(dead_code)]
     pub fn enabled_streams(&self) -> Vec<(StreamType, &StreamConfig)> {
         let mut streams = Vec::new();
         if self.video.main.enabled {
@@ -349,12 +401,14 @@ impl Config {
 
 /// 码流类型枚举
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[allow(dead_code)]
 pub enum StreamType {
     Main = 0,
     Sub = 1,
     Third = 2,
 }
 
+#[allow(dead_code)]
 impl StreamType {
     pub fn from_chn_id(chn_id: u8) -> Option<Self> {
         match chn_id {
