@@ -73,6 +73,10 @@ struct ViewerHandle {
     event_rx: Receiver<ViewerEvent>,
     /// 命令通道
     cmd_tx: Sender<Cmd>,
+    /// 关闭信号：nativeDestroy 时发送，令后台线程退出。
+    /// 否则线程持有 video_tx/event_tx 的 clone，通道永不饱和，线程永不退出，
+    /// 旧设备连接泄露（切设备后出现"两个设备同时连接"）。
+    shutdown_tx: tokio::sync::oneshot::Sender<()>,
 }
 
 // ── 全局句柄表 ──
@@ -130,6 +134,8 @@ pub extern "system" fn Java_com_p2pcamera_mediaplayer_RustBridge_nativeCreate(
     let (audio_tx, audio_rx) = bounded::<MediaPacket>(200);
     let (event_tx, event_rx) = bounded::<ViewerEvent>(32);
     let (cmd_tx, cmd_rx) = bounded::<Cmd>(4);
+    // 关闭信号：nativeDestroy 时发送，令后台线程退出（否则线程持有发送端 clone 永不退出）
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
     // 启动后台 tokio runtime，驱动 MediaPlayer
     std::thread::spawn(move || {
@@ -259,6 +265,10 @@ pub extern "system" fn Java_com_p2pcamera_mediaplayer_RustBridge_nativeCreate(
                 tokio::select! {
                     _ = viewer.poll_swarm() => {
                         // swarm 事件已在 viewer 内部处理
+                    }
+                    _ = shutdown_rx.recv() => {
+                        tracing::info!("[JNI] Shutdown requested, exiting viewer thread");
+                        return;
                     }
                     _ = tokio::time::sleep(tokio::time::Duration::from_millis(5)) => {
                         // 定期拉视频帧 → 发送到 Android 侧
@@ -392,6 +402,7 @@ pub extern "system" fn Java_com_p2pcamera_mediaplayer_RustBridge_nativeCreate(
         audio_rx,
         event_rx,
         cmd_tx,
+        shutdown_tx,
     }) as jlong
 }
 
@@ -667,7 +678,11 @@ pub extern "system" fn Java_com_p2pcamera_mediaplayer_RustBridge_nativeDestroy(
     handle: jlong,
 ) {
     let idx = handle as usize;
-    drop(take_handle(idx));
+    if let Some(h) = take_handle(idx) {
+        // 发送关闭信号，令后台线程退出并断开旧设备连接
+        let _ = h.shutdown_tx.send(());
+        // h 在此作用域结束时 drop，关闭 cmd_tx 等
+    }
 }
 
 /// 发送控制命令
