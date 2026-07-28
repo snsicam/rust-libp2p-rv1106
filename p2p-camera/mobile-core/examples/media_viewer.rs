@@ -1876,20 +1876,18 @@ mod player {
             self.ensure_overlay(w, h)?;
             let mut buf = vec![0u8; (w * h * 4) as usize];
 
-            // 窗体背景 + 外边框
-            fill_rect(&mut buf, w, h, 0, 0, w, h, [30, 30, 36, 255]);
-            fill_rect(&mut buf, w, h, 0, 0, w, 2, [90, 110, 160, 255]);
-            fill_rect(&mut buf, w, h, 0, 0, 2, h, [90, 110, 160, 255]);
-            fill_rect(&mut buf, w, h, w as i32 - 2, 0, 2, h, [90, 110, 160, 255]);
-            fill_rect(&mut buf, w, h, 0, h as i32 - 2, w, 2, [90, 110, 160, 255]);
-            // 标题栏
-            fill_rect(&mut buf, w, h, 0, 0, w, 30, [46, 46, 56, 255]);
-            self.draw_text_w(&mut buf, w, h, 12, 21, 17.0, "设备配置", [230, 230, 236]);
+            // 窗体背景 + 外边框 (沿用 viewer 主面板配色)
+            fill_rect(&mut buf, w, h, 0, 0, w, h, COL_BG);
+            fill_rect(&mut buf, w, h, 0, 0, w, 2, COL_BORDER);
+            fill_rect(&mut buf, w, h, 0, 0, 2, h, COL_BORDER);
+            fill_rect(&mut buf, w, h, w as i32 - 2, 0, 2, h, COL_BORDER);
+            fill_rect(&mut buf, w, h, 0, h as i32 - 2, w, 2, COL_BORDER);
+            // 顶部仅保留设备 PeerId 小字 (取消"设备配置"标题栏)
             if let Some(peer) = &self.config_peer {
-                self.draw_text_w(&mut buf, w, h, 110, 21, 13.0, &super::short_id(peer), [150, 170, 210]);
+                self.draw_text_w(&mut buf, w, h, 12, 21, 12.0, &super::short_id(peer), COL_TEXT_DIM);
             }
 
-            // tabs
+            // tabs (字号/配色统一为 viewer 风格)
             let tab_labels = ["编码", "图像", "系统"];
             for (i, t) in geo.tabs.iter().enumerate() {
                 let active = i == self.config_tab;
@@ -1901,45 +1899,45 @@ mod player {
                     t.1,
                     t.2 as u32,
                     t.3 as u32,
-                    if active { [70, 95, 145, 255] } else { [44, 44, 54, 255] },
+                    if active { COL_ROW_SEL } else { [44, 44, 54, 255] },
                 );
-                self.draw_text_w(&mut buf, w, h, t.0 + 50, t.1 + 18, 14.0, tab_labels[i], [230, 230, 236]);
+                self.draw_text_w(&mut buf, w, h, t.0 + 50, t.1 + 18, 13.0, tab_labels[i], COL_TEXT);
             }
 
-            // 参数行
+            // 参数行 (字号统一缩小, 配色沿用主面板)
             for (f, minus, value, plus) in &geo.rows {
                 let label = Self::field_label(*f);
-                self.draw_text_w(&mut buf, w, h, value.0 - 150, value.1 + 18, 13.0, label, [200, 200, 206]);
+                self.draw_text_w(&mut buf, w, h, value.0 - 150, value.1 + 18, 12.0, label, COL_TEXT);
                 // 减号
-                fill_rect(&mut buf, w, h, minus.0, minus.1, minus.2 as u32, minus.3 as u32, [55, 55, 65, 255]);
-                self.draw_text_w(&mut buf, w, h, minus.0 + 8, minus.1 + 18, 16.0, "-", [220, 220, 225]);
+                fill_rect(&mut buf, w, h, minus.0, minus.1, minus.2 as u32, minus.3 as u32, COL_BTN);
+                self.draw_text_w(&mut buf, w, h, minus.0 + 8, minus.1 + 18, 14.0, "-", COL_TEXT);
                 // 加号
-                fill_rect(&mut buf, w, h, plus.0, plus.1, plus.2 as u32, plus.3 as u32, [55, 55, 65, 255]);
-                self.draw_text_w(&mut buf, w, h, plus.0 + 8, plus.1 + 18, 16.0, "+", [220, 220, 225]);
+                fill_rect(&mut buf, w, h, plus.0, plus.1, plus.2 as u32, plus.3 as u32, COL_BTN);
+                self.draw_text_w(&mut buf, w, h, plus.0 + 8, plus.1 + 18, 14.0, "+", COL_TEXT);
                 // 值框
-                fill_rect(&mut buf, w, h, value.0, value.1, value.2 as u32, value.3 as u32, [20, 20, 26, 255]);
-                fill_rect(&mut buf, w, h, value.0, value.1, value.2 as u32, 1, [70, 70, 80, 255]);
-                fill_rect(&mut buf, w, h, value.0, value.1 + value.3 - 1, value.2 as u32, 1, [70, 70, 80, 255]);
-                fill_rect(&mut buf, w, h, value.0, value.1, 1, value.3 as u32, [70, 70, 80, 255]);
-                fill_rect(&mut buf, w, h, value.0 + value.2 - 1, value.1, 1, value.3 as u32, [70, 70, 80, 255]);
+                fill_rect(&mut buf, w, h, value.0, value.1, value.2 as u32, value.3 as u32, COL_INPUT_BG);
+                fill_rect(&mut buf, w, h, value.0, value.1, value.2 as u32, 1, COL_BORDER);
+                fill_rect(&mut buf, w, h, value.0, value.1 + value.3 - 1, value.2 as u32, 1, COL_BORDER);
+                fill_rect(&mut buf, w, h, value.0, value.1, 1, value.3 as u32, COL_BORDER);
+                fill_rect(&mut buf, w, h, value.0 + value.2 - 1, value.1, 1, value.3 as u32, COL_BORDER);
                 let shown = if *f == ConfigField::DeviceName && self.config_editing_name {
                     format!("{}_", self.config_text)
                 } else {
                     self.field_value(*f)
                 };
                 let vcol = if *f == ConfigField::DeviceName && self.config_editing_name {
-                    [255, 220, 120]
+                    COL_ACCENT
                 } else {
-                    [210, 210, 216]
+                    COL_TEXT
                 };
-                self.draw_text_w(&mut buf, w, h, value.0 + 8, value.1 + 18, 13.0, &shown, vcol);
+                self.draw_text_w(&mut buf, w, h, value.0 + 8, value.1 + 18, 12.0, &shown, vcol);
             }
 
-            // 底部按钮
+            // 底部按钮 (字号/配色统一为 viewer 风格)
             let btn_labels = ["保存", "取消", "默认"];
             for (i, b) in geo.buttons.iter().enumerate() {
-                fill_rect(&mut buf, w, h, b.0, b.1, b.2 as u32, b.3 as u32, [55, 55, 68, 255]);
-                self.draw_text_w(&mut buf, w, h, b.0 + 42, b.1 + 19, 14.0, btn_labels[i], [225, 225, 230]);
+                fill_rect(&mut buf, w, h, b.0, b.1, b.2 as u32, b.3 as u32, COL_BTN);
+                self.draw_text_w(&mut buf, w, h, b.0 + 42, b.1 + 19, 13.0, btn_labels[i], COL_TEXT);
             }
 
             if let Some(t) = &mut self.overlay_texture {

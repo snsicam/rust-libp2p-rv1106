@@ -97,7 +97,10 @@ start_emulator() {
     fi
 
     info "启动模拟器: $AVD_NAME"
-    nohup "$EMULATOR" -avd "$AVD_NAME" -no-snapshot-load -gpu swiftshader_indirect > /tmp/emulator.log 2>&1 &
+    # 用宿主 GPU 加速 (hw.gpu.mode=host)。在 Wayland 会话下强制 X11 后端,
+    # 否则模拟器创建 EGL 上下文会失败 (与 Android Studio 相同的坑)。X11 会话下此设置无害。
+    export QT_QPA_PLATFORM=xcb
+    nohup "$EMULATOR" -avd "$AVD_NAME" -no-snapshot-load -gpu host > /tmp/emulator.log 2>&1 &
 
     info "等待模拟器启动..."
     "$ADB" wait-for-device || true

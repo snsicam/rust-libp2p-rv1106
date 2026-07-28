@@ -135,7 +135,7 @@ pub extern "system" fn Java_com_p2pcamera_mediaplayer_RustBridge_nativeCreate(
     let (event_tx, event_rx) = bounded::<ViewerEvent>(32);
     let (cmd_tx, cmd_rx) = bounded::<Cmd>(4);
     // 关闭信号：nativeDestroy 时发送，令后台线程退出（否则线程持有发送端 clone 永不退出）
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
     // 启动后台 tokio runtime，驱动 MediaPlayer
     std::thread::spawn(move || {
@@ -266,7 +266,7 @@ pub extern "system" fn Java_com_p2pcamera_mediaplayer_RustBridge_nativeCreate(
                     _ = viewer.poll_swarm() => {
                         // swarm 事件已在 viewer 内部处理
                     }
-                    _ = shutdown_rx.recv() => {
+                    _ = &mut shutdown_rx => {
                         tracing::info!("[JNI] Shutdown requested, exiting viewer thread");
                         return;
                     }
