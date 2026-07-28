@@ -697,19 +697,20 @@ mod player {
     /// 设备行高
     const ROW_H: i32 = 24;
 
-    // 面板配色 (RGBA)
-    const COL_BG: [u8; 4] = [30, 31, 38, 255];
-    const COL_BORDER: [u8; 4] = [70, 72, 84, 255];
-    const COL_ROW_SEL: [u8; 4] = [52, 86, 138, 255];
-    const COL_BTN: [u8; 4] = [58, 60, 72, 255];
-    const COL_INPUT_BG: [u8; 4] = [18, 18, 22, 255];
-    const COL_ACCENT_BG: [u8; 4] = [240, 200, 90, 255];
+    // 面板配色 (RGBA) — 现代深色主题 (蓝强调, 与 Android 端对齐)
+    const COL_BG: [u8; 4] = [22, 23, 29, 255];
+    const COL_BORDER: [u8; 4] = [54, 57, 68, 255];
+    const COL_ROW_SEL: [u8; 4] = [38, 64, 110, 255];
+    const COL_BTN: [u8; 4] = [44, 47, 58, 255];
+    const COL_BTN_HI: [u8; 4] = [62, 66, 80, 255];
+    const COL_INPUT_BG: [u8; 4] = [14, 15, 20, 255];
+    const COL_ACCENT_BG: [u8; 4] = [63, 110, 255, 255]; // #3F6EFF
     // 文字配色 (RGB)
-    const COL_TEXT: [u8; 3] = [222, 222, 226];
-    const COL_TEXT_DIM: [u8; 3] = [145, 147, 155];
-    const COL_GREEN: [u8; 3] = [110, 220, 130];
+    const COL_TEXT: [u8; 3] = [226, 228, 235];
+    const COL_TEXT_DIM: [u8; 3] = [140, 145, 158];
+    const COL_GREEN: [u8; 3] = [76, 208, 125]; // #4CD07D
     const COL_TITLE: [u8; 3] = [255, 255, 255];
-    const COL_ACCENT: [u8; 3] = [240, 200, 90];
+    const COL_ACCENT: [u8; 3] = [120, 160, 255];
 
     /// UI 事件动作 (pump_events 返回给主循环)
     pub enum UiAction {
@@ -926,6 +927,46 @@ mod player {
         let y1 = ((y + h as i32).max(0) as u32).min(buf_h);
         for py in y0..y1 {
             for px in x0..x1 {
+                let idx = ((py * buf_w + px) * 4) as usize;
+                buf[idx..idx + 4].copy_from_slice(&c);
+            }
+        }
+    }
+
+    /// 判断点是否落在以 (cx,cy) 为圆心、半径 r 的圆内 (含边界)
+    fn in_circle(px: i32, py: i32, cx: i32, cy: i32, r: i32) -> bool {
+        let dx = px - cx;
+        let dy = py - cy;
+        dx * dx + dy * dy <= r * r
+    }
+
+    /// 圆角矩形填充 (带裁剪): 四角 r×r 区域按内切圆外剔除, 形成圆角。
+    /// r<=0 退化为普通矩形。
+    fn fill_rect_r(buf: &mut [u8], buf_w: u32, buf_h: u32, x: i32, y: i32, w: u32, h: u32, r: u32, c: [u8; 4]) {
+        let r = (r as i32).min(w as i32 / 2).min(h as i32 / 2).max(0);
+        let x0 = (x.max(0)) as u32;
+        let y0 = (y.max(0)) as u32;
+        let x1 = ((x + w as i32).max(0) as u32).min(buf_w);
+        let y1 = ((y + h as i32).max(0) as u32).min(buf_h);
+        if r == 0 {
+            for py in y0..y1 {
+                for px in x0..x1 {
+                    let idx = ((py * buf_w + px) * 4) as usize;
+                    buf[idx..idx + 4].copy_from_slice(&c);
+                }
+            }
+            return;
+        }
+        let (xr, yr, wr, hr) = (x + r, y + r, x + w as i32 - r, y + h as i32 - r);
+        for py in y0..y1 {
+            for px in x0..x1 {
+                let skip = (px < xr as u32 && py < yr as u32 && !in_circle(px as i32, py as i32, xr, yr, r))
+                    || (px >= wr as u32 && py < yr as u32 && !in_circle(px as i32, py as i32, wr, yr, r))
+                    || (px < xr as u32 && py >= hr as u32 && !in_circle(px as i32, py as i32, xr, hr, r))
+                    || (px >= wr as u32 && py >= hr as u32 && !in_circle(px as i32, py as i32, wr, hr, r));
+                if skip {
+                    continue;
+                }
                 let idx = ((py * buf_w + px) * 4) as usize;
                 buf[idx..idx + 4].copy_from_slice(&c);
             }
@@ -1583,7 +1624,7 @@ mod player {
                 (x0 + 12 + (tab_w + 8) * 2, tab_y, tab_w, tab_h),
             ];
             let fields: Vec<ConfigField> = match self.config_tab {
-                0 => vec![ConfigField::Stream, ConfigField::Codec, ConfigField::Resolution, ConfigField::RcMode, ConfigField::Fps, ConfigField::Bitrate, ConfigField::Gop],
+                0 => vec![ConfigField::Stream, ConfigField::Codec, ConfigField::Resolution, ConfigField::Fps, ConfigField::Bitrate, ConfigField::RcMode, ConfigField::Gop],
                 1 => vec![ConfigField::Brightness, ConfigField::Contrast, ConfigField::Saturation, ConfigField::Sharpness],
                 _ => vec![ConfigField::DeviceName],
             };
@@ -1612,7 +1653,7 @@ mod player {
                 ConfigField::Stream => "码流",
                 ConfigField::Codec => "编码格式",
                 ConfigField::Resolution => "分辨率",
-                ConfigField::RcMode => "码率模式",
+                ConfigField::RcMode => "码率控制",
                 ConfigField::Fps => "帧率",
                 ConfigField::Bitrate => "码率",
                 ConfigField::Gop => "GOP",
@@ -1770,10 +1811,12 @@ mod player {
             };
             if need {
                 let tc = self.canvas.texture_creator();
-                let tex = map_sdl(
+                let mut tex = map_sdl(
                     tc.create_texture_streaming(PixelFormatEnum::ABGR8888, w, h),
                     "create overlay texture",
                 )?;
+                // 允许圆角透明边与下方内容混合
+                let _ = tex.set_blend_mode(sdl2::render::BlendMode::Blend);
                 let tex: sdl2::render::Texture<'static> =
                     unsafe { std::mem::transmute::<sdl2::render::Texture<'_>, sdl2::render::Texture<'static>>(tex) };
                 self.overlay_texture = Some(tex);
@@ -1852,12 +1895,14 @@ mod player {
             let h = (items.len() as i32) * 26;
             self.ensure_overlay(w as u32, h as u32)?;
             let mut buf = vec![0u8; (w * h * 4) as usize];
-            fill_rect(&mut buf, w as u32, h as u32, 0, 0, w as u32, h as u32, [38, 38, 44, 255]);
+            // 圆角背景 + 1px 描边
+            fill_rect_r(&mut buf, w as u32, h as u32, 0, 0, w as u32, h as u32, 6, COL_BORDER);
+            fill_rect_r(&mut buf, w as u32, h as u32, 1, 1, (w - 2) as u32, (h - 2) as u32, 5, COL_BG);
             for (i, (label, _)) in items.iter().enumerate() {
                 let ry = i as i32 * 26;
-                self.draw_text_w(&mut buf, w as u32, h as u32, 12, ry + 19, 14.0, label, [225, 225, 230]);
+                self.draw_text_w(&mut buf, w as u32, h as u32, 12, ry + 19, 14.0, label, COL_TEXT);
                 if i < items.len() - 1 {
-                    fill_rect(&mut buf, w as u32, h as u32, 0, ry + 26, w as u32, 1, [70, 70, 80, 255]);
+                    fill_rect(&mut buf, w as u32, h as u32, 0, ry + 26, w as u32, 1, COL_BORDER);
                 }
             }
             if let Some(t) = &mut self.overlay_texture {
@@ -1876,12 +1921,9 @@ mod player {
             self.ensure_overlay(w, h)?;
             let mut buf = vec![0u8; (w * h * 4) as usize];
 
-            // 窗体背景 + 外边框 (沿用 viewer 主面板配色)
-            fill_rect(&mut buf, w, h, 0, 0, w, h, COL_BG);
-            fill_rect(&mut buf, w, h, 0, 0, w, 2, COL_BORDER);
-            fill_rect(&mut buf, w, h, 0, 0, 2, h, COL_BORDER);
-            fill_rect(&mut buf, w, h, w as i32 - 2, 0, 2, h, COL_BORDER);
-            fill_rect(&mut buf, w, h, 0, h as i32 - 2, w, 2, COL_BORDER);
+            // 窗体背景 + 1px 圆角描边 (现代深色卡片)
+            fill_rect_r(&mut buf, w, h, 0, 0, w, h, 10, COL_BORDER);
+            fill_rect_r(&mut buf, w, h, 1, 1, w - 2, h - 2, 9, COL_BG);
             // 顶部仅保留设备 PeerId 小字 (取消"设备配置"标题栏)
             if let Some(peer) = &self.config_peer {
                 self.draw_text_w(&mut buf, w, h, 12, 21, 12.0, &super::short_id(peer), COL_TEXT_DIM);
@@ -1891,7 +1933,7 @@ mod player {
             let tab_labels = ["编码", "图像", "系统"];
             for (i, t) in geo.tabs.iter().enumerate() {
                 let active = i == self.config_tab;
-                fill_rect(
+                fill_rect_r(
                     &mut buf,
                     w,
                     h,
@@ -1899,7 +1941,8 @@ mod player {
                     t.1,
                     t.2 as u32,
                     t.3 as u32,
-                    if active { COL_ROW_SEL } else { [44, 44, 54, 255] },
+                    6,
+                    if active { COL_ROW_SEL } else { [30, 32, 40, 255] },
                 );
                 self.draw_text_w(&mut buf, w, h, t.0 + 50, t.1 + 18, 13.0, tab_labels[i], COL_TEXT);
             }
@@ -1909,17 +1952,14 @@ mod player {
                 let label = Self::field_label(*f);
                 self.draw_text_w(&mut buf, w, h, value.0 - 150, value.1 + 18, 12.0, label, COL_TEXT);
                 // 减号
-                fill_rect(&mut buf, w, h, minus.0, minus.1, minus.2 as u32, minus.3 as u32, COL_BTN);
+                fill_rect_r(&mut buf, w, h, minus.0, minus.1, minus.2 as u32, minus.3 as u32, 4, COL_BTN);
                 self.draw_text_w(&mut buf, w, h, minus.0 + 8, minus.1 + 18, 14.0, "-", COL_TEXT);
                 // 加号
-                fill_rect(&mut buf, w, h, plus.0, plus.1, plus.2 as u32, plus.3 as u32, COL_BTN);
+                fill_rect_r(&mut buf, w, h, plus.0, plus.1, plus.2 as u32, plus.3 as u32, 4, COL_BTN);
                 self.draw_text_w(&mut buf, w, h, plus.0 + 8, plus.1 + 18, 14.0, "+", COL_TEXT);
-                // 值框
-                fill_rect(&mut buf, w, h, value.0, value.1, value.2 as u32, value.3 as u32, COL_INPUT_BG);
-                fill_rect(&mut buf, w, h, value.0, value.1, value.2 as u32, 1, COL_BORDER);
-                fill_rect(&mut buf, w, h, value.0, value.1 + value.3 - 1, value.2 as u32, 1, COL_BORDER);
-                fill_rect(&mut buf, w, h, value.0, value.1, 1, value.3 as u32, COL_BORDER);
-                fill_rect(&mut buf, w, h, value.0 + value.2 - 1, value.1, 1, value.3 as u32, COL_BORDER);
+                // 值框 (圆角 + 1px 描边)
+                fill_rect_r(&mut buf, w, h, value.0, value.1, value.2 as u32, value.3 as u32, 3, COL_BORDER);
+                fill_rect_r(&mut buf, w, h, value.0 + 1, value.1 + 1, value.2 as u32 - 2, value.3 as u32 - 2, 2, COL_INPUT_BG);
                 let shown = if *f == ConfigField::DeviceName && self.config_editing_name {
                     format!("{}_", self.config_text)
                 } else {
@@ -1933,10 +1973,10 @@ mod player {
                 self.draw_text_w(&mut buf, w, h, value.0 + 8, value.1 + 18, 12.0, &shown, vcol);
             }
 
-            // 底部按钮 (字号/配色统一为 viewer 风格)
+            // 底部按钮 (圆角)
             let btn_labels = ["保存", "取消", "默认"];
             for (i, b) in geo.buttons.iter().enumerate() {
-                fill_rect(&mut buf, w, h, b.0, b.1, b.2 as u32, b.3 as u32, COL_BTN);
+                fill_rect_r(&mut buf, w, h, b.0, b.1, b.2 as u32, b.3 as u32, 6, COL_BTN);
                 self.draw_text_w(&mut buf, w, h, b.0 + 42, b.1 + 19, 13.0, btn_labels[i], COL_TEXT);
             }
 
@@ -2107,7 +2147,7 @@ mod player {
                 self.rebuild_panel()?;
             }
 
-            self.canvas.set_draw_color(Color::RGB(10, 10, 12));
+            self.canvas.set_draw_color(Color::RGB(14, 15, 19));
             self.canvas.clear();
 
             let (win_w, win_h) = map_sdl(self.canvas.output_size(), "output_size")?;
@@ -2126,6 +2166,9 @@ mod player {
                         self.canvas.copy(tex, None, Some(Rect::new(dst_x, dst_y, dst_w, dst_h))),
                         "copy video",
                     )?;
+                    // 视频描边 (1px, 现代深色分隔)
+                    self.canvas.set_draw_color(Color::RGB(46, 49, 60));
+                    let _ = self.canvas.draw_rect(Rect::new(dst_x, dst_y, dst_w, dst_h));
                 }
             }
 
@@ -2232,12 +2275,9 @@ mod player {
                 let by = h as i32 - 76;
                 let bw = PANEL_W - 16;
                 let bh = 24u32;
-                fill_rect(&mut buf, PANEL_W, h, bx, by, bw, bh, COL_INPUT_BG);
-                // 边框 (accent)
-                fill_rect(&mut buf, PANEL_W, h, bx, by, bw, 1, COL_ACCENT_BG);
-                fill_rect(&mut buf, PANEL_W, h, bx, by + bh as i32 - 1, bw, 1, COL_ACCENT_BG);
-                fill_rect(&mut buf, PANEL_W, h, bx, by, 1, bh, COL_ACCENT_BG);
-                fill_rect(&mut buf, PANEL_W, h, bx + bw as i32 - 1, by, 1, bh, COL_ACCENT_BG);
+                // 圆角输入框 + accent 描边
+                fill_rect_r(&mut buf, PANEL_W, h, bx, by, bw as u32, bh, 4, COL_ACCENT_BG);
+                fill_rect_r(&mut buf, PANEL_W, h, bx + 1, by + 1, bw as u32 - 2, bh - 2, 3, COL_INPUT_BG);
                 // 输入内容 (过长时显示尾部) + 光标
                 let shown = if self.input.len() > 26 {
                     format!("..{}_", &self.input[self.input.len() - 24..])
@@ -2247,12 +2287,14 @@ mod player {
                 self.draw_text(&mut buf, h, 12, h as i32 - 58, 13.0, &shown, COL_TEXT);
             }
 
-            // 按钮
+            // 按钮 (圆角 + 顶部高光)
             let (ax, ay, aw, ah) = btn_add_rect(h);
-            fill_rect(&mut buf, PANEL_W, h, ax, ay, aw as u32, ah as u32, COL_BTN);
+            fill_rect_r(&mut buf, PANEL_W, h, ax, ay, aw as u32, ah as u32, 6, COL_BTN);
+            fill_rect(&mut buf, PANEL_W, h, ax, ay, aw as u32, 1, COL_BTN_HI);
             self.draw_text(&mut buf, h, ax + 32, ay + 20, 13.0, "+ Add", COL_TEXT);
             let (dx, dy, dw, dh) = btn_del_rect(h);
-            fill_rect(&mut buf, PANEL_W, h, dx, dy, dw as u32, dh as u32, COL_BTN);
+            fill_rect_r(&mut buf, PANEL_W, h, dx, dy, dw as u32, dh as u32, 6, COL_BTN);
+            fill_rect(&mut buf, PANEL_W, h, dx, dy, dw as u32, 1, COL_BTN_HI);
             self.draw_text(&mut buf, h, dx + 32, dy + 20, 13.0, "- Del", COL_TEXT);
 
             // 上传到纹理
@@ -2535,7 +2577,7 @@ impl ViewerConfig {
         if path.exists() {
             let content = std::fs::read_to_string(path)
                 .map_err(|e| anyhow::anyhow!("Failed to read config file {}: {e}", path.display()))?;
-            let mut config: ViewerConfig = toml::from_str(&content)
+            let config: ViewerConfig = toml::from_str(&content)
                 .map_err(|e| anyhow::anyhow!("Failed to parse config file {}: {e}", path.display()))?;
             println!("[Viewer] Loaded config from {}", path.display());
             Ok(config)
