@@ -118,7 +118,7 @@ async fn main() -> Result<()> {
         config.video_file = Some(vf.clone());
     }
 
-    if config.relays.is_empty() && !config.enable_mdns {
+    if config.relay_multiaddrs().is_empty() && !config.enable_mdns {
         eprintln!("[DeviceCam] Error: no relay addresses and mDNS is disabled. \
                    Edit {} or use --relay / --enable-mdns", opt.config.display());
         std::process::exit(1);
@@ -265,7 +265,7 @@ async fn main() -> Result<()> {
     }
 
     // ---- 解析 Relay 地址列表 ----
-    let relay_states: Vec<RelayState> = config.relays.iter().map(|addr_str| {
+    let relay_states: Vec<RelayState> = config.relay_multiaddrs().iter().map(|addr_str| {
         let addr: Multiaddr = addr_str.parse()
             .context(format!("Invalid relay address: {addr_str}"))
             .unwrap();
@@ -1152,8 +1152,9 @@ struct Opt {
 }
 
 fn validate_device_cam_config(config: &config::Config) {
-    for (i, relay_str) in config.relays.iter().enumerate() {
-        let label = if config.relays.len() == 1 {
+    let relay_addrs = config.relay_multiaddrs();
+    for (i, relay_str) in relay_addrs.iter().enumerate() {
+        let label = if relay_addrs.len() == 1 {
             "Relay".to_string()
         } else {
             format!("Relay #{}", i + 1)

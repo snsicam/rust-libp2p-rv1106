@@ -5,9 +5,51 @@
 # ============ 网络连接 ============
 
 # Relay Server 地址列表 (支持多个 Relay，并发拨号)
-# 格式: /ip4/<ip>/tcp/<port>/p2p/<PeerId> 或 /ip4/<ip>/udp/<port>/quic-v1/p2p/<PeerId>
-relays = ["/ip4/101.35.90.171/udp/4001/quic-v1/p2p/12D3KooWDGUejVsts1G4tGyf8ukkr73eWxCr1EUfCQxgcbSDUie1", 
-"/ip4/134.175.248.113/udp/4001/quic-v1/p2p/12D3KooWMZNFG6htyb5gBrChtgag81YE5ySmXLoFiYhaUnQaTopr"]
+# 结构化写法 (推荐, 可读性强): 每个 [[relay_list]] 一项
+#   transport: "quic" (udp+quic-v1, 推荐) | "tcp"
+#   ip 自动识别 ipv4/ipv6
+# 兼容旧格式: relays = ["/ip4/.../p2p/..."] 字符串数组
+[[relay_list]]
+name = "中继1-QUIC"
+ip = "101.35.90.171"
+port = 4001
+transport = "quic"
+peer_id = "12D3KooWDGUejVsts1G4tGyf8ukkr73eWxCr1EUfCQxgcbSDUie1"
+
+[[relay_list]]
+name = "中继1-TCP"
+ip = "101.35.90.171"
+port = 4001
+transport = "tcp"
+peer_id = "12D3KooWDGUejVsts1G4tGyf8ukkr73eWxCr1EUfCQxgcbSDUie1"
+
+[[relay_list]]
+name = "中继2-QUIC"
+ip = "124.221.175.240"
+port = 4001
+transport = "quic"
+peer_id = "12D3KooWBko9VUfuMVEMUFcVaktZxEY48MZTeDTEMUgz4op86qUv"
+
+[[relay_list]]
+name = "中继2-TCP"
+ip = "124.221.175.240"
+port = 4001
+transport = "tcp"
+peer_id = "12D3KooWBko9VUfuMVEMUFcVaktZxEY48MZTeDTEMUgz4op86qUv"
+
+[[relay_list]]
+name = "中继2-IPv6-QUIC"
+ip = "2402:4e00:c032:2400:3afc:b786:56a4:0"
+port = 4001
+transport = "quic"
+peer_id = "12D3KooWBko9VUfuMVEMUFcVaktZxEY48MZTeDTEMUgz4op86qUv"
+
+[[relay_list]]
+name = "中继2-IPv6-TCP"
+ip = "2402:4e00:c032:2400:3afc:b786:56a4:0"
+port = 4001
+transport = "tcp"
+peer_id = "12D3KooWBko9VUfuMVEMUFcVaktZxEY48MZTeDTEMUgz4op86qUv"
 
 
 # mDNS 局域网发现 (默认开启，同局域网 viewer 优先直连)

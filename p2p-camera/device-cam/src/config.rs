@@ -5,9 +5,17 @@
 //! 如果配置文件不存在，自动生成带默认值的配置文件
 //!
 //! 多 Relay 支持:
-//!   新格式: relays = ["/ip4/.../p2p/PeerId1", "/ip4/.../p2p/PeerId2"]
-//!   旧格式: relay = "/ip4/.../p2p/PeerId" (向后兼容, 解析时合并到 relays)
-//!   同时存在时 relays 优先
+//!   推荐格式 (结构化, 可读性强):
+//!     [[relay_list]]
+//!     name = "主中继"
+//!     ip = "101.35.90.171"
+//!     port = 4001
+//!     transport = "quic"          # "quic" (udp+quic-v1, 推荐) | "tcp"
+//!     peer_id = "12D3KooW..."
+//!   兼容旧格式:
+//!     relays = ["/ip4/.../p2p/PeerId1", "/ip4/.../p2p/PeerId2"]  (字符串数组)
+//!     relay  = "/ip4/.../p2p/PeerId"                            (单字符串)
+//!   优先级: relays (含 CLI 覆盖) > relay > relay_list
 //!
 //! 三码流配置 (rv1106 模式):
 //!   [video.main]    主码流 (高清, 如 2304x1296)
@@ -20,6 +28,61 @@
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+
+/// 结构化中继配置 (可读性优先的新格式, TOML 中以 `[[relay_list]]` 表数组书写)
+///
+/// 例:
+/// ```toml
+/// [[relay_list]]
+/// name = "主中继-QUIC"          # 可选备注名, 仅用于日志/UI
+/// ip = "101.35.90.171"          # 中继 IP, 自动识别 ipv4/ipv6
+/// port = 4001
+/// transport = "quic"            # "quic" (udp+quic-v1, 推荐) | "tcp"
+/// peer_id = "12D3KooW..."       # 中继 PeerId
+/// ```
+/// 解析时由 `Config::relay_multiaddrs()` 转换为 multiaddr 字符串, 并兼容旧格式
+/// `relays` (字符串数组) 与 `relay` (单字符串)。下游代码统一读取 `relay_multiaddrs()`。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelayConfig {
+    /// 可选备注名 (仅用于日志/UI 展示)
+    #[serde(default)]
+    pub name: Option<String>,
+    /// 中继 IP (IPv4 / IPv6 字面量均可, 自动识别协议族)
+    pub ip: String,
+    /// 监听端口
+    #[serde(default = "default_relay_port")]
+    pub port: u16,
+    /// 传输层: "quic" (udp + quic-v1, 推荐, 利于 DCUtR 打洞) | "tcp"
+    #[serde(default = "default_relay_transport")]
+    pub transport: String,
+    /// 中继 PeerId
+    pub peer_id: String,
+}
+
+fn default_relay_port() -> u16 { 4001 }
+fn default_relay_transport() -> String { "quic".to_string() }
+
+impl RelayConfig {
+    /// 将结构化配置转换为 libp2p multiaddr 字符串
+    pub fn to_multiaddr(&self) -> Option<String> {
+        let ip = self.ip.trim().trim_matches(|c| c == '[' || c == ']');
+        if ip.is_empty() || self.peer_id.trim().is_empty() {
+            return None;
+        }
+        // ip 含 ':' 即判定为 IPv6, 否则 IPv4 (自动识别协议族, 无需手写 ip4/ip6)
+        let family = if ip.contains(':') { "ip6" } else { "ip4" };
+        let transport = self.transport.to_lowercase();
+        let ma = match transport.as_str() {
+            "tcp" => format!("/{family}/{ip}/tcp/{}/p2p/{}", self.port, self.peer_id),
+            "quic" => format!("/{family}/{ip}/udp/{}/quic-v1/p2p/{}", self.port, self.peer_id),
+            other => {
+                tracing::warn!("[Config] 未知 relay transport '{other}', 已跳过该中继");
+                return None;
+            }
+        };
+        Some(ma)
+    }
+}
 
 /// 单个码流的编码配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -254,11 +317,17 @@ impl Default for AudioConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
-    /// 多 Relay 地址列表 (新格式优先)
+    /// 结构化中继配置 (推荐格式, 可读性强, TOML `[[relay_list]]` 表数组)
+    /// 由 `relay_multiaddrs()` 转换为 multiaddr 字符串, 兼容旧格式 relays/relay
     #[serde(default)]
+    pub relay_list: Vec<RelayConfig>,
+    /// 多 Relay 地址列表 (旧格式字符串数组, 含 CLI 覆盖, 优先级最高)
+    /// 空数组保存时省略 (避免回写冗余空字段)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub relays: Vec<String>,
     /// 单 Relay 地址 (旧格式, 向后兼容, 解析时合并到 relays)
-    #[serde(default)]
+    /// 空字符串保存时省略
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub relay: String,
     /// 是否启用 mDNS 局域网发现 (默认 true)
     #[serde(default = "default_enable_mdns")]
@@ -310,6 +379,7 @@ fn default_sensor_frame_rate() -> u32 { 30 }
 impl Default for Config {
     fn default() -> Self {
         Self {
+            relay_list: Vec::new(),
             relays: Vec::new(),
             relay: String::new(),
             enable_mdns: default_enable_mdns(),
@@ -334,7 +404,6 @@ impl Config {
                 .map_err(|e| anyhow::anyhow!("Failed to read config file {}: {e}", path.display()))?;
             let mut config: Config = toml::from_str(&content)
                 .map_err(|e| anyhow::anyhow!("Failed to parse config file {}: {e}", path.display()))?;
-            config.resolve_relays();
             println!("[DeviceCam] Loaded config from {}", path.display());
             Ok(config)
         } else {
@@ -345,15 +414,24 @@ impl Config {
         }
     }
 
-    /// 解析 Relay 地址列表: 处理旧格式 relay 与新格式 relays 的兼容
+    /// 返回所有中继的 multiaddr 字符串 (合并旧格式 relays/relay 与结构化 relay_list)
     ///
-    /// 规则:
-    /// - 如果 relays 非空, 忽略 relay (新格式优先)
-    /// - 如果 relays 为空且 relay 非空, 将 relay 加入 relays (旧格式兼容)
-    fn resolve_relays(&mut self) {
-        if self.relays.is_empty() && !self.relay.is_empty() {
-            self.relays.push(self.relay.clone());
+    /// 优先级: relays (字符串数组, 含 CLI 覆盖) > relay (单字符串) > relay_list (结构化)
+    /// 旧格式存在时结构化不生效, 避免重复连接。
+    pub fn relay_multiaddrs(&self) -> Vec<String> {
+        if !self.relays.is_empty() {
+            return self.relays.clone();
         }
+        let mut out = Vec::new();
+        if !self.relay.is_empty() {
+            out.push(self.relay.clone());
+        }
+        for rc in &self.relay_list {
+            if let Some(ma) = rc.to_multiaddr() {
+                out.push(ma);
+            }
+        }
+        out
     }
 
     /// 保存配置到文件

@@ -73,17 +73,15 @@ async fn main() -> Result<()> {
     // stream CLI arg always overrides config (unless it's the default "auto")
     if opt.stream != "auto" { config.stream = opt.stream.clone(); }
 
-    // 解析 relays (兼容旧格式 relay 字段)
-    config.resolve_relays();
-
     // ---- 参数校验 ----
-    if config.relays.is_empty() && !config.enable_mdns {
+    if config.relay_multiaddrs().is_empty() && !config.enable_mdns {
         eprintln!("[Viewer] Error: no relay addresses and mDNS is disabled. Edit {} or use --relay / --enable-mdns", opt.config.display());
         std::process::exit(1);
     }
     {
-        for (i, relay_str) in config.relays.iter().enumerate() {
-            let label = if config.relays.len() == 1 { "Relay".to_string() } else { format!("Relay #{}", i + 1) };
+        let relay_addrs = config.relay_multiaddrs();
+        for (i, relay_str) in relay_addrs.iter().enumerate() {
+            let label = if relay_addrs.len() == 1 { "Relay".to_string() } else { format!("Relay #{}", i + 1) };
             if relay_str.contains("/tcp/") && !relay_str.contains("/quic-v1") {
                 tracing::warn!("[Viewer] WARNING: {label} using TCP - DCUtR will only produce TCP candidates, hole punching unlikely to succeed. Use /udp/<port>/quic-v1 instead");
             } else if relay_str.contains("/quic-v1") {
@@ -131,7 +129,7 @@ async fn run_headless(opt: Opt, config: ViewerConfig) -> Result<()> {
         None
     };
 
-    let relay_addrs = config.relays.clone();
+    let relay_addrs = config.relay_multiaddrs();
     let no_audio = config.no_audio;
     let udp_port = config.udp_port.unwrap_or(0);
     let enable_mdns = config.enable_mdns;
@@ -294,7 +292,7 @@ async fn run_gui(opt: Opt, mut config: ViewerConfig) -> Result<()> {
         None
     };
 
-    let relay_addrs = config.relays.clone();
+    let relay_addrs = config.relay_multiaddrs();
     let no_audio = config.no_audio;
     let udp_port = config.udp_port.unwrap_or(0);
     let enable_mdns = config.enable_mdns;
@@ -2420,13 +2418,65 @@ struct Opt {
 
 fn default_enable_mdns() -> bool { true }
 
+/// 结构化中继配置 (可读性优先的新格式, TOML 以 `[[relay_list]]` 表数组书写)
+///
+/// 例:
+/// ```toml
+/// [[relay_list]]
+/// name = "主中继-QUIC"
+/// ip = "101.35.90.171"
+/// port = 4001
+/// transport = "quic"      # "quic" (udp+quic-v1, 推荐) | "tcp"
+/// peer_id = "12D3KooW..."
+/// ```
+/// 由 `relay_multiaddrs()` 转换为 multiaddr 字符串, 兼容旧格式 relays/relay。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RelayConfig {
+    #[serde(default)]
+    name: Option<String>,
+    ip: String,
+    #[serde(default = "default_relay_port")]
+    port: u16,
+    #[serde(default = "default_relay_transport")]
+    transport: String,
+    peer_id: String,
+}
+
+fn default_relay_port() -> u16 { 4001 }
+fn default_relay_transport() -> String { "quic".to_string() }
+
+impl RelayConfig {
+    fn to_multiaddr(&self) -> Option<String> {
+        let ip = self.ip.trim().trim_matches(|c| c == '[' || c == ']');
+        if ip.is_empty() || self.peer_id.trim().is_empty() {
+            return None;
+        }
+        let family = if ip.contains(':') { "ip6" } else { "ip4" };
+        let transport = self.transport.to_lowercase();
+        let ma = match transport.as_str() {
+            "tcp" => format!("/{family}/{ip}/tcp/{}/p2p/{}", self.port, self.peer_id),
+            "quic" => format!("/{family}/{ip}/udp/{}/quic-v1/p2p/{}", self.port, self.peer_id),
+            other => {
+                tracing::warn!("[Viewer] 未知 relay transport '{other}', 已跳过该中继");
+                return None;
+            }
+        };
+        Some(ma)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ViewerConfig {
-    /// 多 Relay 地址列表 (新格式优先)
+    /// 结构化中继配置 (推荐格式, 可读性强, TOML `[[relay_list]]`)
     #[serde(default)]
+    relay_list: Vec<RelayConfig>,
+    /// 多 Relay 地址列表 (旧格式字符串数组, 含 CLI 覆盖, 优先级最高)
+    /// 空数组保存时省略 (避免回写冗余空字段)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     relays: Vec<String>,
     /// 单 Relay 地址 (旧格式, 向后兼容, 解析时合并到 relays)
-    #[serde(default)]
+    /// 空字符串保存时省略
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     relay: String,
     /// 是否启用 mDNS 局域网发现 (默认 true)
     #[serde(default = "default_enable_mdns")]
@@ -2466,6 +2516,7 @@ fn default_network_type() -> String { "auto".to_string() }
 impl Default for ViewerConfig {
     fn default() -> Self {
         Self {
+            relay_list: Vec::new(),
             relays: Vec::new(),
             relay: String::new(),
             enable_mdns: default_enable_mdns(),
@@ -2488,7 +2539,6 @@ impl ViewerConfig {
                 .map_err(|e| anyhow::anyhow!("Failed to read config file {}: {e}", path.display()))?;
             let mut config: ViewerConfig = toml::from_str(&content)
                 .map_err(|e| anyhow::anyhow!("Failed to parse config file {}: {e}", path.display()))?;
-            config.resolve_relays();
             println!("[Viewer] Loaded config from {}", path.display());
             Ok(config)
         } else {
@@ -2516,15 +2566,23 @@ impl ViewerConfig {
         Ok(())
     }
 
-    /// 解析 Relay 地址列表: 处理旧格式 relay 与新格式 relays 的兼容
+    /// 返回所有中继的 multiaddr 字符串 (合并旧格式 relays/relay 与结构化 relay_list)
     ///
-    /// 规则:
-    /// - 如果 relays 非空, 忽略 relay (新格式优先)
-    /// - 如果 relays 为空且 relay 非空, 将 relay 加入 relays (旧格式兼容)
-    fn resolve_relays(&mut self) {
-        if self.relays.is_empty() && !self.relay.is_empty() {
-            self.relays.push(self.relay.clone());
+    /// 优先级: relays (字符串数组, 含 CLI 覆盖) > relay (单字符串) > relay_list (结构化)
+    fn relay_multiaddrs(&self) -> Vec<String> {
+        if !self.relays.is_empty() {
+            return self.relays.clone();
         }
+        let mut out = Vec::new();
+        if !self.relay.is_empty() {
+            out.push(self.relay.clone());
+        }
+        for rc in &self.relay_list {
+            if let Some(ma) = rc.to_multiaddr() {
+                out.push(ma);
+            }
+        }
+        out
     }
 
     /// 设备列表 (统一为 camera_serials，连接时自动判定 PeerId / serial)
