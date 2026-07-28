@@ -12,11 +12,11 @@
 //!
 //! GUI 模式 (play=true):
 //!   窗口左侧为设备管理面板，显示 viewer.toml 中 camera_serials 设备列表；
-//!   - 单击选中设备，双击设备开始连接并在右侧播放视频
+//!   - 单击选中设备，右键菜单可「连接/断开/配置」并在右侧播放视频
 //!   - [+ Add] 添加设备 (键入或 Ctrl+V 粘贴 16位序列号 SN，Enter 确认，Esc 取消)
 //!   - [- Del] 删除选中设备
 //!   - 增删自动保存回 viewer.toml (注意: 保存会丢失配置文件中的注释)
-//!   启动时不自动连接，双击设备才连接。
+//!   启动时不自动连接，右键设备选择「连接」才连接。
 //!
 //! 自动重连: 连接断开时自动重新连接 Relay + DeviceCam + 打开 stream，
 //!           播放器和输出文件持续运行不中断。
@@ -102,7 +102,7 @@ async fn main() -> Result<()> {
         tracing::info!("[Viewer] mDNS disabled");
     }
 
-    // GUI 模式: 左侧设备管理面板 + 右侧视频, 双击设备才连接
+    // GUI 模式: 左侧设备管理面板 + 右侧视频, 右键设备「连接」才连接
     #[cfg(feature = "player")]
     if config.play {
         return run_gui(opt, config).await;
@@ -301,7 +301,7 @@ async fn run_gui(opt: Opt, mut config: ViewerConfig) -> Result<()> {
     // DCUtR 是否启用：默认启用（锥形/EIM NAT 可打洞成功，省中继带宽）。
     let enable_dcutr = network_type != "4g";
 
-    // 会话状态: 双击设备后才创建 MediaPlayer 并连接
+    // 会话状态: 右键「连接」后才创建 MediaPlayer 并连接
     let mut session: Option<MediaPlayer> = None;
     let mut current_cam: Option<String> = None;   // 最近一次选择连接的设备
     let mut pending_cam: Option<String> = None;   // 待连接设备 (重试机制)
@@ -720,7 +720,7 @@ mod player {
         Minimized,
         /// 窗口从最小化恢复
         Restored,
-        /// 双击设备, 开始连接该 PeerId
+        /// 右键菜单「连接」设备, 开始连接该 PeerId
         ConnectDevice(String),
         /// 设备列表已增删, 需要保存配置
         DevicesChanged,
@@ -789,7 +789,7 @@ mod player {
 
     /// 右键菜单动作
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum CtxMenuAct { Disconnect, Configure }
+    enum CtxMenuAct { Connect, Disconnect, Configure }
 
     /// 可编辑配置字段标识 (用于布局/点击命中)
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1411,7 +1411,7 @@ mod player {
                         self.panel_dirty = true;
                         let _ = self.draw_now();
                     }
-                    Event::MouseButtonDown { mouse_btn, x, y, clicks, .. } => {
+                    Event::MouseButtonDown { mouse_btn, x, y, .. } => {
                         match mouse_btn {
                             MouseButton::Left => {
                                 if self.config.is_some() {
@@ -1421,6 +1421,13 @@ mod player {
                                     // 菜单内命中执行对应动作, 否则关闭菜单
                                     if let Some(act) = self.on_context_menu_click(x, y) {
                                         match act {
+                                            CtxMenuAct::Connect => {
+                                                if let Some((_, _, idx)) = self.context_menu {
+                                                    if idx < self.devices.len() {
+                                                        actions.push(UiAction::ConnectDevice(self.devices[idx].clone()));
+                                                    }
+                                                }
+                                            }
                                             CtxMenuAct::Disconnect => actions.push(UiAction::DisconnectDevice),
                                             CtxMenuAct::Configure => self.open_config(),
                                         }
@@ -1428,7 +1435,7 @@ mod player {
                                     self.context_menu = None;
                                     let _ = self.draw_now();
                                 } else if (x as u32) < PANEL_W {
-                                    self.on_panel_click(x, y, clicks, &mut actions);
+                                    self.on_panel_click(x, y, &mut actions);
                                 }
                             }
                             MouseButton::Right => {
@@ -1468,8 +1475,8 @@ mod player {
             actions
         }
 
-        /// 面板区域鼠标点击: 设备行选中/双击连接, 按钮 Add/Del
-        fn on_panel_click(&mut self, x: i32, y: i32, clicks: u8, actions: &mut Vec<UiAction>) {
+        /// 面板区域鼠标点击: 设备行选中, 按钮 Add/Del (连接/断开/配置见右键菜单)
+        fn on_panel_click(&mut self, x: i32, y: i32, actions: &mut Vec<UiAction>) {
             let (_, h) = self.canvas.window().size();
 
             if in_rect(x, y, btn_add_rect(h)) {
@@ -1499,15 +1506,12 @@ mod player {
                 return;
             }
 
-            // 设备行: 单击选中, 双击连接
+            // 设备行: 单击选中 (连接/断开/配置见右键菜单)
             if y >= ROWS_Y0 && y < rows_end(h) {
                 let idx = ((y - ROWS_Y0) / ROW_H) as usize;
                 if idx < self.devices.len() {
                     self.selected = Some(idx);
                     self.panel_dirty = true;
-                    if clicks >= 2 {
-                        actions.push(UiAction::ConnectDevice(self.devices[idx].clone()));
-                    }
                 }
             }
         }
@@ -1552,7 +1556,7 @@ mod player {
             self.adding = false;
             self.input.clear();
             self.video_subsystem.text_input().stop();
-            self.status = "Device added (double-click to connect)".to_string();
+            self.status = "Device added (右键选择「连接」开始播放)".to_string();
             self.panel_dirty = true;
             Some(UiAction::DevicesChanged)
         }
@@ -1573,7 +1577,7 @@ mod player {
         fn on_context_menu_click(&self, x: i32, y: i32) -> Option<CtxMenuAct> {
             let (mx, my, _) = self.context_menu?;
             let w = 150i32;
-            let items = [CtxMenuAct::Disconnect, CtxMenuAct::Configure];
+            let items = [CtxMenuAct::Connect, CtxMenuAct::Disconnect, CtxMenuAct::Configure];
             for (i, act) in items.iter().enumerate() {
                 let ry = my + (i as i32) * 26;
                 if x >= mx && x < mx + w && y >= ry && y < ry + 26 {
@@ -1891,7 +1895,7 @@ mod player {
                 None => return Ok(()),
             };
             let w = 150i32;
-            let items = [("断开连接", CtxMenuAct::Disconnect), ("配置设备", CtxMenuAct::Configure)];
+            let items = [("连接", CtxMenuAct::Connect), ("断开", CtxMenuAct::Disconnect), ("配置", CtxMenuAct::Configure)];
             let h = (items.len() as i32) * 26;
             self.ensure_overlay(w as u32, h as u32)?;
             let mut buf = vec![0u8; (w * h * 4) as usize];

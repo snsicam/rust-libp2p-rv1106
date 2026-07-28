@@ -57,3 +57,11 @@
 - **`build_viewer.ps1` / `run_media_viewer.ps1` / `package_viewer.ps1` 的 `$ProjectRoot`** 原为 `..\..`（指向 `win-rust-libp2p/`），已修正为 `..`（指向 `p2p-camera/`），否则 cargo 找不到 mobile-core。
 - **`build_viewer.ps1`** 已新增：vcpkg lock 检查（防止后台安装冲突）、`E:\vcpkg` 候选路径、退出码修正、交叉编译 `--target` 仅在非 host 时传递。
 - **`package_viewer.ps1`** 已修正：vcpkg 候选路径、DLL 使用通配符（`avcodec-*.dll` 等）自动匹配版本，不再硬编码 soname。
+
+## 设备交互模型（2026-07-28 确立，app 与 viewer 对齐）
+- Android `MainActivity.kt`：**点击 = 选中**（高亮，不连接）；**长按 = 菜单（连接 / 断开 / 配置）**；**「删除」按钮 = 删选中设备（确认后真正删除）**。
+- Rust viewer `p2p-camera/mobile-core/examples/media_viewer.rs`：**单击 = 选中**（不连接，已取消双击连接）；**右键菜单 = 连接 / 断开 / 配置**（顺序与 app 一致）。
+  - `CtxMenuAct { Connect, Disconnect, Configure }`；`on_context_menu_click` 与 `draw_context_menu` 的 items 顺序必须一致（Connect 在最前）；「连接」复用 `UiAction::ConnectDevice`。
+  - `on_panel_click` 不再使用 `clicks` 参数；事件解构 `MouseButtonDown` 不再绑定 `clicks`。
+- 关键字段解耦：app `selectedDeviceId`（选中）/ `currentDeviceId`（当前播放）；viewer `selected`（选中索引）/ session（当前播放）。
+- app 删除有确认框（`showDeleteConfirm`）；viewer 删除是面板「- Del」按钮直接删选中（无确认，用户未要求改）。

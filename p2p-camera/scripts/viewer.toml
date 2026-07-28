@@ -2,6 +2,7 @@ enable_mdns = true
 camera_serials = [
     "e33700a6620dfddc",
     "12D3KooWG2ihY7Ne75KqkYyYrQWL1ACLUgUN8rp1nTskQB3RNNNt",
+    "1234567890888888",
 ]
 stream = "auto"
 no_audio = false
