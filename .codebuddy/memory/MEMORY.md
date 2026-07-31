@@ -18,6 +18,22 @@
 - 排查顺序经验：先用 ping 排除链路（本次设备 ping relay 0% 丢包 → 直接排除弱网，锁定配置问题），
   再看断开 `Cause:`。`timed out` + 随机时长 = 典型 idle timeout 误杀，不是丢包。
 
+## LAN 直连不稳定 → 保留 relay 电路做秒切备份（2026-07-31 方案 A）
+- 多网卡/对称 NAT 环境下 **LAN 直连（`mDNS` 发现的 `192.168.0.x`）会随时被底层网络打断**（~50s 一断），
+  但 **relay 电路很稳**（设备↔relay reservation 实测 10 分钟不掉）。
+- **不要**在 LAN 直连升级成功后 `close_connection(relay_conn_id)` 关掉 relay 兜底 —— 这会导致 LAN 一断就整轮 reconnect。
+- 正确做法（已在 `mobile-core/src/viewer.rs` 实现）：LAN 升级后保留 relay transport 连接，
+  置 `relay_circuit_available = true`；当 `ConnectionClosed`(device, num_established==0) 且标志为真时，
+  走 `fallback_to_relay()`：经**现有 relay 重拨 circuit**（不重建 Swarm/不重 mDNS），
+  复用 swarm 级 `stream_control` 重开三路 stream，发 `DirectUpgraded{via_lan:false}`，`connected` 保持 true。
+  - `poll_swarm` 是 async fn（调用方循环驱动），内部**不能用 `continue`，用 `return`**。
+  - `stream_resolver.resolve()` 返回 `StreamProtocol`（**非 Copy**，包 `Bytes`），被 `open_stream` 消费后
+    不能在 println 复用 → 先算 `video_name: &str` 再 move。
+  - `reconnect()` 重建 Swarm 后必须 `relay_circuit_available = false`（旧备份失效）。
+- 固定设备 UDP 端口稳定 NAT：`device-cam.toml` 设 `udp_port = 48781`，
+  `scripts/run_device_cam.sh` 命令行模式传 `--udp-port 48781`（可用 `FIXED_UDP_PORT` 环境变量覆盖）。
+  目的：避免出口端口随机漂移导致 NAT 类型在 Full/Port-Restricted/Symmetric 间跳变。
+
 ## 网络（国内）：默认源不稳定，务必用镜像
 - rustup / cargo：用 `rsproxy.cn` 镜像。cargo 配置在 `C:\Users\song\.cargo\config.toml`
   （`[source.crates-io] replace-with = "rsproxy-sparse"`，`registry = "sparse+https://rsproxy.cn/index/"`，`[net] git-fetch-with-cli = true`）。

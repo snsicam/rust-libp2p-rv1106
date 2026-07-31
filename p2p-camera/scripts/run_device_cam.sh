@@ -41,6 +41,11 @@ mkdir -p "$LOG_DIR"
 # 构建命令参数
 ARGS=()
 
+# 固定 UDP 端口: 稳定 NAT 映射, 避免出口端口随机漂移导致 NAT 类型在
+# Full Cone / Symmetric 间跳变 (多网卡/4G 环境下尤为明显, 会让 DCUtR 与直连反复失败)。
+# 设备本机已在 48781 上监听 QUIC, 这里显式指定保持一致。
+FIXED_UDP_PORT="${FIXED_UDP_PORT:-48781}"
+
 if [ $# -ge 1 ]; then
     # 命令行模式: 传入 relay 地址和可选视频文件
     RELAY_ADDR="$1"
@@ -55,17 +60,22 @@ if [ $# -ge 1 ]; then
         ARGS+=(--video-file "$VIDEO_FILE")
     fi
 
+    ARGS+=(--udp-port "$FIXED_UDP_PORT")
+
     echo ""
     echo "============================================"
     echo "  P2P Camera DeviceCam"
     echo "============================================"
     echo "  Binary:  $DEVICE_CAM_BIN"
     echo "  Relay:   $RELAY_ADDR"
+    echo "  UDP:     $FIXED_UDP_PORT (fixed)"
     if [ $# -ge 2 ]; then
     echo "  Video:   $VIDEO_FILE"
     fi
 else
     # 配置文件模式: 直接运行，读取 device-cam.toml
+    # 注意: 若 device-cam.toml 未设置 udp_port, 设备将使用随机端口。
+    # 如需固定端口, 在 device-cam.toml 中加入 `udp_port = 48781` 或改用命令行模式。
     echo ""
     echo "============================================"
     echo "  P2P Camera DeviceCam"

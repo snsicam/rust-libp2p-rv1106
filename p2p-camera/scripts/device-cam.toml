@@ -72,7 +72,9 @@ key_file = "device-cam.key"
 sensor_frame_rate = 30
 
 # QUIC UDP 监听端口 (0=随机, 非0=固定端口便于端口映射)
-# udp_port = 9090
+# 固定端口可稳定 NAT 映射, 避免出口端口随机漂移导致 NAT 类型在
+# Full Cone / Symmetric 间跳变 (多网卡/4G 环境下会让直连反复失败)。
+udp_port = 48781
 
 # 是否启用音频采集 (命令行 --enable-audio 可覆盖)
 # config 文件中通过 [audio] enabled 控制
