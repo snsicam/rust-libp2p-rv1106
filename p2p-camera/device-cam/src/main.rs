@@ -57,8 +57,10 @@ use tracing_subscriber::EnvFilter;
 const BROADCAST_CAPACITY: usize = 100;
 
 // 重连间隔 (指数退避: base → 2x → 4x → ... → max)
-const RECONNECT_DELAY_BASE: Duration = Duration::from_secs(3);
-const RECONNECT_DELAY_MAX: Duration = Duration::from_secs(60);
+// 监控场景要求快速恢复: 上限 60s 会导致设备长时间不可见 (app 端表现为"连不上"),
+// 且 relay 可达时无需长退避, 故上限压到 8s。
+const RECONNECT_DELAY_BASE: Duration = Duration::from_secs(2);
+const RECONNECT_DELAY_MAX: Duration = Duration::from_secs(8);
 
 /// 单个 Relay 的连接和预约状态
 struct RelayState {
@@ -304,7 +306,14 @@ async fn main() -> Result<()> {
             noise::Config::new,
             libp2p::yamux::Config::default,
         )?
-        .with_quic()
+        // QUIC 传输层超时: 默认 max_idle_timeout=10s 对弱网/高负载过于激进,
+        // 一旦连续丢失 2 个 keep-alive 就判定连接死亡 (日志中大量 "I/O error: timed out")。
+        // 放宽到 30s, keep-alive 缩短到 3s => 需连续丢 10 个探测包才断开。
+        .with_quic_config(|mut c| {
+            c.max_idle_timeout = 30_000;
+            c.keep_alive_interval = Duration::from_secs(3);
+            c
+        })
         .with_relay_client(noise::Config::new, libp2p::yamux::Config::default)?
         .with_behaviour(|key, relay_client| {
             let identify_config = identify::Config::new(

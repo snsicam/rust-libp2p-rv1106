@@ -75,7 +75,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
             noise::Config::new,
             yamux::Config::default,
         )?
-        .with_quic()
+        // QUIC max_idle_timeout: 实际生效值 = 两端协商的较小者。
+        // relay 端若保持默认 10s, 客户端单方面调大无效, 因此必须同步为 30s。
+        .with_quic_config(|mut c| {
+            c.max_idle_timeout = 30_000;
+            c.keep_alive_interval = std::time::Duration::from_secs(3);
+            c
+        })
         .with_behaviour(|key| Behaviour::new(key.public()))?
         .with_swarm_config(|c| c.with_idle_connection_timeout(std::time::Duration::from_secs(120)))
         .build();

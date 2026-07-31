@@ -328,7 +328,13 @@ impl MediaPlayer {
                 noise::Config::new,
                 libp2p::yamux::Config::default,
             )?
-            .with_quic()
+            // QUIC max_idle_timeout 默认 10s 过短, 与 device-cam / relay-server 保持一致 (30s)。
+            // QUIC 实际生效值取两端协商的较小者, 因此三端必须同步调整。
+            .with_quic_config(|mut c| {
+                c.max_idle_timeout = 30_000;
+                c.keep_alive_interval = Duration::from_secs(3);
+                c
+            })
             .with_relay_client(noise::Config::new, libp2p::yamux::Config::default)?
             .with_behaviour(|key, relay_client| {
                 ViewerBehaviour::new(key.public(), relay_client, enable_dcutr)

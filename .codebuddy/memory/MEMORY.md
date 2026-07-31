@@ -6,6 +6,18 @@
 - 一键脚本：`p2p-camera/scripts/setup_env.ps1`（强制管理员，装 Rust/VS/vcpkg/LLVM 并写 `VCPKG_ROOT`/`LIBCLANG_PATH`/`VCPKGRS_DYNAMIC`）。
 - **llvm 在本项目只用于提供 `libclang`**：`mobile-core/build.rs` 用 `bindgen` 在编译期解析 ffmpeg/sdl2 的 C 头、生成 Rust FFI 绑定（ffmpeg-next 6.x / sdl2 0.37 是 C 库的 Rust 封装，需绑定才能调用）。`LIBCLANG_PATH` 即指向 LLVM 的 libclang.dll。`VCPKGRS_DYNAMIC=1` 让 vcpkg-rs 动态链接。libclang 仅服务编译期，运行时 viewer 只链 ffmpeg/sdl2 的 dll，不依赖 llvm。vcpkg 的 llvm 端口默认编全套（clang/lld/mlir/全 target），实际只用 libclang 一个库，所以编译极慢（2–3h）。
 
+## QUIC 连接稳定性：swarm idle timeout ≠ QUIC idle timeout（2026-07-31 踩坑）
+- `with_swarm_config(|c| c.with_idle_connection_timeout(120s))` 只控制「无活跃 stream 就关连接」，
+  **不影响 QUIC 传输层自身的空闲超时**。二者是两层，别混。
+- `.with_quic()` 使用 `transports/quic/src/config.rs` 默认值：`max_idle_timeout = 10s`、
+  `keep_alive_interval = 5s` → 连续丢 2 个探测包即断，症状是 `I/O error: timed out` 且连接时长随机。
+- 要调必须用 `.with_quic_config(|mut c| { c.max_idle_timeout = 30_000; c.keep_alive_interval = ...; c })`。
+- **`max_idle_timeout` 生效值 = 两端协商的较小者**：device-cam / viewer / relay-server **三端必须同步改**，
+  只改客户端无效；改完 **relay 必须重新部署到服务器**才生效。
+- `relay-server/src/main.rs` 没有 `use std::time::Duration`，写全路径 `std::time::Duration::from_secs(3)`。
+- 排查顺序经验：先用 ping 排除链路（本次设备 ping relay 0% 丢包 → 直接排除弱网，锁定配置问题），
+  再看断开 `Cause:`。`timed out` + 随机时长 = 典型 idle timeout 误杀，不是丢包。
+
 ## 网络（国内）：默认源不稳定，务必用镜像
 - rustup / cargo：用 `rsproxy.cn` 镜像。cargo 配置在 `C:\Users\song\.cargo\config.toml`
   （`[source.crates-io] replace-with = "rsproxy-sparse"`，`registry = "sparse+https://rsproxy.cn/index/"`，`[net] git-fetch-with-cli = true`）。
