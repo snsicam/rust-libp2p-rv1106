@@ -328,7 +328,9 @@ async fn main() -> Result<()> {
                 config.enable_dcutr,
             )
         })?
-        .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(120)))
+        // swarm idle timeout 调大到 10min: QUIC keep-alive(3s) 负责 NAT 保活; 原 120s 会把无子协议
+        // 活跃的 relay 中转连接误杀, 导致每 ~2min 整轮重连并波及 LAN 直连。不设 0 防死连接永久挂。
+        .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(600)))
         .build();
 
     tracing::info!("[DeviceCam] push_listen_addr_updates enabled for DCUtR");

@@ -339,8 +339,10 @@ impl MediaPlayer {
             .with_behaviour(|key, relay_client| {
                 ViewerBehaviour::new(key.public(), relay_client, enable_dcutr)
             })?
-            // idle timeout 120s: DCUtR handler 在重试期间需要 keep-alive，0 会导致连接被意外关闭
-            .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(120)))
+            // swarm idle timeout: 10min。QUIC keep-alive(3s) 已负责 NAT 保活,
+            // 此处只防"真正死连接永久挂着"; 不能设 0 (DCUtR 重试期间需要 keep-alive, 0 会误关)。
+            // 原 120s 会把"无子协议活跃"的 relay 中转连接误杀 → 每 ~2min 整轮重连 → 波及 LAN 直连。
+            .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(600)))
             .build();
         Ok(swarm)
     }

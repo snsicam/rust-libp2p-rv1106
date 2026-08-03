@@ -83,7 +83,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
             c
         })
         .with_behaviour(|key| Behaviour::new(key.public()))?
-        .with_swarm_config(|c| c.with_idle_connection_timeout(std::time::Duration::from_secs(120)))
+        // swarm idle timeout 调大到 10min: QUIC keep-alive(3s) 负责 NAT 保活; 原 120s 误杀无子协议
+        // 活跃的 relay 中转连接, 导致 viewer 每 ~2min 整轮重连。不设 0 防死连接永久挂。
+        .with_swarm_config(|c| c.with_idle_connection_timeout(std::time::Duration::from_secs(600)))
         .build();
 
     // ---- 监听 ----
