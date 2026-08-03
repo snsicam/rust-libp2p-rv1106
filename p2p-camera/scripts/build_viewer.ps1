@@ -118,6 +118,14 @@ if (-not $env:LIBCLANG_PATH) {
     }
 }
 
+# libclang.dll 依赖 LLVM-C.dll / z.dll / zstd.dll（同处 bin/ 下）。
+# bindgen 调用 LoadLibraryExW 时默认不会把 DLL 所在目录加入依赖搜索路径，
+# 必须把该目录加入 PATH，否则报 "LoadLibraryExW failed" (err=126)。
+if ($env:LIBCLANG_PATH -and ($env:PATH -notlike "*$($env:LIBCLANG_PATH)*")) {
+    $env:PATH = "$($env:LIBCLANG_PATH);$env:PATH"
+    Write-Host "[INFO] Prepended LIBCLANG_PATH to PATH for bindgen dependency resolution"
+}
+
 # ---- 设置 VCPKGRS_DYNAMIC ----
 $env:VCPKGRS_DYNAMIC = "1"
 Write-Host "[INFO] Setting VCPKGRS_DYNAMIC=1"

@@ -61,8 +61,15 @@
 - ✅ VS Build Tools 2022（MSVC / cl.exe）
 - ✅ vcpkg 装在 `E:\vcpkg`，ffmpeg (8.1.2, libavcodec 62) / sdl2 / llvm 已安装完成
 - ✅ **Windows viewer 编译验证通过**（`media_viewer.exe` 20.9MB）
-- ✅ `LIBCLANG_PATH` 已修正为 `E:\vcpkg\installed\x64-windows\bin`（libclang.dll 在此目录，不在 `tools\llvm\bin`）
-- ✅ `build_viewer.ps1` 已修正 LIBCLANG_PATH 候选路径（优先查 `installed\<triplet>\bin`）
+- ✅ `LIBCLANG_PATH` 指向 `E:\vcpkg\installed\x64-windows\bin`（libclang.dll 在此目录）。
+- ✅ `build_viewer.ps1` 已修正 LIBCLANG_PATH 候选路径（优先查 `installed\<triplet>\bin`）。
+
+## libclang 加载失败（2026-08-03 踩坑，已修复）
+- 症状：`ffmpeg-sys-next` 的 build.rs（bindgen）报 `Unable to find libclang: ... libclang.dll could not be opened: LoadLibraryExW failed`（err=126）。
+- 根因：bindgen 用 `LoadLibraryExW(full_path_to_libclang.dll)` 加载 **不**会自动把 DLL 所在目录加入其**依赖**的搜索路径。`bin\libclang.dll` 运行期依赖同目录的 `LLVM-C.dll`/`z.dll`/`zstd.dll`，这些 DLL 默认不在进程 DLL 搜索路径里 → 整条链加载失败（err=126）。
+- 验证：PowerShell 里 `SetDllDirectory('E:\vcpkg\installed\x64-windows\bin')` 后 `LoadLibraryExW(libclang.dll)` 即成功。
+- 修复（已写入 `build_viewer.ps1`）：设置 `LIBCLANG_PATH` 后，把该目录**前置到 `PATH`**（`$env:PATH = "$LIBCLANG_PATH;$env:PATH"`），bindgen 即可解析依赖。`LLVM-C.dll` 自身的依赖（VCRUNTIME140/MSVCP140 等）在 `C:\Windows\System32` 正常。
+- 注意：不能只靠 `LIBCLANG_PATH`，**必须同时把该目录加进 PATH**，否则仍会 126。
 - ✅ `run_media_viewer.ps1` 已修正：自动添加 vcpkg DLL 目录到 PATH、自动查找 `viewer.toml`（p2p-camera/ → repo root）、移除旧 `--config` 处理避免重复
 - ✅ 已创建占位 `E:\vcpkg\installed\x64-windows\include\libavcodec\avfft.h`（FFmpeg 8.0 移除此头文件，但 ffmpeg-sys-next 仍引用它；占位为空文件即可让 bindgen 通过）
 - 辅助脚本：`p2p-camera/scripts/` 下 `install_rust_mirror.ps1`、`write_cargo_config.ps1`、`install_vcpkg.ps1`、`install_vcpkg_deps.ps1`、`run_deps.bat`、`_elevate_setup.ps1`、`_build_final.bat`
