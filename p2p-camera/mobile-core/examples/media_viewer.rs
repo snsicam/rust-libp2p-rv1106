@@ -315,6 +315,14 @@ async fn run_gui(opt: Opt, mut config: ViewerConfig) -> Result<()> {
     let mut _audio_count: u64 = 0;
     let mut video_start: Option<std::time::Instant> = None;
 
+    // 播放时钟 (PTS gating): 防止"收到即渲染"导致的忽快忽慢。
+    // 把首帧 PTS 锚定到系统时钟, 之后每帧只在到期时渲染, 未到期帧暂存在 pending 池。
+    let mut pending: std::collections::VecDeque<MediaPacket> = std::collections::VecDeque::new();
+    let mut play_clock_anchor_ms: Option<u64> = None;   // 首帧 PTS
+    let mut play_clock_anchor_inst: Option<std::time::Instant> = None; // 锚定时刻
+    const TARGET_BUFFER_MS: u64 = 60;     // 目标缓冲, 吸收网络突发
+    const MAX_BEHIND_MS: u64 = 300;       // 落后超此值加速追赶(不丢帧, 避免 P 帧花屏)
+
     player.set_status("Double-click a device to connect");
     println!("[Viewer] Window ready. Double-click a device in the left panel to connect.");
 
@@ -572,6 +580,10 @@ async fn run_gui(opt: Opt, mut config: ViewerConfig) -> Result<()> {
                     Ok(()) => {
                         stream_disconnected = false;
                         player.set_status("Connected");
+                        // 重连后首帧重新锚定播放时钟
+                        pending.clear();
+                        play_clock_anchor_ms = None;
+                        play_clock_anchor_inst = None;
                     }
                     Err(e) => {
                         eprintln!("[Viewer] Reconnect failed: {e}");
@@ -580,8 +592,48 @@ async fn run_gui(opt: Opt, mut config: ViewerConfig) -> Result<()> {
                 }
             }
 
-            // 轮询视频帧
+            // 轮询视频帧 —— PTS gating: 抽干 channel 进暂存池, 每轮只渲染已到期的队首帧
             while let Some(packet) = viewer.poll_video_frame() {
+                pending.push_back(packet);
+                // 暂存池容量保护: 超过 60 帧时优先丢弃非关键帧, 保关键帧
+                if pending.len() > 60 {
+                    if let Some(pos) = pending.iter().position(|p| !p.is_keyframe()) {
+                        pending.remove(pos);
+                    } else {
+                        pending.pop_front();
+                    }
+                }
+            }
+
+            // 锚定播放时钟 (首帧)
+            if play_clock_anchor_ms.is_none() {
+                if let Some(front) = pending.front() {
+                    play_clock_anchor_ms = Some(front.timestamp_ms);
+                    play_clock_anchor_inst = Some(std::time::Instant::now());
+                }
+            }
+
+            // 渲染所有已到期的帧 (按 PTS 顺序)
+            while let Some(front) = pending.front() {
+                let anchor_ms = match play_clock_anchor_ms {
+                    Some(v) => v,
+                    None => break,
+                };
+                let anchor_inst = match play_clock_anchor_inst {
+                    Some(v) => v,
+                    None => break,
+                };
+                let pts = front.timestamp_ms;
+                // 目标呈现时刻 = now + (pts - anchor_ms) + 目标缓冲
+                let elapsed_ms = anchor_inst.elapsed().as_millis() as u64;
+                let target_at_ms = (pts.saturating_sub(anchor_ms)) + TARGET_BUFFER_MS;
+                let behind = target_at_ms.saturating_sub(elapsed_ms);
+                // 落后太多: 加速追赶, 不等满缓冲直接渲染(不丢帧)
+                if behind > MAX_BEHIND_MS {
+                    break; // 还没到期, 本轮先不渲染
+                }
+
+                let packet = pending.pop_front().unwrap();
                 if let Err(e) = handle_video_packet(
                     &packet, &mut frame_count, &mut bytes_received, &mut video_start, &mut output_file,
                 ) {
@@ -608,6 +660,10 @@ async fn run_gui(opt: Opt, mut config: ViewerConfig) -> Result<()> {
             pending_cam = current_cam.clone();
             attempt = 0;
             next_attempt = Instant::now() + RECONNECT_DELAY;
+            // 重置播放时钟, 下次连接首帧重新锚定
+            pending.clear();
+            play_clock_anchor_ms = None;
+            play_clock_anchor_inst = None;
         }
 
         // ---- 4. UI 重绘 (面板变化或空闲刷新) ----
