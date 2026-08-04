@@ -1,102 +1,50 @@
 # 长期记忆 (MEMORY.md)
 
-## 项目：win-rust-libp2p / p2p-camera
-- Windows 开发机（用户 `song`，主机 `DESKTOP-867VBCJ`）构建 p2p-camera。
-- Viewer 编译需要：Rust 工具链 + VS Build Tools 2022 (C++ 桌面) + vcpkg(`ffmpeg`/`sdl2`/`llvm` for x64-windows) + `libclang`。
-- 一键脚本：`p2p-camera/scripts/setup_env.ps1`（强制管理员，装 Rust/VS/vcpkg/LLVM 并写 `VCPKG_ROOT`/`LIBCLANG_PATH`/`VCPKGRS_DYNAMIC`）。
-- **llvm 在本项目只用于提供 `libclang`**：`mobile-core/build.rs` 用 `bindgen` 在编译期解析 ffmpeg/sdl2 的 C 头、生成 Rust FFI 绑定（ffmpeg-next 6.x / sdl2 0.37 是 C 库的 Rust 封装，需绑定才能调用）。`LIBCLANG_PATH` 即指向 LLVM 的 libclang.dll。`VCPKGRS_DYNAMIC=1` 让 vcpkg-rs 动态链接。libclang 仅服务编译期，运行时 viewer 只链 ffmpeg/sdl2 的 dll，不依赖 llvm。vcpkg 的 llvm 端口默认编全套（clang/lld/mlir/全 target），实际只用 libclang 一个库，所以编译极慢（2–3h）。
+## 项目结构 / Workspace（关键）
+- `p2p-camera/Cargo.toml` 是**独立 workspace**（proto, mobile-core, device-cam, relay-server）；父级 `rust-libp2p/Cargo.toml` 是另一个 workspace（libp2p 官方 crate），不含 p2p-camera。
+- Cargo 不支持嵌套 workspace → **所有构建命令必须在 `p2p-camera/` 目录执行**。
+- Viewer 不是独立 crate：是 `mobile-core` 的 example → `cargo build --example media_viewer -p mobile-core --features player`。
+- path 依赖向上引用父 workspace：`../libp2p`、`../protocols/stream`、`../swarm`。
 
-## QUIC 连接稳定性：swarm idle timeout ≠ QUIC idle timeout（2026-07-31 踩坑）
-- `with_swarm_config(|c| c.with_idle_connection_timeout(120s))` 只控制「无活跃 stream 就关连接」，
-  **不影响 QUIC 传输层自身的空闲超时**。二者是两层，别混。
-- `.with_quic()` 使用 `transports/quic/src/config.rs` 默认值：`max_idle_timeout = 10s`、
-  `keep_alive_interval = 5s` → 连续丢 2 个探测包即断，症状是 `I/O error: timed out` 且连接时长随机。
-- 要调必须用 `.with_quic_config(|mut c| { c.max_idle_timeout = 30_000; c.keep_alive_interval = ...; c })`。
-- **`max_idle_timeout` 生效值 = 两端协商的较小者**：device-cam / viewer / relay-server **三端必须同步改**，
-  只改客户端无效；改完 **relay 必须重新部署到服务器**才生效。
-- `relay-server/src/main.rs` 没有 `use std::time::Duration`，写全路径 `std::time::Duration::from_secs(3)`。
-- 排查顺序经验：先用 ping 排除链路（本次设备 ping relay 0% 丢包 → 直接排除弱网，锁定配置问题），
-  再看断开 `Cause:`。`timed out` + 随机时长 = 典型 idle timeout 误杀，不是丢包。
+## Windows 构建环境（已验证可用）
+- 依赖：Rust 1.97.1 + VS Build Tools 2022(C++ 桌面 + **ATL 组件**) + vcpkg(`E:\vcpkg`，装 ffmpeg/sdl2/llvm x64-windows) + libclang。
+- 一键脚本：`p2p-camera/scripts/setup_env.ps1`；构建 `build_viewer.ps1`；运行 `run_media_viewer.ps1`；打包 `package_viewer.ps1`。这些脚本的 `$ProjectRoot` 必须是 `..`（指向 `p2p-camera/`）。
+- **llvm 只为提供 libclang**：`mobile-core/build.rs` 用 bindgen 解析 ffmpeg/sdl2 C 头。仅编译期需要，运行时不依赖。
+- **libclang 加载失败(err=126) 修复**：仅设 `LIBCLANG_PATH` 不够，**必须把该目录前置到 `PATH`**（`bin\libclang.dll` 依赖同目录 `LLVM-C.dll`/`z.dll`/`zstd.dll`）。
+- FFmpeg 8.0 移除了 `libavcodec/avfft.h`，但 ffmpeg-sys-next 仍引用 → 已创建空占位头文件。
+- **ffmpeg-next 版本号必须匹配 vcpkg 的 ffmpeg 主版本**（当前 FFmpeg 8.1.2 → `ffmpeg-next = "8"`）。不匹配会有大量 API 缺失编译错误。
+- vcpkg 坑：必须在 `vcvars64.bat` 环境下运行（否则找不到 `atlbase.h`）；vcpkg install 会 re-exec，父进程早退属正常；机器上有 3 个 vcpkg 目录，实际使用 `E:\vcpkg`。
 
-## LAN 直连不稳定 → 保留 relay 电路做秒切备份（2026-07-31 方案 A）
-- 多网卡/对称 NAT 环境下 **LAN 直连（`mDNS` 发现的 `192.168.0.x`）会随时被底层网络打断**（~50s 一断），
-  但 **relay 电路很稳**（设备↔relay reservation 实测 10 分钟不掉）。
-- **不要**在 LAN 直连升级成功后 `close_connection(relay_conn_id)` 关掉 relay 兜底 —— 这会导致 LAN 一断就整轮 reconnect。
-- 正确做法（已在 `mobile-core/src/viewer.rs` 实现）：LAN 升级后保留 relay transport 连接，
-  置 `relay_circuit_available = true`；当 `ConnectionClosed`(device, num_established==0) 且标志为真时，
-  走 `fallback_to_relay()`：经**现有 relay 重拨 circuit**（不重建 Swarm/不重 mDNS），
-  复用 swarm 级 `stream_control` 重开三路 stream，发 `DirectUpgraded{via_lan:false}`，`connected` 保持 true。
-  - `poll_swarm` 是 async fn（调用方循环驱动），内部**不能用 `continue`，用 `return`**。
-  - `stream_resolver.resolve()` 返回 `StreamProtocol`（**非 Copy**，包 `Bytes`），被 `open_stream` 消费后
-    不能在 println 复用 → 先算 `video_name: &str` 再 move。
-  - `reconnect()` 重建 Swarm 后必须 `relay_circuit_available = false`（旧备份失效）。
-- 固定设备 UDP 端口稳定 NAT：`device-cam.toml` 设 `udp_port = 48781`，
-  `scripts/run_device_cam.sh` 命令行模式传 `--udp-port 48781`（可用 `FIXED_UDP_PORT` 环境变量覆盖）。
-  目的：避免出口端口随机漂移导致 NAT 类型在 Full/Port-Restricted/Symmetric 间跳变。
+## 网络（国内）
+- rustup/cargo 用 `rsproxy.cn` 镜像（`~/.cargo/config.toml` 配 `rsproxy-sparse` + `git-fetch-with-cli = true`）。
+- vcpkg 克隆用 gitee 镜像 `https://gitee.com/mirrors/vcpkg`。
 
-## 网络（国内）：默认源不稳定，务必用镜像
-- rustup / cargo：用 `rsproxy.cn` 镜像。cargo 配置在 `C:\Users\song\.cargo\config.toml`
-  （`[source.crates-io] replace-with = "rsproxy-sparse"`，`registry = "sparse+https://rsproxy.cn/index/"`，`[net] git-fetch-with-cli = true`）。
-- rustup-init 下载：`https://rsproxy.cn/rustup/dist/x86_64-pc-windows-msvc/rustup-init.exe`（设 `RUSTUP_DIST_SERVER=https://rsproxy.cn`、`RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup`）。
-- vcpkg 克隆：用 gitee 镜像 `https://gitee.com/mirrors/vcpkg`，避免 github 失败。
+## QUIC 连接稳定性（重要踩坑）
+- **swarm idle timeout ≠ QUIC idle timeout**，是两层。`with_idle_connection_timeout` 只管「无活跃 stream 关连接」。
+- `.with_quic()` 默认 `max_idle_timeout=10s` / `keep_alive_interval=5s` → 丢 2 个探测包即断，症状 `I/O error: timed out` + 断开时长随机。
+- 调整需用 `.with_quic_config(|mut c| { c.max_idle_timeout = 30_000; ... c })`，且**三端（device-cam / viewer / relay-server）必须同步改**（生效值取协商较小者），relay 改完要重新部署。
+- 排查顺序：先 ping 排除链路 → 再看断开 `Cause:`。`timed out` + 随机时长 = idle timeout 误杀，不是丢包。
 
-## vcpkg on Windows 编译坑（关键）
-- vcpkg 的 `atl` 端口用 `find_path(... PATHS $ENV{INCLUDE})` 找 `atlbase.h`。VS Build Tools 默认**不装 ATL**，需额外用 VS 安装器补 `Microsoft.VisualStudio.Component.VC.ATL`（ATL 头文件装在 `VC\Tools\MSVC\<ver>\atlmfc\include\`，不是 `include\`）。这是 ffmpeg 的间接依赖，缺失会直接 `BUILD_FAILED`。
-- 补装 ATL 后，vcpkg 仍可能报 `Unable to locate 'atlbase.h'`：**必须在 `vcvars64.bat` 环境下运行 vcpkg**（`vcvars64` 才会把 `atlmfc\include` 加进 `INCLUDE` 环境变量）。普通 shell 的 `INCLUDE` 为空 → 失败。
-- 注意：`vcvars64.bat` 会把 `VCPKG_ROOT` 改成 VS 自带的 `...\VC\vcpkg`，与我们的 `E:\vcpkg` 冲突（vcpkg 会忽略并用自身目录，仅警告，无害）。脚本里最后用 `setx VCPKG_ROOT E:\vcpkg` 覆盖回去即可。
-- vcpkg install 会 re-exec 自身：父进程很快返回（打印 DONE），但子 vcpkg/cmake 进程在后台继续编译并持有 `vcpkg-running.lock`，属正常现象，勿重复启动（会报 lock busy）。
-- 机器上会有 **3 个 vcpkg 目录，别混**：① `E:\vcpkg` = 真正在用（装包、编译中，受 `VCPKG_ROOT` 用户变量指向）；② `C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\vcpkg` = VS 2022 自带 bundled 系统组件（vcvars 会把 `VCPKG_ROOT` 临时改成它），**勿删**；③ `C:\vcpkg` = 早期克隆的**冗余源码副本**（仅 19MB、有 `.git`、无 installed/buildtrees/packages、未被任何环境变量/脚本引用），可安全删除，留着也无害。
+## LAN 直连不稳 → 保留 relay 电路秒切（方案 A，已实现）
+- 多网卡/对称 NAT 下 LAN 直连约 50s 一断，但 relay 电路很稳。**不要**在 LAN 升级成功后关掉 relay 连接。
+- `mobile-core/src/viewer.rs`：LAN 升级后置 `relay_circuit_available = true`；`ConnectionClosed`(num_established==0) 时走 `fallback_to_relay()` —— 经现有 relay 重拨 circuit，不重建 Swarm、不重 mDNS，复用 swarm 级 `stream_control` 重开三路 stream，`connected` 保持 true。`reconnect()` 重建 Swarm 后须置 `relay_circuit_available = false`。
+- 代码细节：`poll_swarm` 是 async fn 被循环驱动，内部**用 `return` 不能用 `continue`**；`StreamProtocol` 非 Copy，被 `open_stream` 消费后不可复用。
+- 固定设备 UDP 端口稳定 NAT：`device-cam.toml` `udp_port = 48781`，`run_device_cam.sh` 传 `--udp-port`（`FIXED_UDP_PORT` 可覆盖）。
 
-## CodeBuddy 执行器注意事项（重要）
-- `execute_command` 对“可能耗时久”的命令会**自动跳过**（如 bootstrap、长编译），需要改用**脱离进程**后台跑。
-- ⚠️ 长时构建（如 vcpkg 编译 ffmpeg，30–60 分钟）的可靠方式：**`schtasks /Create /TN xxx /TR "路径\xxx.bat" /SC ONCE /ST 23:59 /IT /F` 然后 `schtasks /Run /TN xxx`**。
-  - 必须加 **`/IT`（交互式）**：否则任务在 headless 会话里运行，vcpkg/ffmpeg 等需要控制台的构建会立即死掉（拿不到 tty/console）。
-  - 交互式任务运行在**独立会话**，工具后续的 `execute_command` 诊断**不会**把它杀掉。
-  - 反例：`cmd /c start "" "xxx.bat"` 看似脱离，但每次发新的 `execute_command` 时工具会回收上一条命令的进程树，把正在编译的子进程连带杀死（本次 ffmpeg 屡次在查状态时死掉就是这个原因）。
-- `call vcvars64.bat >> %LOG%` 会把批处理后续 `echo >> %LOG%` 的句柄弄乱、导致后续回显丢失；vcvars 的输出应重定向到 `>nul 2>&1`，构建命令再单独 `>> %LOG% 2>&1`。
-- 管理员提权 `Start-Process -Verb RunAs` 的 UAC 弹窗在本工具里不可靠（可能不弹/超时），尽量把需要写系统盘(C:\)的操作改到用户可写的非系统盘（如 `E:\vcpkg`），普通权限即可，无需 UAC。
+## libp2p IPv6 不双栈（重要踩坑）
+- rust-libp2p 对 IPv6 监听 socket **强制 `set_only_v6(true)`**（`transports/tcp/src/lib.rs` + `transports/quic/src/transport.rs` 的 `create_socket`）。`/ip6/::` **不接受 IPv4-mapped 连接**，「IPv6 兼容 IPv4」在 libp2p **不成立**。
+- 官方设计（CHANGELOG PR 1555）：IPv4-mapped 地址无法干净表达为 multiaddr，会污染 identify/地址簿/relay 电路地址 → 要求「同时起两个 listener」。
+- 因此凡是要同时服务 v4/v6，必须**分别 listen_on `/ip4/0.0.0.0` 和 `/ip6/::`**，不能二选一。
+- `relay-server` 已按此修复：IPv4 恒定监听，`use_ipv6` 语义 = 「是否**额外**加 IPv6」；IPv6 监听失败只 warn 不退出。
+- relay 配置字段是 **`public_ips` 列表**（无旧 `public_ip` 单值兼容），自动按族生成 `/ip4` 或 `/ip6` 的 TCP+QUIC 外部地址；CLI `--public-ip` 可重复传。配 v6 必须同时 `use_ipv6 = true`，否则只通告不监听（已加 warn）。
 
-## 当前环境状态（2026-07-25 验证通过）
-- ✅ Rust 1.97.1（用户目录，已配 rsproxy 镜像）
-- ✅ VS Build Tools 2022（MSVC / cl.exe）
-- ✅ vcpkg 装在 `E:\vcpkg`，ffmpeg (8.1.2, libavcodec 62) / sdl2 / llvm 已安装完成
-- ✅ **Windows viewer 编译验证通过**（`media_viewer.exe` 20.9MB）
-- ✅ `LIBCLANG_PATH` 指向 `E:\vcpkg\installed\x64-windows\bin`（libclang.dll 在此目录）。
-- ✅ `build_viewer.ps1` 已修正 LIBCLANG_PATH 候选路径（优先查 `installed\<triplet>\bin`）。
+## 设备交互模型（app 与 viewer 对齐）
+- Android `MainActivity.kt`：点击=选中；长按=菜单(连接/断开/配置)；「删除」按钮删选中设备(带确认)。
+- Rust viewer `media_viewer.rs`：单击=选中（无双击连接）；右键菜单=连接/断开/配置（顺序须与 app 一致，`CtxMenuAct` 与 `draw_context_menu` items 顺序对应）。
+- 字段解耦：app `selectedDeviceId`(选中) / `currentDeviceId`(播放)；viewer `selected`(索引) / session(播放)。
 
-## libclang 加载失败（2026-08-03 踩坑，已修复）
-- 症状：`ffmpeg-sys-next` 的 build.rs（bindgen）报 `Unable to find libclang: ... libclang.dll could not be opened: LoadLibraryExW failed`（err=126）。
-- 根因：bindgen 用 `LoadLibraryExW(full_path_to_libclang.dll)` 加载 **不**会自动把 DLL 所在目录加入其**依赖**的搜索路径。`bin\libclang.dll` 运行期依赖同目录的 `LLVM-C.dll`/`z.dll`/`zstd.dll`，这些 DLL 默认不在进程 DLL 搜索路径里 → 整条链加载失败（err=126）。
-- 验证：PowerShell 里 `SetDllDirectory('E:\vcpkg\installed\x64-windows\bin')` 后 `LoadLibraryExW(libclang.dll)` 即成功。
-- 修复（已写入 `build_viewer.ps1`）：设置 `LIBCLANG_PATH` 后，把该目录**前置到 `PATH`**（`$env:PATH = "$LIBCLANG_PATH;$env:PATH"`），bindgen 即可解析依赖。`LLVM-C.dll` 自身的依赖（VCRUNTIME140/MSVCP140 等）在 `C:\Windows\System32` 正常。
-- 注意：不能只靠 `LIBCLANG_PATH`，**必须同时把该目录加进 PATH**，否则仍会 126。
-- ✅ `run_media_viewer.ps1` 已修正：自动添加 vcpkg DLL 目录到 PATH、自动查找 `viewer.toml`（p2p-camera/ → repo root）、移除旧 `--config` 处理避免重复
-- ✅ 已创建占位 `E:\vcpkg\installed\x64-windows\include\libavcodec\avfft.h`（FFmpeg 8.0 移除此头文件，但 ffmpeg-sys-next 仍引用它；占位为空文件即可让 bindgen 通过）
-- 辅助脚本：`p2p-camera/scripts/` 下 `install_rust_mirror.ps1`、`write_cargo_config.ps1`、`install_vcpkg.ps1`、`install_vcpkg_deps.ps1`、`run_deps.bat`、`_elevate_setup.ps1`、`_build_final.bat`
-
-## ffmpeg-next 版本匹配关键规则（2026-07-25 验证）
-- **vcpkg 默认安装最新 ffmpeg**（当前 FFmpeg 8.1.2, libavcodec 62），**不是** FFmpeg 6.x。
-- `ffmpeg-next` crate 版本号跟踪 FFmpeg 版本：`"6"` → FFmpeg 6.x，`"7"` → FFmpeg 7.x，`"8"` → FFmpeg 8.x。
-- `mobile-core/Cargo.toml` 中 `ffmpeg-next = { version = "8" }` 匹配当前 vcpkg 安装的 FFmpeg 8.1.2。
-- **版本不匹配会导致**：API 常量缺失（如 `AVFMT_ALLOW_FLUSH`、`AV_CODEC_CAP_SUBFRAMES`）、枚举变体不覆盖、大量编译错误。
-- 如果 vcpkg 版本变（如 vcpkg 更新 ffmpeg 到 9.x），需同步更新 `ffmpeg-next` 版本号。
-
-## p2p-camera 项目结构与 Workspace（2026-07-24 修正）
-- **`p2p-camera/Cargo.toml` 是独立的 Cargo workspace**（members: proto, mobile-core, device-cam, relay-server）。
-- 父级 `win-rust-libp2p/Cargo.toml` 是**另一个** workspace（libp2p 官方 crate），**不包含** p2p-camera 的 crate。
-- Cargo 不支持嵌套 workspace，所有构建命令**必须从 `p2p-camera/` 目录执行**，不能从 `win-rust-libp2p/` 根执行。
-- Viewer 不独立存在：是 `mobile-core` crate 的 example（`mobile-core/examples/media_viewer.rs`），编译命令 `cargo build --example media_viewer -p mobile-core --features player`。
-- path 依赖从 `p2p-camera/` 向上引用父 workspace 源码：`../libp2p`、`../protocols/stream`、`../swarm`。
-
-## 脚本潜在问题与修复（2026-07-24）
-- **`build_viewer.ps1` / `run_media_viewer.ps1` / `package_viewer.ps1` 的 `$ProjectRoot`** 原为 `..\..`（指向 `win-rust-libp2p/`），已修正为 `..`（指向 `p2p-camera/`），否则 cargo 找不到 mobile-core。
-- **`build_viewer.ps1`** 已新增：vcpkg lock 检查（防止后台安装冲突）、`E:\vcpkg` 候选路径、退出码修正、交叉编译 `--target` 仅在非 host 时传递。
-- **`package_viewer.ps1`** 已修正：vcpkg 候选路径、DLL 使用通配符（`avcodec-*.dll` 等）自动匹配版本，不再硬编码 soname。
-
-## 设备交互模型（2026-07-28 确立，app 与 viewer 对齐）
-- Android `MainActivity.kt`：**点击 = 选中**（高亮，不连接）；**长按 = 菜单（连接 / 断开 / 配置）**；**「删除」按钮 = 删选中设备（确认后真正删除）**。
-- Rust viewer `p2p-camera/mobile-core/examples/media_viewer.rs`：**单击 = 选中**（不连接，已取消双击连接）；**右键菜单 = 连接 / 断开 / 配置**（顺序与 app 一致）。
-  - `CtxMenuAct { Connect, Disconnect, Configure }`；`on_context_menu_click` 与 `draw_context_menu` 的 items 顺序必须一致（Connect 在最前）；「连接」复用 `UiAction::ConnectDevice`。
-  - `on_panel_click` 不再使用 `clicks` 参数；事件解构 `MouseButtonDown` 不再绑定 `clicks`。
-- 关键字段解耦：app `selectedDeviceId`（选中）/ `currentDeviceId`（当前播放）；viewer `selected`（选中索引）/ session（当前播放）。
-- app 删除有确认框（`showDeleteConfirm`）；viewer 删除是面板「- Del」按钮直接删选中（无确认，用户未要求改）。
+## CodeBuddy 执行器注意事项
+- `execute_command` 会自动跳过「可能耗时久」的命令；长时构建要用**独立会话**跑。
+- Windows 长时构建可靠方式：`schtasks /Create /TN xxx /TR "xxx.bat" /SC ONCE /ST 23:59 /IT /F` + `schtasks /Run`。**必须加 `/IT`**（否则无 tty 直接死）。
+- 反例：`cmd /c start "" xxx.bat` 会在下一条 `execute_command` 时被进程树回收杀掉。
+- 批处理里 `call vcvars64.bat` 的输出要 `>nul 2>&1`，否则弄乱后续日志重定向句柄。

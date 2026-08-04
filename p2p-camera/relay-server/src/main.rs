@@ -60,7 +60,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         use_ipv6: opt.use_ipv6,
         key_file: opt.key_file,
         port: opt.port,
-        public_ip: opt.public_ip,
+        public_ips: opt.public_ip,
     };
     config.apply_cli_overrides(&cli_overrides);
 
@@ -89,22 +89,52 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .build();
 
     // ---- 监听 ----
-    let tcp_addr = Multiaddr::empty()
-        .with(match config.use_ipv6 {
-            true => Protocol::from(Ipv6Addr::UNSPECIFIED),
-            false => Protocol::from(Ipv4Addr::UNSPECIFIED),
-        })
-        .with(Protocol::Tcp(config.port));
-    swarm.listen_on(tcp_addr.clone())?;
+    // 注意: rust-libp2p 对 IPv6 监听 socket 强制设置 IPV6_V6ONLY=true
+    // (transports/tcp/src/lib.rs 与 transports/quic/src/transport.rs 的 create_socket),
+    // 所以 /ip6/:: 不会像普通双栈 socket 那样接受 IPv4-mapped 连接。
+    // 官方做法是「同时起两个 listener」而不是依赖 IPv4-mapped IPv6。
+    // 因此 use_ipv6 = true 表示「额外启用 IPv6」, IPv4 始终监听, 保证 v4 客户端可连。
+    let mut listen_addrs: Vec<Multiaddr> = Vec::new();
 
-    let quic_addr = Multiaddr::empty()
-        .with(match config.use_ipv6 {
-            true => Protocol::from(Ipv6Addr::UNSPECIFIED),
-            false => Protocol::from(Ipv4Addr::UNSPECIFIED),
-        })
-        .with(Protocol::Udp(config.port))
-        .with(Protocol::QuicV1);
-    swarm.listen_on(quic_addr.clone())?;
+    // IPv4 始终监听 (TCP + QUIC)
+    listen_addrs.push(
+        Multiaddr::empty()
+            .with(Protocol::from(Ipv4Addr::UNSPECIFIED))
+            .with(Protocol::Tcp(config.port)),
+    );
+    listen_addrs.push(
+        Multiaddr::empty()
+            .with(Protocol::from(Ipv4Addr::UNSPECIFIED))
+            .with(Protocol::Udp(config.port))
+            .with(Protocol::QuicV1),
+    );
+
+    // IPv6 按需追加 (TCP + QUIC)
+    if config.use_ipv6 {
+        listen_addrs.push(
+            Multiaddr::empty()
+                .with(Protocol::from(Ipv6Addr::UNSPECIFIED))
+                .with(Protocol::Tcp(config.port)),
+        );
+        listen_addrs.push(
+            Multiaddr::empty()
+                .with(Protocol::from(Ipv6Addr::UNSPECIFIED))
+                .with(Protocol::Udp(config.port))
+                .with(Protocol::QuicV1),
+        );
+    }
+
+    for addr in &listen_addrs {
+        // IPv6 监听失败不应拖垮 IPv4 (例如宿主机/容器未启用 IPv6)
+        if let Err(e) = swarm.listen_on(addr.clone()) {
+            let is_v6 = addr.iter().any(|p| matches!(p, Protocol::Ip6(_)));
+            if is_v6 {
+                tracing::warn!("[Relay] Failed to listen on IPv6 {addr}: {e} (continuing with IPv4)");
+            } else {
+                return Err(format!("Failed to listen on {addr}: {e}").into());
+            }
+        }
+    }
 
     // ---- 注册表 (serial → peer_id 签名绑定) ----
     // 相机用私钥签名 (serial || peer_id) 后 REGISTER；viewer 用 serial QUERY 取回真实 peer_id。
@@ -125,42 +155,81 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!("╠══════════════════════════════════════════╣");
     println!("║ PeerId: {peer_id}");
     println!("║");
-    println!("║ TCP:  /ip4/<PUBLIC_IP>/tcp/{}/p2p/{peer_id}", config.port);
-    println!("║ QUIC: /ip4/<PUBLIC_IP>/udp/{}/quic-v1/p2p/{peer_id}", config.port);
+    // 客户端可直接复制的完整拨号地址; 未配 public_ips 时退化为占位符提示
+    if config.public_ips.is_empty() {
+        println!("║ TCP:  /ip4/<PUBLIC_IP>/tcp/{}/p2p/{peer_id}", config.port);
+        println!("║ QUIC: /ip4/<PUBLIC_IP>/udp/{}/quic-v1/p2p/{peer_id}", config.port);
+    } else {
+        for ip_str in &config.public_ips {
+            let proto = if ip_str.trim().parse::<std::net::IpAddr>().map(|i| i.is_ipv6()).unwrap_or(false) {
+                "ip6"
+            } else {
+                "ip4"
+            };
+            println!("║ TCP:  /{proto}/{}/tcp/{}/p2p/{peer_id}", ip_str.trim(), config.port);
+            println!("║ QUIC: /{proto}/{}/udp/{}/quic-v1/p2p/{peer_id}", ip_str.trim(), config.port);
+        }
+    }
     println!("║");
-    println!("║ Listening TCP:  {tcp_addr}");
-    println!("║ Listening QUIC: {quic_addr}");
+    for addr in &listen_addrs {
+        println!("║ Listening: {addr}");
+    }
     println!("╚══════════════════════════════════════════╝");
 
     // ---- 手动添加公网外部地址（若指定） ----
-    if let Some(ref ip_str) = config.public_ip {
-        let ip: std::net::IpAddr = ip_str.parse()
-            .map_err(|e| format!("Invalid public_ip '{}': {e}", ip_str))?;
-        if let std::net::IpAddr::V4(v4) = ip {
-            if v4.is_private() {
-                tracing::error!("[Relay] ERROR: public_ip {} is a private IP - must be a public IP", ip_str);
-                return Err("Public IP must not be a private address".into());
-            }
+    // public_ips 支持同时配置 IPv4 和 IPv6, 逐个解析并按地址族生成
+    // /ip4/... 或 /ip6/... 的 TCP + QUIC 外部地址。
+    if !config.public_ips.is_empty() {
+        let mut has_v6 = false;
+        for ip_str in &config.public_ips {
+            let ip: std::net::IpAddr = ip_str.trim().parse()
+                .map_err(|e| format!("Invalid public_ips entry '{}': {e}", ip_str))?;
+
+            // 按地址族分别做私网/非法地址校验, 并选出 multiaddr 的 ip 协议前缀
+            let proto = match ip {
+                std::net::IpAddr::V4(v4) => {
+                    if v4.is_private() || v4.is_loopback() || v4.is_link_local() || v4.is_unspecified() {
+                        tracing::error!(
+                            "[Relay] ERROR: public_ips entry {} is not a public IPv4 address", ip_str
+                        );
+                        return Err("public_ips must contain only public addresses".into());
+                    }
+                    "ip4"
+                }
+                std::net::IpAddr::V6(v6) => {
+                    // ULA(fc00::/7) / 链路本地(fe80::/10) / 回环 / 未指定 均非公网
+                    let seg = v6.segments();
+                    let is_ula = (seg[0] & 0xfe00) == 0xfc00;
+                    let is_link_local = (seg[0] & 0xffc0) == 0xfe80;
+                    if is_ula || is_link_local || v6.is_loopback() || v6.is_unspecified() {
+                        tracing::error!(
+                            "[Relay] ERROR: public_ips entry {} is not a public IPv6 address", ip_str
+                        );
+                        return Err("public_ips must contain only public addresses".into());
+                    }
+                    has_v6 = true;
+                    "ip6"
+                }
+            };
+
+            let ext_tcp: Multiaddr = format!("/{}/{}/tcp/{}", proto, ip, config.port).parse()
+                .map_err(|e| format!("Invalid external TCP address for {ip_str}: {e}"))?;
+            let ext_quic: Multiaddr = format!("/{}/{}/udp/{}/quic-v1", proto, ip, config.port).parse()
+                .map_err(|e| format!("Invalid external QUIC address for {ip_str}: {e}"))?;
+            swarm.add_external_address(ext_tcp.clone());
+            swarm.add_external_address(ext_quic.clone());
+            tracing::info!("[Relay] Added external addresses: {ext_tcp} , {ext_quic}");
         }
-        if ip.is_ipv4() {
-            let ext_tcp: Multiaddr = format!("/ip4/{}/tcp/{}", ip_str, config.port).parse()
-                .map_err(|e| format!("Invalid external TCP address: {e}"))?;
-            let ext_quic: Multiaddr = format!("/ip4/{}/udp/{}/quic-v1", ip_str, config.port).parse()
-                .map_err(|e| format!("Invalid external QUIC address: {e}"))?;
-            swarm.add_external_address(ext_tcp);
-            swarm.add_external_address(ext_quic);
-            tracing::info!("[Relay] Added external addresses for public IP: {}", ip_str);
-        } else {
-            let ext_tcp: Multiaddr = format!("/ip6/{}/tcp/{}", ip_str, config.port).parse()
-                .map_err(|e| format!("Invalid external TCP address: {e}"))?;
-            let ext_quic: Multiaddr = format!("/ip6/{}/udp/{}/quic-v1", ip_str, config.port).parse()
-                .map_err(|e| format!("Invalid external QUIC address: {e}"))?;
-            swarm.add_external_address(ext_tcp);
-            swarm.add_external_address(ext_quic);
-            tracing::info!("[Relay] Added external addresses for public IPv6: {}", ip_str);
+
+        // 配了公网 IPv6 却没开 IPv6 监听 → 通告的 v6 地址实际不可达
+        if has_v6 && !config.use_ipv6 {
+            tracing::warn!(
+                "[Relay] public_ips contains IPv6 but use_ipv6 = false; \
+                 the advertised IPv6 addresses are NOT listening. Set use_ipv6 = true."
+            );
         }
     } else {
-        tracing::warn!("[Relay] No public_ip specified, relay may advertise private IP via hostname -I");
+        tracing::warn!("[Relay] No public_ips specified, relay may advertise private IP via hostname -I");
     }
 
     // ---- 节点连接地址跟踪 ----
@@ -356,9 +425,10 @@ struct Opt {
     #[arg(long)]
     port: Option<u16>,
 
-    /// 公网 IP 地址 (覆盖配置文件)
-    #[arg(long)]
-    public_ip: Option<String>,
+    /// 公网 IP 地址, 支持 IPv4/IPv6, 可重复传多个 (覆盖配置文件的 public_ips)
+    /// 例: --public-ip 1.2.3.4 --public-ip 2408:8000::1
+    #[arg(long = "public-ip", value_name = "IP")]
+    public_ip: Vec<String>,
 }
 
 /// 从文件加载密钥，不存在则生成新密钥并保存

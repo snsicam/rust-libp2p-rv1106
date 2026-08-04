@@ -1,5 +1,9 @@
 
-use_ipv6 = false
+use_ipv6 = true
 key_file = "relay-server.key"
 port = 4001
-public_ip = "101.35.90.171"
+
+# 公网地址列表, 自动识别 IPv4 / IPv6 并分别通告 /ip4 或 /ip6 外部地址。
+# 填 IPv6 时需同时设置 use_ipv6 = true, 否则通告的 v6 地址不在监听。
+public_ips = ["124.221.175.240", "2402:4e00:c032:2400:3afc:b786:56a4:0"]
+

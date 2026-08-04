@@ -12,6 +12,7 @@
 #   ./run_relay.sh
 #   ./run_relay.sh --port 5001
 #   ./run_relay.sh --public-ip 1.2.3.4
+#   ./run_relay.sh --public-ip 1.2.3.4 --public-ip 2408:8000::1   # v4+v6 (需 use_ipv6=true)
 #
 # 日志: 输出到终端同时写入 scripts/logs/relay.log
 

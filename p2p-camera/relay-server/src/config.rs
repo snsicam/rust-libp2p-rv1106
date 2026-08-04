@@ -16,8 +16,11 @@ pub struct Config {
     pub key_file: PathBuf,
     #[serde(default = "default_port")]
     pub port: u16,
+    /// 公网地址列表, 支持同时填 IPv4 和 IPv6, 运行时自动识别族别并
+    /// 分别通告 `/ip4/...` 或 `/ip6/...` 外部地址。
+    /// 例: public_ips = ["101.35.90.171", "2408:8000::1"]
     #[serde(default)]
-    pub public_ip: Option<String>,
+    pub public_ips: Vec<String>,
 }
 
 fn default_key_file() -> PathBuf { PathBuf::from("relay-server.key") }
@@ -29,7 +32,7 @@ impl Default for Config {
             use_ipv6: false,
             key_file: default_key_file(),
             port: default_port(),
-            public_ip: None,
+            public_ips: Vec::new(),
         }
     }
 }
@@ -68,7 +71,8 @@ impl Config {
         if cli.use_ipv6 { self.use_ipv6 = true; }
         if let Some(ref key_file) = cli.key_file { self.key_file = key_file.clone(); }
         if let Some(port) = cli.port { self.port = port; }
-        if let Some(ref public_ip) = cli.public_ip { self.public_ip = Some(public_ip.clone()); }
+        // 命令行给了 --public-ip 就整体替换配置文件里的列表 (可重复传多个)
+        if !cli.public_ips.is_empty() { self.public_ips = cli.public_ips.clone(); }
     }
 }
 
@@ -78,5 +82,5 @@ pub struct CliOverrides {
     pub use_ipv6: bool,
     pub key_file: Option<PathBuf>,
     pub port: Option<u16>,
-    pub public_ip: Option<String>,
+    pub public_ips: Vec<String>,
 }
