@@ -17,3 +17,7 @@ pub const AUDIO_PROTOCOL: StreamProtocol = StreamProtocol::new("/p2p-camera/audi
 
 /// 控制通道协议: 双向 request/response (查询/设置编码参数、图像参数、系统参数等)
 pub const CONTROL_PROTOCOL: StreamProtocol = StreamProtocol::new("/p2p-camera/control/1.0.0");
+
+/// 文件下载协议: 设备将抓拍合成的视频(avi/mov)等大文件经独立 stream 分块回传给 viewer。
+/// 查询(ListSnapshots)走 CONTROL_PROTOCOL, 下载二进制走本协议, 避免污染 JSON 控制流。
+pub const FILE_PROTOCOL: StreamProtocol = StreamProtocol::new("/p2p-camera/file/1.0.0");

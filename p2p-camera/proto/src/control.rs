@@ -35,6 +35,14 @@ pub enum ControlRequest {
     },
     SystemReboot,
     FactoryReset,
+
+    // ---- 抓拍/延时摄影 ----
+    /// 查询已合成的视频文件列表(avi/mov, 走控制通道 JSON 返回)
+    ListSnapshots,
+    /// 下载指定视频文件(avi/mov): 控制通道先回 JSON 头(file_size), 再经 FILE_PROTOCOL 独立 stream 分块回传
+    DownloadFile {
+        name: String,
+    },
 }
 
 // ============================================================
@@ -53,6 +61,12 @@ pub struct ControlResponse {
     pub image_config: Option<ImageConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system_config: Option<SystemConfig>,
+    /// 已合成的视频文件列表(avi/mov, ListSnapshots 返回)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avi_files: Option<Vec<String>>,
+    /// 下载文件大小 (DownloadFile 响应头)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_size: Option<u64>,
 }
 
 impl ControlResponse {
@@ -63,6 +77,8 @@ impl ControlResponse {
             encoder_config: None,
             image_config: None,
             system_config: None,
+            avi_files: None,
+            file_size: None,
         }
     }
 
@@ -73,6 +89,8 @@ impl ControlResponse {
             encoder_config: None,
             image_config: None,
             system_config: None,
+            avi_files: None,
+            file_size: None,
         }
     }
 }

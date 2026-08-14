@@ -20,6 +20,8 @@
 #include <sys/ioctl.h>
 #include <sys/time.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <linux/fb.h>
 #include <linux/videodev2.h>
 
@@ -73,6 +75,14 @@ static void rk_video_set_from_ini(void);
 #define VPSS_CHN_MAIN       VPSS_CHN0
 #define VPSS_CHN_SUB        VPSS_CHN1
 #define VPSS_CHN_THIRD      VPSS_CHN2
+#define VPSS_CHN_SNAP       VPSS_CHN3   // 抓拍 JPEG 用, 空闲通道
+
+// 抓拍 JPEG 专用 VENC 通道 (独立于三路编码流)
+#define JPEG_VENC_CHN       3
+// 抓拍/合成文件根目录
+#define SNAP_DIR           "/userdata/snaps"
+// 合成临时 jpg 缓冲目录
+#define SNAP_TMP_DIR       "/userdata/snaps/.tmp"
 
 // ---- 全局状态 ----
 
@@ -100,6 +110,16 @@ static volatile int g_sys_init_count = 0;
 // 每个 encoder channel 的取流线程
 static pthread_t g_stream_threads[VENC_MAX_CHN];
 static volatile int g_chn_enabled[VENC_MAX_CHN] = {0, 0, 0};
+
+// ---- 抓拍 / 合成 (JPEG) 全局状态 ----
+static pthread_t g_snap_thread = 0;
+static volatile int g_snap_enabled = 0;      // JPEG VENC 通道已初始化
+static volatile int g_snap_requested = 0;    // rk_take_photo 触发标志
+static volatile int g_snap_done = 0;         // 抓拍线程完成一帧标志
+static pthread_mutex_t g_snap_path_lock = PTHREAD_MUTEX_INITIALIZER;
+static char g_last_snap_path[256] = {0};     // 最近一次抓拍的 jpg 路径
+static int g_snap_width = 1280;              // 抓拍分辨率 (默认, 由 init 设置)
+static int g_snap_height = 720;
 
 // 每通道的 encoder 参数配置
 typedef struct {
@@ -510,6 +530,284 @@ static int bind_vpss_to_venc(int vpss_chn, int venc_chn) {
     return RK_MPI_SYS_Bind(&stSrcChn, &stDestChn);
 }
 
+// ---- 抓拍 / 延时摄影 (JPEG) 实现 ----
+// 参考: media/samples/simple_test/simple_vi_bind_venc_jpeg.c
+// 单帧接收模式: RK_MPI_VENC_StartRecvFrame(chn,{s32RecvPicNum:1}) 触发抓一帧 JPEG。
+
+static int ensure_dir(const char *path) {
+    struct stat st;
+    if (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) return 0;
+    return mkdir(path, 0755);
+}
+
+// 创建 JPEG VENC 通道 (单帧接收) + 启用 VPSS_CHN3 + 绑定
+static int jpeg_venc_init(int width, int height) {
+    int ret;
+    VPSS_CHN_ATTR_S stChnAttr;
+    VENC_CHN_ATTR_S stAttr;
+    VENC_RECV_PIC_PARAM_S stRecvParam;
+
+    // 1. 启用 VPSS 抓拍输出通道 (空闲的 CHN3)
+    memset(&stChnAttr, 0, sizeof(stChnAttr));
+    stChnAttr.enChnMode = VPSS_CHN_MODE_AUTO;
+    stChnAttr.enDynamicRange = DYNAMIC_RANGE_SDR8;
+    stChnAttr.enPixelFormat = RK_FMT_YUV420SP;
+    stChnAttr.u32Width = width;
+    stChnAttr.u32Height = height;
+    stChnAttr.enCompressMode = COMPRESS_MODE_NONE;
+    ret = RK_MPI_VPSS_SetChnAttr(VPSS_GRP_ID, VPSS_CHN_SNAP, &stChnAttr);
+    if (ret != RK_SUCCESS) {
+        printf("[rk_camera] VPSS SetChnAttr[snap] failed: %x\n", ret);
+        return ret;
+    }
+    ret = RK_MPI_VPSS_EnableChn(VPSS_GRP_ID, VPSS_CHN_SNAP);
+    if (ret != RK_SUCCESS) {
+        printf("[rk_camera] VPSS EnableChn[snap] failed: %x\n", ret);
+        return ret;
+    }
+
+    // 2. 创建 JPEG VENC 通道 (单帧接收模式)
+    memset(&stAttr, 0, sizeof(stAttr));
+    stAttr.stVencAttr.enType = RK_VIDEO_ID_JPEG;
+    stAttr.stVencAttr.enPixelFormat = RK_FMT_YUV420SP;
+    stAttr.stVencAttr.u32PicWidth = width;
+    stAttr.stVencAttr.u32PicHeight = height;
+    stAttr.stVencAttr.u32VirWidth = width;
+    stAttr.stVencAttr.u32VirHeight = height;
+    stAttr.stVencAttr.u32StreamBufCnt = 2;
+    stAttr.stVencAttr.u32BufSize = width * height * 3 / 2;
+    stAttr.stVencAttr.enMirror = MIRROR_NONE;
+    stAttr.stVencAttr.stAttrJpege.bSupportDCF = RK_FALSE;
+    stAttr.stVencAttr.stAttrJpege.stMPFCfg.u8LargeThumbNailNum = 0;
+    stAttr.stVencAttr.stAttrJpege.enReceiveMode = VENC_PIC_RECEIVE_SINGLE;
+    ret = RK_MPI_VENC_CreateChn(JPEG_VENC_CHN, &stAttr);
+    if (ret != RK_SUCCESS) {
+        printf("[rk_camera] VENC CreateChn[snap JPEG] failed: %x\n", ret);
+        return ret;
+    }
+
+    // JPEG 质量
+    VENC_JPEG_PARAM_S stJpegParam;
+    memset(&stJpegParam, 0, sizeof(stJpegParam));
+    stJpegParam.u32Qfactor = 77;
+    RK_MPI_VENC_SetJpegParam(JPEG_VENC_CHN, &stJpegParam);
+
+    // 单帧接收模式 (StartRecvFrame 每次触发一帧)
+    memset(&stRecvParam, 0, sizeof(stRecvParam));
+    stRecvParam.s32RecvPicNum = -1;  // 持续接收, 但每次只抓 1 帧靠 StartRecvFrame
+    ret = RK_MPI_VENC_StartRecvFrame(JPEG_VENC_CHN, &stRecvParam);
+    if (ret != RK_SUCCESS) {
+        printf("[rk_camera] VENC StartRecvFrame[snap] failed: %x\n", ret);
+        return ret;
+    }
+
+    // 3. 绑定 VPSS_CHN3 → JPEG VENC
+    ret = bind_vpss_to_venc(VPSS_CHN_SNAP, JPEG_VENC_CHN);
+    if (ret != RK_SUCCESS) {
+        printf("[rk_camera] bind VPSS->VENC[snap] failed: %x\n", ret);
+        return ret;
+    }
+
+    g_snap_width = width;
+    g_snap_height = height;
+    g_snap_enabled = 1;
+    printf("[rk_camera] JPEG snap channel ready (VENC chn=%d, %dx%d)\n",
+           JPEG_VENC_CHN, width, height);
+    return 0;
+}
+
+// 抓拍线程: 阻塞取流, 抓到一帧写入 SNAP_DIR/snap_<ts>.jpg
+static void *jpeg_capture_thread(void *arg) {
+    (void)arg;
+    VENC_STREAM_S stFrame;
+    stFrame.pstPack = (VENC_PACK_S *)malloc(sizeof(VENC_PACK_S));
+
+    printf("[rk_camera] snap thread started\n");
+    while (!g_quit) {
+        int ret = RK_MPI_VENC_GetStream(JPEG_VENC_CHN, &stFrame, 500);
+        if (ret == RK_SUCCESS) {
+            // 仅当本次触发了抓拍才存盘
+            if (g_snap_requested) {
+                void *pData = RK_MPI_MB_Handle2VirAddr(stFrame.pstPack->pMbBlk);
+                uint32_t u32Len = stFrame.pstPack->u32Len;
+
+                struct timeval tv;
+                gettimeofday(&tv, NULL);
+                long long ms = (long long)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+
+                char path[256];
+                snprintf(path, sizeof(path), "%s/snap_%lld.jpg", SNAP_DIR, ms);
+
+                FILE *fp = fopen(path, "wb");
+                if (fp) {
+                    fwrite(pData, 1, u32Len, fp);
+                    fflush(fp);
+                    fclose(fp);
+                    pthread_mutex_lock(&g_snap_path_lock);
+                    snprintf(g_last_snap_path, sizeof(g_last_snap_path), "%s", path);
+                    pthread_mutex_unlock(&g_snap_path_lock);
+                    printf("[rk_camera] snap saved: %s (%u bytes)\n", path, u32Len);
+                } else {
+                    printf("[rk_camera] snap fopen failed: %s\n", path);
+                }
+                g_snap_requested = 0;
+                g_snap_done = 1;
+            }
+            RK_MPI_VENC_ReleaseStream(JPEG_VENC_CHN, &stFrame);
+        }
+    }
+    free(stFrame.pstPack);
+    return NULL;
+}
+
+// 外部接口: 抓一张 JPEG, 返回 malloc 的字符串 (绝对路径), 失败返回 NULL
+// 由 Rust 侧 free()
+char *rk_take_photo(void) {
+    if (!g_snap_enabled) {
+        printf("[rk_camera] rk_take_photo: snap channel not ready\n");
+        return NULL;
+    }
+    ensure_dir(SNAP_DIR);
+
+    VENC_RECV_PIC_PARAM_S stRecvParam;
+    memset(&stRecvParam, 0, sizeof(stRecvParam));
+    stRecvParam.s32RecvPicNum = 1;
+    if (RK_MPI_VENC_StartRecvFrame(JPEG_VENC_CHN, &stRecvParam) != RK_SUCCESS) {
+        printf("[rk_camera] rk_take_photo: StartRecvFrame failed\n");
+        return NULL;
+    }
+
+    g_snap_requested = 1;
+    g_snap_done = 0;
+
+    // 等待抓拍线程完成 (最多 2s)
+    for (int i = 0; i < 40 && !g_snap_done; i++) {
+        usleep(50 * 1000);
+    }
+    if (!g_snap_done) {
+        g_snap_requested = 0;
+        printf("[rk_camera] rk_take_photo: timeout\n");
+        return NULL;
+    }
+
+    pthread_mutex_lock(&g_snap_path_lock);
+    char *ret = strdup(g_last_snap_path);
+    pthread_mutex_unlock(&g_snap_path_lock);
+    return ret;
+}
+
+// 外部接口: 合成延时视频 (fps 帧率)
+// 优先使用 /userdata/snaps/*.jpg 中已有的抓拍帧 (loop/snapshot 已保存), 按文件名排序;
+//   若没有现成 JPG, 则退回「实时抓取 fps*2 张」模式 (旧行为, 默认 2 秒片段)。
+// 返回 malloc 的字符串 (mov 绝对路径), 失败返回 NULL, 由 Rust 侧 free()
+char *rk_compose_video(int fps) {
+    if (!g_snap_enabled) {
+        printf("[rk_camera] rk_compose_video: snap channel not ready\n");
+        return NULL;
+    }
+    if (fps <= 0) fps = 10;
+
+    ensure_dir(SNAP_DIR);
+    ensure_dir(SNAP_TMP_DIR);
+
+    // 清空临时目录旧文件
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd), "rm -f %s/frame_*.jpg", SNAP_TMP_DIR);
+    system(cmd);
+
+    // 统计 /userdata/snaps 下已有的 jpg (loop/snapshot 产出)
+    snprintf(cmd, sizeof(cmd),
+             "ls -1 '%s'/snap_*.jpg 2>/dev/null | sort | wc -l", SNAP_DIR);
+    FILE *pf = popen(cmd, "r");
+    int existing = 0;
+    if (pf) {
+        if (fscanf(pf, "%d", &existing) != 1) existing = 0;
+        pclose(pf);
+    }
+
+    int captured = 0;
+    if (existing >= 2) {
+        // 使用已有抓拍帧: 按文件名排序复制到 frame_%04d.jpg
+        printf("[rk_camera] compose: using %d existing snaps from %s\n", existing, SNAP_DIR);
+        snprintf(cmd, sizeof(cmd),
+                 "i=0; for f in $(ls -1 '%s'/snap_*.jpg | sort); do "
+                 "cp \"$f\" '%s'/frame_$(printf '%%04d' $i).jpg; i=$((i+1)); done; echo $i",
+                 SNAP_DIR, SNAP_TMP_DIR);
+        pf = popen(cmd, "r");
+        if (pf) {
+            if (fscanf(pf, "%d", &captured) != 1) captured = 0;
+            pclose(pf);
+        }
+    } else {
+        // 退回实时抓取模式
+        int frame_cnt = fps * 2;  // 默认 2 秒片段
+        if (frame_cnt < 2) frame_cnt = 2;
+        if (frame_cnt > 600) frame_cnt = 600;
+
+        printf("[rk_camera] compose: capturing %d frames @ %d fps (live)\n", frame_cnt, fps);
+
+        for (int i = 0; i < frame_cnt; i++) {
+            VENC_RECV_PIC_PARAM_S stRecvParam;
+            memset(&stRecvParam, 0, sizeof(stRecvParam));
+            stRecvParam.s32RecvPicNum = 1;
+            if (RK_MPI_VENC_StartRecvFrame(JPEG_VENC_CHN, &stRecvParam) != RK_SUCCESS) {
+                break;
+            }
+            g_snap_requested = 1;
+            g_snap_done = 0;
+            for (int t = 0; t < 40 && !g_snap_done; t++) {
+                usleep(50 * 1000);
+            }
+            if (!g_snap_done) {
+                g_snap_requested = 0;
+                break;
+            }
+            // 复制抓到的 jpg 到有序帧文件
+            pthread_mutex_lock(&g_snap_path_lock);
+            snprintf(cmd, sizeof(cmd),
+                     "cp '%s' %s/frame_%04d.jpg", g_last_snap_path, SNAP_TMP_DIR, captured);
+            pthread_mutex_unlock(&g_snap_path_lock);
+            system(cmd);
+            captured++;
+        }
+    }
+
+    if (captured < 2) {
+        printf("[rk_camera] compose: too few frames (%d)\n", captured);
+        return NULL;
+    }
+
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    long long ms = (long long)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+
+    char avi_path[256];
+    snprintf(avi_path, sizeof(avi_path), "%s/video_%lld.mov", SNAP_DIR, ms);
+
+    // ffmpeg: jpg 序列 → MJPEG MOV (零重编码, 兼容性优于 MJPEG-AVI)
+    snprintf(cmd, sizeof(cmd),
+             "ffmpeg -y -framerate %d -i %s/frame_%%04d.jpg -c:v mjpeg "
+             "-q:v 4 -pix_fmt yuv420p '%s' >/dev/null 2>&1",
+             fps, SNAP_TMP_DIR, avi_path);
+    int rc = system(cmd);
+    if (rc != 0) {
+        printf("[rk_camera] compose: ffmpeg failed (rc=%d)\n", rc);
+        return NULL;
+    }
+
+    // 清理临时帧
+    snprintf(cmd, sizeof(cmd), "rm -f %s/frame_*.jpg", SNAP_TMP_DIR);
+    system(cmd);
+
+    // 删除已被消费的原始抓拍帧, 避免下次 loop 累积旧帧
+    snprintf(cmd, sizeof(cmd), "rm -f '%s'/snap_*.jpg", SNAP_DIR);
+    system(cmd);
+
+    printf("[rk_camera] compose done: %s (%d frames, ~%.1fs @ %d fps)\n",
+           avi_path, captured, (double)captured / fps, fps);
+    return strdup(avi_path);
+}
+
 
 
 
@@ -824,6 +1122,24 @@ int rk_camera_init(int main_w, int main_h, int fps, int bitrate, int sensor_fps)
 
     // 从 INI 恢复上次持久化的 ISP 图像参数 (控制通道 set 时写入)
     rk_isp_set_from_ini(0);
+
+    // 6. 抓拍 JPEG 通道: 复用 VPSS_CHN3 (空闲输出) → VENC 通道 3
+    {
+        int snap_w = 1280, snap_h = 720;
+        // 抓拍分辨率取 third 通道或默认
+        if (g_chn_enabled[VENC_CHN_THIRD]) {
+            snap_w = g_chn_attr[VENC_CHN_THIRD].width;
+            snap_h = g_chn_attr[VENC_CHN_THIRD].height;
+        }
+        if (jpeg_venc_init(snap_w, snap_h) == 0) {
+            g_snap_thread = 0;
+            if (pthread_create(&g_snap_thread, NULL,
+                               jpeg_capture_thread, NULL) != 0) {
+                printf("[rk_camera] WARN: snap thread create failed\n");
+                g_snap_enabled = 0;
+            }
+        }
+    }
 
     g_initialized = 1;
     printf("[rk_camera] initialized, %d stream threads started%s\n",
@@ -1206,6 +1522,28 @@ void rk_camera_deinit() {
             dest.s32ChnId = i;
             RK_MPI_SYS_UnBind(&src, &dest);
         }
+    }
+
+    // 停止抓拍 JPEG 通道 (独立于三路编码流)
+    if (g_snap_enabled) {
+        if (g_snap_thread) {
+            pthread_join(g_snap_thread, NULL);
+            g_snap_thread = 0;
+        }
+        {
+            MPP_CHN_S src, dest;
+            src.enModId = RK_ID_VPSS;
+            src.s32DevId = VPSS_GRP_ID;
+            src.s32ChnId = VPSS_CHN_SNAP;
+            dest.enModId = RK_ID_VENC;
+            dest.s32DevId = 0;
+            dest.s32ChnId = JPEG_VENC_CHN;
+            RK_MPI_SYS_UnBind(&src, &dest);
+        }
+        RK_MPI_VENC_StopRecvFrame(JPEG_VENC_CHN);
+        RK_MPI_VENC_DestroyChn(JPEG_VENC_CHN);
+        RK_MPI_VPSS_DisableChn(VPSS_GRP_ID, VPSS_CHN_SNAP);
+        g_snap_enabled = 0;
     }
 
     {

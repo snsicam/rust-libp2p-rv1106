@@ -15,6 +15,10 @@
 - **ffmpeg-next 版本号必须匹配 vcpkg 的 ffmpeg 主版本**（当前 FFmpeg 8.1.2 → `ffmpeg-next = "8"`）。不匹配会有大量 API 缺失编译错误。
 - vcpkg 坑：必须在 `vcvars64.bat` 环境下运行（否则找不到 `atlbase.h`）；vcpkg install 会 re-exec，父进程早退属正常；机器上有 3 个 vcpkg 目录，实际使用 `E:\vcpkg`。
 
+## 文件下行流 (FILE_PROTOCOL = /p2p-camera/file/1.0.0) 约定
+- 抓拍 AVI 下载采用「**device-cam 主动推 / viewer 接收**」模式：device-cam `control_handler.rs::download_file` 收到控制请求后 `open_stream(FILE_PROTOCOL)` 出站推数据；viewer 端必须用 `stream_control.accept(FILE_PROTOCOL)` 注册入站监听（先 accept 再发控制请求），再用 `incoming.next()` 取流，**严禁** viewer 端 `open_stream` FILE 协议（否则报 `remote peer does not support`）。
+- `Control::accept` 返回 `IncomingStreams`（futures::Stream, yield `(PeerId, Stream)`），见 `protocols/stream/src/control.rs`。
+
 ## 网络（国内）
 - rustup/cargo 用 `rsproxy.cn` 镜像（`~/.cargo/config.toml` 配 `rsproxy-sparse` + `git-fetch-with-cli = true`）。
 - vcpkg 克隆用 gitee 镜像 `https://gitee.com/mirrors/vcpkg`。

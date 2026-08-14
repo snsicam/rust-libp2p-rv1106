@@ -640,6 +640,10 @@ extern "C" {
     fn rk_system_reboot() -> std::ffi::c_int;
     fn rk_system_factory_reset() -> std::ffi::c_int;
 
+    // 抓拍 / 延时摄影 (JPEG 抓拍 + ffmpeg 合成 MOV(MJPEG 零重编码), 参考 rkipc rv1106 video.c)
+    fn rk_take_photo() -> *mut std::ffi::c_char; // 返回 jpg 绝对路径 (malloc), 失败返回 NULL
+    fn rk_compose_video(fps: std::ffi::c_int) -> *mut std::ffi::c_char; // 返回 video_*.mov 文件名 (malloc), 失败返回 NULL
+
     // 编码参数热更新 (运行时改参, 对标 rkipc video.c)
     fn rk_camera_update_chn_config(
         chn_id: std::ffi::c_int,
@@ -977,7 +981,40 @@ pub fn factory_reset() -> anyhow::Result<()> {
             return Err(anyhow::anyhow!("rk_system_factory_reset failed: {ret}"));
         }
     }
+
     Ok(())
+}
+
+/// 抓拍一张 JPG 到 /userdata/snaps/, 返回生成的 jpg 绝对路径
+pub fn take_snapshot() -> anyhow::Result<String> {
+    unsafe extern "C" {
+        fn free(ptr: *mut std::ffi::c_void);
+    }
+    unsafe {
+        let ptr = rk_take_photo();
+        if ptr.is_null() {
+            return Err(anyhow::anyhow!("rk_take_photo failed"));
+        }
+        let path = std::ffi::CStr::from_ptr(ptr).to_string_lossy().into_owned();
+        free(ptr as *mut std::ffi::c_void);
+        Ok(path)
+    }
+}
+
+/// 用 ffmpeg 把 /userdata/snaps/*.jpg 合成 AVI, 返回生成文件名
+pub fn compose_video(fps: u32) -> anyhow::Result<String> {
+    unsafe extern "C" {
+        fn free(ptr: *mut std::ffi::c_void);
+    }
+    unsafe {
+        let ptr = rk_compose_video(fps as i32);
+        if ptr.is_null() {
+            return Err(anyhow::anyhow!("rk_compose_video failed"));
+        }
+        let name = std::ffi::CStr::from_ptr(ptr).to_string_lossy().into_owned();
+        free(ptr as *mut std::ffi::c_void);
+        Ok(name)
+    }
 }
 
 // ---- INI 参数读写辅助 ----

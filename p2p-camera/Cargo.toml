@@ -5,6 +5,7 @@ members = [
     "mobile-core",
     "device-cam",
     "relay-server",
+    "cam-test",
 ]
 
 [workspace.dependencies]

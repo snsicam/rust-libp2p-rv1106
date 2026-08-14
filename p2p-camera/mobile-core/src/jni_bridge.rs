@@ -60,6 +60,16 @@ enum Cmd {
         request_json: String,
         response_tx: Sender<String>,
     },
+    /// 查询设备已合成视频文件列表(avi/mov), 回传 JSON: {"ok":true,"files":["a.mov",...]} 或 {"ok":false,"error":...}
+    ListSnapshots {
+        response_tx: Sender<String>,
+    },
+    /// 下载指定 AVI 到本地目录, 回传 JSON: {"ok":true,"size":123} 或 {"ok":false,"error":...}
+    DownloadFile {
+        name: String,
+        dest_dir: String,
+        response_tx: Sender<String>,
+    },
 }
 
 // ── ViewerHandle ──
@@ -156,108 +166,71 @@ pub extern "system" fn Java_com_p2pcamera_mediaplayer_RustBridge_nativeCreate(
             // 创建 viewer（是否启用 DCUtR 取决于网络类型：4G/CGNAT 下禁用）
             let mut viewer;
 
-            // 等待连接命令
+            // 等待连接命令 (循环直到收到 Connect, 期间其他命令回传错误)
             let device_id;
             let network_type;
-            match cmd_rx.recv() {
-                Ok(Cmd::Connect { relays, device_id: did, enable_mdns, serial_map, stream_type, no_audio, network_type: nt }) => {
-                    device_id = did.clone();
-                    network_type = nt;
-                    // 默认启用 DCUtR 打洞：锥形/EIM NAT（含多数 4G）可打洞成功，省中继带宽。
-                    // 仅当连接后 net_diag 确认为 Symmetric NAT 时，才在重连时禁用
-                    // （viewer.rs 会重建 Swarm 并去掉 dcutr 行为），避免每次重连都无效打洞 ~17s。
-                    let enable_dcutr = true;
-                    println!("[Viewer] DCUtR enabled (network_type={}, will auto-disable on reconnect if Symmetric NAT detected)", network_type);
-                    viewer = match MediaPlayer::new(enable_dcutr).await {
-                        Ok(v) => v,
-                        Err(e) => {
-                            let _ = event_tx.send(ViewerEvent::Error {
-                                message: format!("create viewer: {e}"),
-                            });
-                            return;
+            'outer: loop {
+                match cmd_rx.recv() {
+                    Ok(Cmd::Connect { relays, device_id: did, enable_mdns, serial_map, stream_type, no_audio, network_type: nt }) => {
+                        device_id = did.clone();
+                        network_type = nt;
+                        // 默认启用 DCUtR 打洞：锥形/EIM NAT（含多数 4G）可打洞成功，省中继带宽。
+                        // 仅当连接后 net_diag 确认为 Symmetric NAT 时，才在重连时禁用
+                        // （viewer.rs 会重建 Swarm 并去掉 dcutr 行为），避免每次重连都无效打洞 ~17s。
+                        let enable_dcutr = true;
+                        println!("[Viewer] DCUtR enabled (network_type={}, will auto-disable on reconnect if Symmetric NAT detected)", network_type);
+                        viewer = match MediaPlayer::new(enable_dcutr).await {
+                            Ok(v) => v,
+                            Err(e) => {
+                                let _ = event_tx.send(ViewerEvent::Error {
+                                    message: format!("create viewer: {e}"),
+                                });
+                                return;
+                            }
+                        };
+                        let _ = event_tx.send(ViewerEvent::Connecting);
+                        let relay_strs: Vec<String> = relays.clone();
+                        match viewer
+                            .connect(&relay_strs, &did, enable_mdns, &serial_map, &stream_type)
+                            .await
+                        {
+                            Ok(()) => {
+                                let _ = event_tx.send(ViewerEvent::Connected {
+                                    peer_id: did,
+                                    connection_type: "relay".into(),
+                                });
+                                let _ = event_tx.send(ViewerEvent::StreamReady);
+                            }
+                            Err(e) => {
+                                let _ = event_tx.send(ViewerEvent::Error {
+                                    message: format!("connect failed: {e}"),
+                                });
+                                return;
+                            }
                         }
-                    };
-                    let _ = event_tx.send(ViewerEvent::Connecting);
-                    let relay_strs: Vec<String> = relays.clone();
-                    match viewer
-                        .connect(&relay_strs, &did, enable_mdns, &serial_map, &stream_type)
-                        .await
-                    {
-                        Ok(()) => {
-                            let _ = event_tx.send(ViewerEvent::Connected {
-                                peer_id: did,
-                                connection_type: "relay".into(),
-                            });
-                            let _ = event_tx.send(ViewerEvent::StreamReady);
-                        }
-                        Err(e) => {
-                            let _ = event_tx.send(ViewerEvent::Error {
-                                message: format!("connect failed: {e}"),
-                            });
-                            return;
-                        }
-                    }
 
-                    // 如果 no_audio，关闭音频发送端（Android 侧 pollAudioFrame 将返回 null）
-                    if no_audio {
-                        drop(audio_tx.take());
-                    }
-                }
-                Ok(Cmd::Control { response_tx, .. }) => {
-                    // 控制命令在连接前到达，返回错误并继续等待 Connect
-                    let err_resp = proto::control::ControlResponse::err("not connected");
-                    let _ = response_tx.send(serde_json::to_string(&err_resp).unwrap_or_default());
-                    // 继续等待 Connect 命令
-                    loop {
-                        match cmd_rx.recv() {
-                            Ok(Cmd::Connect { relays, device_id: did, enable_mdns, serial_map, stream_type, no_audio, network_type: nt }) => {
-                                device_id = did.clone();
-                                network_type = nt;
-                                let enable_dcutr = true;
-                                println!("[Viewer] DCUtR enabled (network_type={}, will auto-disable on reconnect if Symmetric NAT detected)", network_type);
-                                viewer = match MediaPlayer::new(enable_dcutr).await {
-                                    Ok(v) => v,
-                                    Err(e) => {
-                                        let _ = event_tx.send(ViewerEvent::Error {
-                                            message: format!("create viewer: {e}"),
-                                        });
-                                        return;
-                                    }
-                                };
-                                let _ = event_tx.send(ViewerEvent::Connecting);
-                                let relay_strs: Vec<String> = relays.clone();
-                                match viewer
-                                    .connect(&relay_strs, &did, enable_mdns, &serial_map, &stream_type)
-                                    .await
-                                {
-                                    Ok(()) => {
-                                        let _ = event_tx.send(ViewerEvent::Connected {
-                                            peer_id: did,
-                                            connection_type: "relay".into(),
-                                        });
-                                        let _ = event_tx.send(ViewerEvent::StreamReady);
-                                    }
-                                    Err(e) => {
-                                        let _ = event_tx.send(ViewerEvent::Error {
-                                            message: format!("connect failed: {e}"),
-                                        });
-                                        return;
-                                    }
-                                }
-                                if no_audio {
-                                    drop(audio_tx.take());
-                                }
-                                break;
-                            }
-                            Ok(Cmd::Control { response_tx, .. }) => {
-                                let err_resp = proto::control::ControlResponse::err("not connected");
-                                let _ = response_tx.send(serde_json::to_string(&err_resp).unwrap_or_default());
-                            }
-                            Err(_) => return,
+                        // 如果 no_audio，关闭音频发送端（Android 侧 pollAudioFrame 将返回 null）
+                        if no_audio {
+                            drop(audio_tx.take());
                         }
+                        break 'outer;
                     }
+                    Ok(Cmd::Control { response_tx, .. }) => {
+                        // 连接前到达，返回错误并继续等待 Connect
+                        let err_resp = proto::control::ControlResponse::err("not connected");
+                        let _ = response_tx.send(serde_json::to_string(&err_resp).unwrap_or_default());
+                        continue 'outer;
+                    }
+                    Ok(Cmd::ListSnapshots { response_tx }) => {
+                        let _ = response_tx.send(r#"{"ok":false,"error":"not connected"}"#.to_string());
+                        continue 'outer;
+                    }
+                    Ok(Cmd::DownloadFile { response_tx, .. }) => {
+                        let _ = response_tx.send(r#"{"ok":false,"error":"not connected"}"#.to_string());
+                        continue 'outer;
+                    }
+                    Err(_) => return, // channel closed
                 }
-                Err(_) => return, // channel closed
             }
 
             // 主事件循环: 驱动 swarm + 轮询帧 + 检测断连 + 自动重连 + 处理控制命令
@@ -316,6 +289,47 @@ pub extern "system" fn Java_com_p2pcamera_mediaplayer_RustBridge_nativeCreate(
                                 }
                                 Cmd::Connect { .. } => {
                                     // Connect 命令已在循环前处理，忽略
+                                }
+                                Cmd::ListSnapshots { response_tx } => {
+                                    let resp = match viewer.list_snapshots().await {
+                                        Ok(files) => {
+                                            let json = serde_json::json!({
+                                                "ok": true,
+                                                "files": files,
+                                            });
+                                            json.to_string()
+                                        }
+                                        Err(e) => {
+                                            let json = serde_json::json!({
+                                                "ok": false,
+                                                "error": e.to_string(),
+                                            });
+                                            json.to_string()
+                                        }
+                                    };
+                                    let _ = response_tx.send(resp);
+                                }
+                                Cmd::DownloadFile { name, dest_dir, response_tx } => {
+                                    // dest_dir 拼文件名 -> save_path
+                                    let save_path = std::path::Path::new(&dest_dir).join(&name);
+                                    let resp = match viewer.download_file(&name, &save_path).await {
+                                        Ok(size) => {
+                                            let json = serde_json::json!({
+                                                "ok": true,
+                                                "size": size,
+                                                "path": save_path.to_string_lossy().to_string(),
+                                            });
+                                            json.to_string()
+                                        }
+                                        Err(e) => {
+                                            let json = serde_json::json!({
+                                                "ok": false,
+                                                "error": e.to_string(),
+                                            });
+                                            json.to_string()
+                                        }
+                                    };
+                                    let _ = response_tx.send(resp);
                                 }
                             }
                         }
@@ -745,8 +759,136 @@ pub extern "system" fn Java_com_p2pcamera_mediaplayer_RustBridge_nativeSendContr
         }
         Err(_) => {
             let err = proto::control::ControlResponse::err("control command timeout");
-            json_response(&mut env, &err)
+            return json_response(&mut env, &err);
         }
+    }
+}
+
+/// 查询已合成 AVI 文件列表
+///
+/// Kotlin: external fun nativeListSnapshots(handle: Long): String
+/// 返回 JSON: {"ok":true,"files":["a.mov",...]} 或 {"ok":false,"error":...}
+/// 同步阻塞 (最长 5s), 调用方须在后台线程执行
+#[no_mangle]
+pub extern "system" fn Java_com_p2pcamera_mediaplayer_RustBridge_nativeListSnapshots(
+    env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jstring {
+    let idx = match handle_to_idx(handle) {
+        Some(i) => i,
+        None => {
+            return env
+                .new_string(r#"{"ok":false,"error":"invalid handle"}"#)
+                .map(|s| s.into_raw())
+                .unwrap_or(std::ptr::null_mut());
+        }
+    };
+
+    let (response_tx, response_rx) = bounded::<String>(1);
+    let sent = with_handles(|handles| {
+        handles
+            .get(idx)
+            .and_then(|h| h.as_ref())
+            .map(|h| h.cmd_tx.send(Cmd::ListSnapshots { response_tx: response_tx.clone() }).is_ok())
+            .unwrap_or(false)
+    });
+
+    if !sent {
+        return env
+            .new_string(r#"{"ok":false,"error":"not connected"}"#)
+            .map(|s| s.into_raw())
+            .unwrap_or(std::ptr::null_mut());
+    }
+
+    match response_rx.recv_timeout(std::time::Duration::from_secs(5)) {
+        Ok(resp_json) => env
+            .new_string(&resp_json)
+            .map(|s| s.into_raw())
+            .unwrap_or(std::ptr::null_mut()),
+        Err(_) => env
+            .new_string(r#"{"ok":false,"error":"list snapshots timeout"}"#)
+            .map(|s| s.into_raw())
+            .unwrap_or(std::ptr::null_mut()),
+    }
+}
+
+/// 下载指定 AVI 文件到本地目录
+///
+/// Kotlin: external fun nativeDownloadFile(handle: Long, name: String, destDir: String): String
+/// 返回 JSON: {"ok":true,"size":123,"path":"..."} 或 {"ok":false,"error":...}
+/// 同步阻塞 (最长 60s, 文件较大), 调用方须在后台线程执行
+#[no_mangle]
+pub extern "system" fn Java_com_p2pcamera_mediaplayer_RustBridge_nativeDownloadFile(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    name: JString,
+    dest_dir: JString,
+) -> jstring {
+    let idx = match handle_to_idx(handle) {
+        Some(i) => i,
+        None => {
+            return env
+                .new_string(r#"{"ok":false,"error":"invalid handle"}"#)
+                .map(|s| s.into_raw())
+                .unwrap_or(std::ptr::null_mut());
+        }
+    };
+
+    let name_str: String = match env.get_string(&name) {
+        Ok(s) => s.into(),
+        Err(_) => {
+            return env
+                .new_string(r#"{"ok":false,"error":"invalid name"}"#)
+                .map(|s| s.into_raw())
+                .unwrap_or(std::ptr::null_mut());
+        }
+    };
+    let dir_str: String = match env.get_string(&dest_dir) {
+        Ok(s) => s.into(),
+        Err(_) => {
+            return env
+                .new_string(r#"{"ok":false,"error":"invalid destDir"}"#)
+                .map(|s| s.into_raw())
+                .unwrap_or(std::ptr::null_mut());
+        }
+    };
+
+    let (response_tx, response_rx) = bounded::<String>(1);
+    let sent = with_handles(|handles| {
+        handles
+            .get(idx)
+            .and_then(|h| h.as_ref())
+            .map(|h| {
+                h.cmd_tx
+                    .send(Cmd::DownloadFile {
+                        name: name_str,
+                        dest_dir: dir_str,
+                        response_tx: response_tx.clone(),
+                    })
+                    .is_ok()
+            })
+            .unwrap_or(false)
+    });
+
+    if !sent {
+        return env
+            .new_string(r#"{"ok":false,"error":"not connected"}"#)
+            .map(|s| s.into_raw())
+            .unwrap_or(std::ptr::null_mut());
+    }
+
+    // 下载可能较久, 放宽超时到 60s
+    match response_rx.recv_timeout(std::time::Duration::from_secs(60)) {
+        Ok(resp_json) => env
+            .new_string(&resp_json)
+            .map(|s| s.into_raw())
+            .unwrap_or(std::ptr::null_mut()),
+        Err(_) => env
+            .new_string(r#"{"ok":false,"error":"download timeout"}"#)
+            .map(|s| s.into_raw())
+            .unwrap_or(std::ptr::null_mut()),
     }
 }
 

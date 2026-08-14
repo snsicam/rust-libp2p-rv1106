@@ -402,7 +402,7 @@ impl Config {
         if path.exists() {
             let content = std::fs::read_to_string(path)
                 .map_err(|e| anyhow::anyhow!("Failed to read config file {}: {e}", path.display()))?;
-            let mut config: Config = toml::from_str(&content)
+            let config: Config = toml::from_str(&content)
                 .map_err(|e| anyhow::anyhow!("Failed to parse config file {}: {e}", path.display()))?;
             println!("[DeviceCam] Loaded config from {}", path.display());
             Ok(config)

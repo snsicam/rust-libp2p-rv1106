@@ -5,14 +5,23 @@
 
 use anyhow::Result;
 use libp2p::PeerId;
+use libp2p_stream::Control;
 use proto::control::{
     ControlRequest, ControlResponse, EncoderConfig, ImageConfig, SystemConfigSet,
     read_frame, write_frame,
 };
 use tracing;
+use std::sync::Arc;
 
 /// 处理一条控制流的生命周期
-pub async fn handle_control_stream(peer_id: PeerId, mut stream: libp2p::swarm::Stream) {
+///
+/// `stream_control` 用于 DownloadFile: 收到下载请求后, 经独立 FILE_PROTOCOL
+/// 打开新 stream 把 AVI 二进制分块回传给 viewer (与控制 JSON 流隔离)。
+pub async fn handle_control_stream(
+    peer_id: PeerId,
+    mut stream: libp2p::swarm::Stream,
+    stream_control: Arc<Control>,
+) {
     tracing::info!("[ControlHandler] Handling control stream from {peer_id}");
 
     loop {
@@ -40,7 +49,7 @@ pub async fn handle_control_stream(peer_id: PeerId, mut stream: libp2p::swarm::S
         tracing::debug!("[ControlHandler] Request from {peer_id}: {:?}", req);
 
         // 处理请求
-        let resp = handle_request(req).await;
+        let resp = handle_request(req, &peer_id, &stream_control).await;
 
         // 发送响应
         if let Err(e) = send_response(&mut stream, &resp).await {
@@ -53,7 +62,11 @@ pub async fn handle_control_stream(peer_id: PeerId, mut stream: libp2p::swarm::S
 }
 
 /// 分发控制请求到对应的处理函数
-async fn handle_request(req: ControlRequest) -> ControlResponse {
+async fn handle_request(
+    req: ControlRequest,
+    peer_id: &PeerId,
+    stream_control: &Arc<Control>,
+) -> ControlResponse {
     match req {
         // ---- 编码参数 ----
         ControlRequest::GetEncoderConfig { stream } => get_encoder_config(&stream),
@@ -68,6 +81,12 @@ async fn handle_request(req: ControlRequest) -> ControlResponse {
         ControlRequest::SetSystemConfig { config } => set_system_config(&config),
         ControlRequest::SystemReboot => system_reboot(),
         ControlRequest::FactoryReset => factory_reset(),
+
+        // ---- 抓拍 / 延时摄影 ----
+        ControlRequest::ListSnapshots => list_snapshots(),
+        ControlRequest::DownloadFile { name } => {
+            download_file(&name, peer_id, (**stream_control).clone()).await
+        }
     }
 }
 
@@ -118,6 +137,8 @@ fn get_encoder_config(stream: &str) -> ControlResponse {
                     encoder_config: Some(config),
                     image_config: None,
                     system_config: None,
+                    avi_files: None,
+                    file_size: None,
                 }
             }
             None => ControlResponse::err("stream not enabled"),
@@ -235,6 +256,8 @@ fn get_image_config(cam_id: u32) -> ControlResponse {
                 encoder_config: None,
                 image_config: Some(config),
                 system_config: None,
+                avi_files: None,
+                file_size: None,
             },
             None => ControlResponse::err("cam_id not available"),
         }
@@ -277,6 +300,8 @@ fn get_system_config() -> ControlResponse {
                 encoder_config: None,
                 image_config: None,
                 system_config: Some(config),
+                avi_files: None,
+                file_size: None,
             },
             None => ControlResponse::err("failed to read system config"),
         }
@@ -332,4 +357,129 @@ fn factory_reset() -> ControlResponse {
     {
         ControlResponse::err("not available on this platform")
     }
+}
+
+// ============================================================
+// 抓拍 / 延时摄影
+// ============================================================
+
+/// 查询已合成的视频文件列表 (avi/mov, 走控制通道 JSON 返回)
+fn list_snapshots() -> ControlResponse {
+    use std::fs;
+    const SNAP_DIR: &str = "/userdata/snaps";
+
+    let mut files = Vec::new();
+    if let Ok(entries) = fs::read_dir(SNAP_DIR) {
+        for e in entries.flatten() {
+            let path = e.path();
+            let is_video = matches!(
+                path.extension().and_then(|s| s.to_str()),
+                Some("avi") | Some("mov")
+            );
+            if is_video {
+                if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
+                    files.push(name.to_string());
+                }
+            }
+        }
+    }
+    files.sort();
+    let mut resp = ControlResponse::ok();
+    resp.avi_files = Some(files);
+    resp
+}
+
+/// 下载指定 AVI 文件: 经独立 FILE_PROTOCOL stream 分块回传
+///
+/// 控制流已回 JSON 头(file_size, 在返回前由调用方发出), 这里只负责把文件经
+/// 新 stream 写出去。路径白名单: 只允许 /userdata/snaps/ 下的 .avi/.mov, 禁止目录穿越。
+async fn download_file(
+    name: &str,
+    peer_id: &PeerId,
+    mut stream_control: Control,
+) -> ControlResponse {
+    tracing::info!(
+        "[ControlHandler] download_file enter: name={name} peer={peer_id}"
+    );
+    if !(name.ends_with(".avi") || name.ends_with(".mov"))
+        || name.contains('/')
+        || name.contains("..")
+    {
+        tracing::warn!("[ControlHandler] download {name} rejected: invalid file name");
+        return ControlResponse::err("invalid file name");
+    }
+    let path = format!("/userdata/snaps/{name}");
+
+    let meta = match std::fs::metadata(&path) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!("[ControlHandler] download {name} failed: file not found: {e}");
+            return ControlResponse::err(&format!("file not found: {e}"));
+        }
+    };
+    let size = meta.len();
+    tracing::info!("[ControlHandler] download {name}: file size = {size} bytes");
+
+    let mut new_stream = match stream_control
+        .open_stream(*peer_id, proto::stream_protocols::FILE_PROTOCOL)
+        .await
+    {
+        Ok(s) => {
+            tracing::info!(
+                "[ControlHandler] download {name}: opened FILE stream to {peer_id}"
+            );
+            s
+        }
+        Err(e) => {
+            tracing::warn!(
+                "[ControlHandler] download {name} failed: open file stream failed: {e}"
+            );
+            return ControlResponse::err(&format!("open file stream failed: {e}"));
+        }
+    };
+
+    let mut file_stream = match tokio::fs::File::open(&path).await {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!("[ControlHandler] download {name} failed: open file failed: {e}");
+            return ControlResponse::err(&format!("open file failed: {e}"));
+        }
+    };
+
+    use tokio::io::AsyncReadExt;
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut total = 0u64;
+    let mut chunks = 0u64;
+    loop {
+        match file_stream.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => {
+                if let Err(e) = proto::control::write_frame(&mut new_stream, &buf[..n]).await {
+                    tracing::warn!("[ControlHandler] download {name} failed: file stream write failed: {e}");
+                    return ControlResponse::err("file stream write failed");
+                }
+                total += n as u64;
+                chunks += 1;
+                if chunks % 16 == 0 {
+                    let pct = if size > 0 {
+                        (total * 100 / size) as u32
+                    } else {
+                        100
+                    };
+                    tracing::debug!(
+                        "[ControlHandler] download {name}: sent {total}/{size} bytes ({pct}%)"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!("[ControlHandler] download {name} failed: file read failed: {e}");
+                return ControlResponse::err(&format!("file read failed: {e}"));
+            }
+        }
+    }
+
+    tracing::info!("[ControlHandler] Downloaded {name} ({total} bytes) to {peer_id}");
+    let mut resp = ControlResponse::ok();
+    resp.file_size = Some(size);
+    resp
 }

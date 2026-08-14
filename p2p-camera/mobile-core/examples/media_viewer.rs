@@ -374,6 +374,60 @@ async fn run_gui(opt: Opt, mut config: ViewerConfig) -> Result<()> {
                     player.set_status("Disconnected");
                     println!("[Viewer] Disconnected by user");
                 }
+                UiAction::QuerySnapshots => {
+                    if let Some(viewer) = session.as_mut() {
+                        match viewer.list_snapshots().await {
+                            Ok(files) => {
+                                player.snapshot_files = files.clone();
+                                player.selected_snapshot = None;
+                                if files.is_empty() {
+                                    player.set_status("无已合成的 AVI 文件".to_string());
+                                } else {
+                                    let msg = format!("已合成 {} 个 AVI: {}", files.len(), files.join(", "));
+                                    player.set_status(msg);
+                                    println!("[Viewer] Snapshots: {files:?}");
+                                }
+                            }
+                            Err(e) => {
+                                player.set_status(format!("查询失败: {e}"));
+                                eprintln!("[Viewer] QuerySnapshots failed: {e}");
+                            }
+                        }
+                    } else {
+                        player.set_status("未连接，无法查询".to_string());
+                    }
+                }
+                UiAction::DownloadSnapshot => {
+                    if let Some(viewer) = session.as_mut() {
+                        let idx = player.selected_snapshot;
+                        if idx.is_none() || idx.unwrap() >= player.snapshot_files.len() {
+                            player.set_status("请先在「系统」页选择要下载的文件".to_string());
+                        } else {
+                            let name = player.snapshot_files[idx.unwrap()].clone();
+                            // 默认保存到当前工作目录下的 ./tmp 子目录
+                            let save_dir = std::path::Path::new("./tmp");
+                            let _ = std::fs::create_dir_all(save_dir);
+                            let save = save_dir.join(&name);
+                            // 先给出「下载中」反馈并立即刷新, 避免网络等待期间界面看似卡死
+                            player.set_status(format!("下载中: {name} ..."));
+                            player.draw_now();
+                            match viewer.download_file(&name, &save).await {
+                                Ok(n) => {
+                                    player.set_status(format!("已下载 {} ({n} bytes) -> {}", name, save.display()));
+                                    player.set_toast(format!("下载完成\n{name}  ({n} bytes)"));
+                                    println!("[Viewer] Downloaded {name}: {n} bytes -> {}", save.display());
+                                }
+                                Err(e) => {
+                                    player.set_status(format!("下载失败: {e}"));
+                                    player.set_toast(format!("下载失败\n{e}"));
+                                    eprintln!("[Viewer] DownloadFile failed: {e}");
+                                }
+                            }
+                        }
+                    } else {
+                        player.set_status("未连接，无法下载".to_string());
+                    }
+                }
                 UiAction::Minimized => {
                     window_minimized = true;
                     if let Some(s) = session.as_mut() {
@@ -782,6 +836,10 @@ mod player {
         DevicesChanged,
         /// 右键菜单"断开连接": 真正关闭底层 media 流
         DisconnectDevice,
+        /// 配置窗体"系统"页「查询」按钮: 列出已合成 AVI 文件
+        QuerySnapshots,
+        /// 配置窗体"系统"页「下载」按钮: 下载选中的 AVI 文件
+        DownloadSnapshot,
     }
 
     // ============ 设备配置 (仅 viewer 端本地保存, 不真正下发到摄像头) ============
@@ -863,10 +921,14 @@ mod player {
         rows: Vec<(ConfigField, (i32, i32, i32, i32), (i32, i32, i32, i32), (i32, i32, i32, i32))>,
         /// (保存, 取消, 默认)
         buttons: [(i32, i32, i32, i32); 3],
+        /// 系统页专属: (查询, 下载) 两个按钮
+        snap_buttons: [(i32, i32, i32, i32); 2],
+        /// 系统页专属: 文件列表区域 (命中检测用)
+        snap_list: (i32, i32, i32, i32),
     }
 
     const CFG_W: i32 = 480;
-    const CFG_H: i32 = 400;
+    const CFG_H: i32 = 460;
 
     #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
     pub struct DeviceConfig {
@@ -1154,6 +1216,12 @@ mod player {
         /// 待下发到摄像头的图像参数 (peer, config)
         config_image_apply_pending: Option<(String, ImageConfig)>,
 
+        // ---- 抓拍 / 延时摄影 (控制通道) 状态 ----
+        /// 最近一次查询返回的 AVI 文件列表
+        pub snapshot_files: Vec<String>,
+        /// 系统页文件列表中当前选中的索引 (供「下载」按钮使用)
+        pub selected_snapshot: Option<usize>,
+
         /// 右键菜单 / 配置窗体共用的 overlay 纹理 (ABGR8888)
         overlay_texture: Option<sdl2::render::Texture<'static>>,
 
@@ -1168,6 +1236,8 @@ mod player {
         adding: bool,
         input: String,
         status: String,
+        /// 瞬时提示: 文字 + 过期时刻 (过期后不再绘制). 用于下载完成等一次性反馈.
+        toast: Option<(String, Instant)>,
         panel_dirty: bool,
         panel_h: u32,
         last_present: Instant,
@@ -1256,6 +1326,8 @@ mod player {
                 image_raw: None,
                 config_image_fetch_pending: None,
                 config_image_apply_pending: None,
+                snapshot_files: Vec::new(),
+                selected_snapshot: None,
                 overlay_texture: None,
                 font,
                 font_cjk: load_cjk_font(),
@@ -1266,6 +1338,7 @@ mod player {
                 adding: false,
                 input: String::new(),
                 status: String::new(),
+                toast: None,
                 panel_dirty: true,
                 panel_h: 0,
                 last_present: Instant::now(),
@@ -1285,6 +1358,12 @@ mod player {
 
         pub fn set_status(&mut self, s: impl Into<String>) {
             self.status = s.into();
+            self.panel_dirty = true;
+        }
+
+        /// 设置瞬时提示, 默认 3 秒后自动消失
+        pub fn set_toast(&mut self, s: impl Into<String>) {
+            self.toast = Some((s.into(), Instant::now() + std::time::Duration::from_secs(3)));
             self.panel_dirty = true;
         }
 
@@ -1704,7 +1783,15 @@ mod player {
                 (x0 + 180, by, 120, 28),
                 (x0 + 340, by, 120, 28),
             ];
-            CfgGeo { win, tabs, rows, buttons }
+            // 系统页专属: 查询/下载两个按钮 + 文件列表区域
+            let snap_buttons = [
+                (x0 + 12, y0 + 112, 200, 28),
+                (x0 + 268, y0 + 112, 200, 28),
+            ];
+            let list_y = y0 + 150;
+            let list_h = CFG_H - 150 - 48;
+            let snap_list = (x0 + 12, list_y, CFG_W - 24, list_h);
+            CfgGeo { win, tabs, rows, buttons, snap_buttons, snap_list }
         }
 
         /// 配置参数显示标签
@@ -1815,6 +1902,38 @@ mod player {
                     self.config_editing_name = true;
                     self.config_text = self.config.as_ref().map(|c| c.device_name.clone()).unwrap_or_default();
                     self.video_subsystem.text_input().start();
+                    self.panel_dirty = true;
+                    let _ = self.draw_now();
+                    return;
+                }
+            }
+            // 系统页专属: 查询 / 下载 按钮 + 文件列表单选
+            if self.config_tab == 2 {
+                for (i, b) in geo.snap_buttons.iter().enumerate() {
+                    if in_rect(lx, ly, *b) {
+                        match i {
+                            0 => _actions.push(UiAction::QuerySnapshots),
+                            _ => _actions.push(UiAction::DownloadSnapshot),
+                        }
+                        self.panel_dirty = true;
+                        let _ = self.draw_now();
+                        return;
+                    }
+                }
+                // 文件列表项命中: 计算第几项并选中
+                if in_rect(lx, ly, geo.snap_list) {
+                    let (_, ly_, _, lh_) = geo.snap_list;
+                    let item_h = 24i32;
+                    let rel = ly - ly_ - 4;
+                    if rel >= 0 {
+                        let idx = (rel / item_h) as usize;
+                        if idx < self.snapshot_files.len() {
+                            self.selected_snapshot = Some(idx);
+                            let name = self.snapshot_files[idx].clone();
+                            self.set_status(format!("已选择: {name}"));
+                        }
+                    }
+                    let _ = lh_;
                     self.panel_dirty = true;
                     let _ = self.draw_now();
                     return;
@@ -2040,9 +2159,84 @@ mod player {
                 self.draw_text_w(&mut buf, w, h, b.0 + 42, b.1 + 19, 13.0, btn_labels[i], COL_TEXT);
             }
 
+            // 系统页专属: 查询 / 下载 两个按钮 + AVI 文件列表 (单选)
+            if self.config_tab == 2 {
+                let snap_labels = ["查询", "下载"];
+                for (i, b) in geo.snap_buttons.iter().enumerate() {
+                    fill_rect_r(&mut buf, w, h, b.0, b.1, b.2 as u32, b.3 as u32, 6, COL_BTN);
+                    self.draw_text_w(&mut buf, w, h, b.0 + 84, b.1 + 19, 13.0, snap_labels[i], COL_TEXT);
+                }
+                // 文件列表标题
+                self.draw_text_w(&mut buf, w, h, geo.snap_list.0, geo.snap_list.1 - 18, 12.0, "已合成 AVI 文件 (点击选择):", COL_TEXT_DIM);
+                // 列表区域边框 + 滚动(仅显示前若干项)
+                let (lx, ly, lw, lh) = geo.snap_list;
+                fill_rect_r(&mut buf, w, h, lx, ly, lw as u32, lh as u32, 4, COL_BORDER);
+                fill_rect_r(&mut buf, w, h, lx + 1, ly + 1, lw as u32 - 2, lh as u32 - 2, 3, COL_INPUT_BG);
+                let item_h = 24i32;
+                let max_items = (lh / item_h) as usize;
+                let shown: Vec<(usize, String)> = self.snapshot_files.iter()
+                    .take(max_items)
+                    .enumerate()
+                    .map(|(i, n)| (i, n.clone()))
+                    .collect();
+                for (i, name) in shown {
+                    let ry = ly + 4 + (i as i32) * item_h;
+                    if Some(i) == self.selected_snapshot {
+                        fill_rect_r(&mut buf, w, h, lx + 3, ry, lw as u32 - 6, (item_h - 4) as u32, 3, COL_ROW_SEL);
+                    }
+                    self.draw_text_w(&mut buf, w, h, lx + 8, ry + 17, 12.0, &name, COL_TEXT);
+                }
+                if self.snapshot_files.is_empty() {
+                    self.draw_text_w(&mut buf, w, h, lx + 8, ly + 4 + 17, 12.0, "(空, 请点击「查询」)", COL_TEXT_DIM);
+                }
+            }
+
             if let Some(t) = &mut self.overlay_texture {
                 map_sdl(t.update(None, &buf, (w * 4) as usize), "config update")?;
                 map_sdl(self.canvas.copy(t, None, Some(Rect::new(wx, wy, w, h))), "config copy")?;
+            }
+            Ok(())
+        }
+
+        /// 绘制瞬时提示浮层 (居中). 过期后不再绘制, 下次 draw() 自然消失.
+        fn draw_toast(&mut self) -> Result<()> {
+            let (msg, expire) = match &self.toast {
+                Some(v) => (v.0.clone(), v.1),
+                None => return Ok(()),
+            };
+            if Instant::now() >= expire {
+                self.toast = None;
+                self.panel_dirty = true;
+                return Ok(());
+            }
+            // 2 行: 主提示 + 副提示 (用 \n 分隔)
+            let lines: Vec<&str> = msg.split('\n').collect();
+            let line_h = 22i32;
+            let pad_x = 22i32;
+            let pad_y = 14i32;
+            // 计算宽度 (取最长行)
+            let mut max_w = 0i32;
+            for l in &lines {
+                let cw: i32 = l.chars().map(|c| if Self::is_cjk(c) { 14 } else { 8 }).sum();
+                max_w = max_w.max(cw);
+            }
+            let tw = (max_w + pad_x * 2).max(80);
+            let th = (lines.len() as i32) * line_h + pad_y * 2;
+
+            self.ensure_overlay(tw as u32, th as u32)?;
+            let mut buf = vec![0u8; (tw * th * 4) as usize];
+            fill_rect_r(&mut buf, tw as u32, th as u32, 0, 0, tw as u32, th as u32, 8, COL_BORDER);
+            fill_rect_r(&mut buf, tw as u32, th as u32, 1, 1, tw as u32 - 2, th as u32 - 2, 7, [26, 28, 36, 240]);
+            for (i, l) in lines.iter().enumerate() {
+                let ry = pad_y + i as i32 * line_h;
+                self.draw_text_w(&mut buf, tw as u32, th as u32, pad_x, ry + 16, 14.0, l, COL_TEXT);
+            }
+            if let Some(t) = &mut self.overlay_texture {
+                map_sdl(t.update(None, &buf, (tw * 4) as usize), "toast update")?;
+                let (win_w, win_h) = map_sdl(self.canvas.output_size(), "output_size")?;
+                let tx = (win_w as i32 - tw) / 2;
+                let ty = (win_h as i32 - th) / 2;
+                map_sdl(self.canvas.copy(t, None, Some(Rect::new(tx, ty, tw as u32, th as u32))), "toast copy")?;
             }
             Ok(())
         }
@@ -2247,6 +2441,9 @@ mod player {
             if self.config.is_some() {
                 let _ = self.draw_config();
             }
+
+            // 瞬时提示 (下载完成等) 居中浮层
+            let _ = self.draw_toast();
 
             self.canvas.present();
             self.last_present = Instant::now();

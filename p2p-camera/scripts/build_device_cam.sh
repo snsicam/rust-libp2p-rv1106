@@ -4,8 +4,10 @@
 # 两种模式:
 #   ./build_rv1106.sh              # 文件模式 (musl 静态链接, 从文件读视频)
 #   ./build_rv1106.sh rv1106       # 摄像头模式 (glibc + uclibc 工具链, 链接 SDK)
-#   ./build_rv1106.sh deploy       # 文件模式 + scp
-#   ./build_rv1106.sh rv1106 deploy  # 摄像头模式 + scp
+#   ./build_rv1106.sh deploy       # 文件模式 + scp (device-cam)
+#   ./build_rv1106.sh rv1106 deploy  # 摄像头模式 + scp (device-cam + cam-test)
+#
+# 两种模式都会同时编译 cam-test (RV1106 本地抓拍/合成测试程序, 经 UDS 控 device-cam)
 #
 # 环境变量:
 #   RV1106_HOST         — RV1106 的 IP (deploy 用, 默认 192.168.1.100)
@@ -133,7 +135,7 @@ fi
 
 # ---- 编译 ----
 echo ""
-echo "[2/3] Building device-cam for RV1106..."
+echo "[2/4] Building device-cam for RV1106..."
 
 if [ "$RV1106_MODE" = true ]; then
     cargo build -p device-cam --target "$TARGET" --features rv1106
@@ -141,18 +143,31 @@ else
     cargo build -p device-cam --target "$TARGET"
 fi
 
+# 同时编译 cam-test (RV1106 本地抓拍/合成测试程序, 经 UDS 控 device-cam)
+# 注意: cam-test 是 p2p-camera workspace 成员, 需指定 --manifest-path (父 rust-libp2p workspace 不含它)
+# 该 Rockchip uclibc 工具链的 libc 未导出 getauxval (Rust std stack_overflow 检测需要), 用 gnueabihf target 但
+# 让链接器忽略该未定义符号 (cam-test 为轻量工具, 不会触发栈溢出检测崩溃)。
+echo ""
+echo "[3/4] Building cam-test for RV1106..."
+P2P_CAMERA_DIR="$SCRIPT_DIR/.."
+export RUSTFLAGS="-C link-arg=-Wl,--unresolved-symbols=ignore-all"
+cargo build --manifest-path "$P2P_CAMERA_DIR/Cargo.toml" -p cam-test --target "$TARGET"
+CAM_TEST_BIN="$P2P_CAMERA_DIR/target/$TARGET/debug/cam-test"
+unset RUSTFLAGS
+
 # ---- 验证产物 ----
 echo ""
-echo "[3/3] Build complete!"
+echo "[4/4] Build complete!"
 echo ""
 echo "============================================"
-echo "  Binary: $DEVICE_CAM_BIN"
-echo "  Target: $TARGET"
-echo "  Mode:   $( [ "$RV1106_MODE" = true ] && echo "rv1106 (camera SDK)" || echo "file" )"
+echo "  device-cam: $DEVICE_CAM_BIN"
+echo "  cam-test:   $CAM_TEST_BIN"
+echo "  Target:     $TARGET"
+echo "  Mode:       $( [ "$RV1106_MODE" = true ] && echo "rv1106 (camera SDK)" || echo "file" )"
 echo "============================================"
 file "$DEVICE_CAM_BIN" 2>/dev/null || true
 echo ""
-ls -lh "$DEVICE_CAM_BIN"
+ls -lh "$DEVICE_CAM_BIN" "$CAM_TEST_BIN"
 
 # ---- deploy 模式 ----
 if [ "$DEPLOY" = true ]; then
@@ -160,9 +175,13 @@ if [ "$DEPLOY" = true ]; then
     echo ""
     echo "[Deploy] Copying to RV1106 ($RV1106_HOST)..."
     scp "$DEVICE_CAM_BIN" "root@$RV1106_HOST:/usr/bin/device-cam"
+    scp "$CAM_TEST_BIN" "root@$RV1106_HOST:/usr/bin/cam-test"
     echo "[Deploy] Done. Run on RV1106:"
     if [ "$RV1106_MODE" = true ]; then
         echo "  device-cam --relay <relay_addr> --width 1920 --height 1080 --fps 25 --bitrate 4096"
+        echo "  cam-test snapshot            # 抓拍一张 JPG"
+        echo "  cam-test compose [fps]       # 合成 AVI (默认 fps=5)"
+        echo "  cam-test loop [n] [fps]      # 循环抓拍 n 次后合成"
     else
         echo "  device-cam --relay <relay_addr> --video-file /tmp/test.h265"
     fi

@@ -1259,6 +1259,76 @@ impl MediaPlayer {
         Ok(resp)
     }
 
+    /// 查询摄像头已合成的 AVI 文件列表 (走控制通道 JSON 返回)
+    pub async fn list_snapshots(&mut self) -> Result<Vec<String>> {
+        let req = proto::control::ControlRequest::ListSnapshots;
+        let resp = self.send_control(&req).await?;
+        if !resp.ok {
+            let err = resp.error.clone().unwrap_or_else(|| "unknown error".to_string());
+            return Err(anyhow::anyhow!(err));
+        }
+        Ok(resp.avi_files.unwrap_or_default())
+    }
+
+    /// 下载指定 AVI 文件: 经控制通道请求 (通知设备端推送), 然后接收设备端经
+    /// 独立 FILE_PROTOCOL 入站 stream 推来的分块数据存盘。
+    ///
+    /// 设计: 设备端 `download_file` 收到控制请求后会**主动 open_stream(FILE_PROTOCOL)**
+    /// 把文件推给本端, 因此本端必须先 `accept` 注册入站监听, 再发控制请求触发推送,
+    /// 最后从入站流读取分块。切勿反过来用 open_stream, 否则对端未注册 accept 会报
+    /// "remote peer does not support /p2p-camera/file/1.0.0"。
+    pub async fn download_file(
+        &mut self,
+        name: &str,
+        save_path: &std::path::Path,
+    ) -> Result<u64> {
+        use proto::control::read_frame;
+        use tokio::io::AsyncWriteExt;
+
+        let _device_cam = match self.device_cam_peer_id {
+            Some(id) => id,
+            None => return Err(anyhow::anyhow!("not connected to device-cam")),
+        };
+
+        // 1) 先注册 FILE_PROTOCOL 入站监听 (必须在发控制请求之前, 否则推送流会被拒)
+        let mut incoming = self
+            .stream_control
+            .accept(stream_protocols::FILE_PROTOCOL)
+            .map_err(|e| anyhow::anyhow!("register file accept failed: {e}"))?;
+
+        // 2) 控制通道请求下载 (触发设备端主动推送)
+        let req = proto::control::ControlRequest::DownloadFile { name: name.to_string() };
+        let head = self.send_control(&req).await?;
+        if !head.ok {
+            let err = head.error.clone().unwrap_or_else(|| "download rejected".to_string());
+            return Err(anyhow::anyhow!(err));
+        }
+
+        // 3) 等待设备端推来的入站文件流
+        let (_peer, mut file_stream) = incoming
+            .next()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("file stream closed before data"))?;
+
+        let mut out = tokio::fs::File::create(save_path).await?;
+        let mut total = 0u64;
+        loop {
+            match read_frame(&mut file_stream).await {
+                Ok(chunk) => {
+                    if chunk.is_empty() {
+                        break; // EOF 标记 (设备端关流或发空帧)
+                    }
+                    out.write_all(&chunk).await?;
+                    total += chunk.len() as u64;
+                }
+                Err(_) => break, // 设备端关流 = 传输结束
+            }
+        }
+        out.flush().await?;
+        drop(incoming); // 停止接受后续入站流
+        Ok(total)
+    }
+
     /// 通过控制通道从摄像头读取当前编码参数 (真正读取设备端配置, 非本地缓存)
     pub async fn get_encoder_config(&mut self, stream: &str) -> Result<proto::control::EncoderConfig> {
         let req = proto::control::ControlRequest::GetEncoderConfig { stream: stream.to_string() };

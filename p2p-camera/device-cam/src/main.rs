@@ -22,6 +22,7 @@ mod config;
 mod control_handler;
 mod media_source;
 mod net_diag;
+mod uds_server;
 #[cfg(feature = "rv1106")]
 mod rk_video_source;
 
@@ -346,30 +347,38 @@ async fn main() -> Result<()> {
         if udp_port != 0 { udp_port.to_string() } else { "random".to_string() });
 
     // ---- Stream 控制 (三路视频 + 音频 + 向后兼容旧协议) ----
-    let mut stream_control = swarm.behaviour().new_stream_control();
+    // 用 Arc 包裹, 使下载命令能克隆句柄开独立 FILE_PROTOCOL 流回传文件
+    let stream_control = std::sync::Arc::new(swarm.behaviour().new_stream_control());
     // 用于向 relay 发送注册表流的独立控制句柄 (可并发)
     let registry_control = stream_control.clone();
 
     // 主码流
-    let mut incoming_main = stream_control
-        .accept(stream_protocols::VIDEO_MAIN_PROTOCOL)
+    let mut incoming_main = (*stream_control).clone()
+            .accept(stream_protocols::VIDEO_MAIN_PROTOCOL)
         .context("Failed to accept main video protocol")?;
     // 子码流
-    let mut incoming_sub = stream_control
-        .accept(stream_protocols::VIDEO_SUB_PROTOCOL)
+    let mut incoming_sub = (*stream_control).clone()
+            .accept(stream_protocols::VIDEO_SUB_PROTOCOL)
         .context("Failed to accept sub video protocol")?;
     // 第三码流
-    let mut incoming_third = stream_control
-        .accept(stream_protocols::VIDEO_THIRD_PROTOCOL)
+    let mut incoming_third = (*stream_control).clone()
+            .accept(stream_protocols::VIDEO_THIRD_PROTOCOL)
         .context("Failed to accept third video protocol")?;
     // 音频
-    let mut incoming_audio = stream_control
-        .accept(stream_protocols::AUDIO_PROTOCOL)
+    let mut incoming_audio = (*stream_control).clone()
+            .accept(stream_protocols::AUDIO_PROTOCOL)
         .context("Failed to accept audio protocol")?;
     // 控制通道
-    let mut incoming_control = stream_control
-        .accept(stream_protocols::CONTROL_PROTOCOL)
+    let mut incoming_control = (*stream_control).clone()
+            .accept(stream_protocols::CONTROL_PROTOCOL)
         .context("Failed to accept control protocol")?;
+    // 文件下载通道 (AVI 大文件分块回传, 与控制 JSON 流隔离)
+    let mut incoming_file = (*stream_control).clone()
+            .accept(stream_protocols::FILE_PROTOCOL)
+        .context("Failed to accept file protocol")?;
+    // 启动本地 UDS 监听: 接收同机另一程序下发的 snapshot/compose 命令
+    uds_server::spawn();
+    println!("[DeviceCam] Local UDS command server listening on /tmp/cam_ctrl.sock");
 
     // ---- 状态 ----
     let mut connection_times: HashMap<PeerId, Instant> = HashMap::new();
@@ -618,7 +627,7 @@ async fn main() -> Result<()> {
                                 // 向 relay 注册 (serial → peer_id) 签名绑定，
                                 // 使 viewer 仅凭短 serial 即可经 relay 解析出真实 PeerId 并连接。
                                 if let Some(ref s) = serial {
-                                    let ctrl = registry_control.clone();
+                                    let ctrl = (*registry_control).clone();
                                     let kp = signing_keypair.clone();
                                     let ser = s.clone();
                                     let self_pid = kp.public().to_peer_id();
@@ -783,9 +792,17 @@ async fn main() -> Result<()> {
                 if let Some((peer_id, stream)) = control {
                     let conn_type = peer_conn_type.get(&peer_id).map(|s| s.as_str()).unwrap_or("Unknown");
                     println!("[DeviceCam] New control connection: {peer_id} via {conn_type}");
-                    tokio::spawn(control_handler::handle_control_stream(peer_id, stream));
+                    let sc = stream_control.clone();
+                    tokio::spawn(control_handler::handle_control_stream(peer_id, stream, sc));
                 } else {
                     tracing::error!("[DeviceCam] Control stream accept channel closed");
+                }
+            }
+
+            // 文件下载通道 (仅作为下载服务端被 viewer 打开, 不主动发起)
+            file_req = incoming_file.next() => {
+                if let Some((peer_id, _stream)) = file_req {
+                    tracing::debug!("[DeviceCam] File stream requested by {peer_id} (data sent via DownloadFile handler)");
                 }
             }
 
