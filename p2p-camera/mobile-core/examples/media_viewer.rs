@@ -381,9 +381,9 @@ async fn run_gui(opt: Opt, mut config: ViewerConfig) -> Result<()> {
                                 player.snapshot_files = files.clone();
                                 player.selected_snapshot = None;
                                 if files.is_empty() {
-                                    player.set_status("无已合成的 AVI 文件".to_string());
+                                    player.set_status("无已合成的视频文件".to_string());
                                 } else {
-                                    let msg = format!("已合成 {} 个 AVI: {}", files.len(), files.join(", "));
+                                    let msg = format!("已合成 {} 个视频文件: {}", files.len(), files.join(", "));
                                     player.set_status(msg);
                                     println!("[Viewer] Snapshots: {files:?}");
                                 }
@@ -836,9 +836,9 @@ mod player {
         DevicesChanged,
         /// 右键菜单"断开连接": 真正关闭底层 media 流
         DisconnectDevice,
-        /// 配置窗体"系统"页「查询」按钮: 列出已合成 AVI 文件
+        /// 配置窗体"系统"页「查询」按钮: 列出已合成视频文件
         QuerySnapshots,
-        /// 配置窗体"系统"页「下载」按钮: 下载选中的 AVI 文件
+        /// 配置窗体"系统"页「下载」按钮: 下载选中的视频文件
         DownloadSnapshot,
     }
 
@@ -2166,8 +2166,6 @@ mod player {
                     fill_rect_r(&mut buf, w, h, b.0, b.1, b.2 as u32, b.3 as u32, 6, COL_BTN);
                     self.draw_text_w(&mut buf, w, h, b.0 + 84, b.1 + 19, 13.0, snap_labels[i], COL_TEXT);
                 }
-                // 文件列表标题
-                self.draw_text_w(&mut buf, w, h, geo.snap_list.0, geo.snap_list.1 - 18, 12.0, "已合成 AVI 文件 (点击选择):", COL_TEXT_DIM);
                 // 列表区域边框 + 滚动(仅显示前若干项)
                 let (lx, ly, lw, lh) = geo.snap_list;
                 fill_rect_r(&mut buf, w, h, lx, ly, lw as u32, lh as u32, 4, COL_BORDER);
